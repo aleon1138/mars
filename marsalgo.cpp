@@ -55,10 +55,14 @@ void sort_columns(Ref<MatrixXd> X, const ArrayXi32 &k)
 void covariates(double *ff_, double *fy_, ArrayXd &f, ArrayXd &g,
     const Ref<VectorXd> &x, const VectorXd &y, double k0, double k1)
 {
-    int m = x.rows();
+    assert(x.cols()==1 && x.rows()>=x.cols());
+    assert(x.rows()==y.rows());
+
+    const int m = x.rows();
     double s0 = 0;
     double s1 = 0;
 
+    static_assert(FP_FAST_FMA, "-mfma must be enabled");
     for (int i = 0; i < m; ++i) {
         f[i] = fma(k0,g[i],f[i]);
         g[i] = fma(k1,x[i],g[i]);
@@ -82,10 +86,9 @@ class MarsAlgo {
     MatrixXdC   _Bok;       // all basis, ortho-normalized and sorted (scratch buffer)
     MatrixXd    _Bx;        // B[k,mask]*x[k,None] (scratch buffer)
     ArrayXf     _s;         // scale of columns of 'X'
-    ArrayXd     _d;         // deltas of 'X' (scratch buffer)
     int         _m    = 1;  // number of basis found
     double      _yvar = 0;  // variance of 'y'
-    double      _eps  = 0;  // numerical error tolerance
+    double      _tol  = 0;  // numerical error tolerance
 
 public:
     MarsAlgo(const float *x, const float *y, const float *w, int n, int m, int p, int ldx)
@@ -94,8 +97,7 @@ public:
        , _Bo (MatrixXdC::Zero(n,p))
        , _Bok(MatrixXdC::Zero(n,p))
        , _Bx (MatrixXdC::Zero(n,p))
-       , _d  (n-1)
-       , _eps((n*0.02)*DBL_EPSILON) // rough guess
+       , _tol((n*0.02)*DBL_EPSILON) // rough guess
     {
         if (std::isfinite(NAN)) {
             throw std::runtime_error("NAN check is disabled, recompile without --fast-math");
@@ -152,7 +154,7 @@ public:
         //---------------------------------------------------------------------
         // Ortho-normalize via inverse Cholesky method
         //---------------------------------------------------------------------
-        orthonormalize(Bx, _B.leftCols(m), Bo, x, Map<const ArrayXi64>(mask,p), _eps);
+        orthonormalize(Bx, _B.leftCols(m), Bo, x, Map<const ArrayXi64>(mask,p), _tol);
 
         //---------------------------------------------------------------------
         // Calculate the linear delta SSE
@@ -165,6 +167,12 @@ public:
         // Evaluate the delta SSE on all hinge locations
         //---------------------------------------------------------------------
         if (linear_only == false) {
+            ArrayXi hinge_idx(p);
+            for (int j = 0; j < p; ++j) {
+                hinge_idx[j] = -1;
+                hinge_sse[j] =  0;
+            }
+
             //-----------------------------------------------------------------
             // Get sort indices
             //-----------------------------------------------------------------
@@ -180,6 +188,8 @@ public:
                 Bok.row(i) = Bo.row(k[i]);
             }
             sort_columns(Bx, k);
+
+            ArrayXd _d(n-1);
             double *d = _d.data()-1; // note minus-one hack
             for (int i = 1; i < n; ++i) {
                 d[i] = x[k[i-1]] - x[k[i]];
@@ -188,7 +198,6 @@ public:
             const int head = endspan;
             const int tail = n-endspan;
             static_assert(FP_FAST_FMA, "-mfma must be enabled");
-            ArrayXi hinge_idx = -ArrayXi::Ones(p);
 
             for (int j = 0; j < p; ++j) {
                 const Ref<VectorXf> b  = _B.col(mask[j]);
@@ -226,7 +235,7 @@ public:
 
                     const double uw  = fy - w;
                     const double den = (k0+k1) - ff;
-                    const double sse = den > _eps? (uw*uw)/(den+_eps) : 0;
+                    const double sse = den > _tol? (uw*uw)/(den+_tol) : 0;
                     if ((i > head) and (sse > hinge_sse[j])) {
                         hinge_sse[j] = sse;
                         hinge_idx[j] = i;
@@ -236,7 +245,7 @@ public:
 
             for (int j = 0; j < p; ++j) {
                 hinge_sse[j] += linear_sse[j];
-                hinge_cut[j] = hinge_idx[j]>=0? x[hinge_idx[j]]/_s[xcol] : NAN;
+                hinge_cut[j] = hinge_idx[j]>=0? x[k[hinge_idx[j]]]/_s[xcol] : NAN;
             }
         }
     }
@@ -275,7 +284,7 @@ public:
         }
 
         const double w = v.norm();
-        if (w*w > _eps) {
+        if (w*w > _tol) {
             _Bo.col(_m) = v/w;
             VectorXd yb = _Bo.leftCols(_m+1).transpose() * _y.matrix();
             const double mse = (1. - yb.squaredNorm()) / _X.rows();
@@ -325,10 +334,29 @@ double slow_dsse(Ref<const MatrixXd> X, VectorXd y) {
 }
 
 double slow_mse(Ref<MatrixXd> X, VectorXd y) {
-    VectorXd beta = X.fullPivHouseholderQr().solve(y);
-    VectorXd err  = X * beta - y;
-    return err.squaredNorm()/X.rows();
+    VectorXd b = X.fullPivHouseholderQr().solve(y);
+    VectorXd e = X * b - y;
+    return e.squaredNorm()/X.rows();
 }
+
+///////////////////////////////////////////////////////////////////////////////
+
+TEST(MarsTest, ArgSort)
+{
+    int n = 23;
+    ArrayXf x(ArrayXf::Random(n));
+    ArrayXf y = x;
+    ArrayXi32 k(n);
+
+    std::sort(y.data(), y.data()+n, [](float a, float b) { return a > b; });
+    argsort(k.data(), x.data(), n);
+
+    for (int i = 0; i < n; ++i){
+        ASSERT_EQ(x[k[i]],y[i]);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
 
 TEST(MarsTest, Orthonormalize)
 {
@@ -389,7 +417,6 @@ TEST(MarsTest, SortColumns)
     ArrayXi32 k = Map<ArrayXi32>(idx.data(),idx.size());
 
     sort_columns(X,k);
-
     for (int i = 0; i < X.rows(); ++i) {
         ASSERT_TRUE(X.row(i).isApprox(Y.row(k[i])));
     }
@@ -404,15 +431,25 @@ TEST(MarsTest, DeltaSSE)
 
     MatrixXf X(MatrixXf::Random(N,m));
     ArrayXf  x3 = X.col(3).array();
+    ArrayXf  x7 = X.col(7).array();
     ArrayXf  x9 = X.col(9).array();
-    VectorXf y  = (x3*.3 - x9*.2 + x3*x9*.25).matrix() + VectorXf::Random(N);
+    VectorXf y  = (x3*.3 - x9*.2 + x3*x9*.25 - 0.2*(x7-.4).cwiseMax(0)).matrix();
     ArrayXf  w(ArrayXf::Ones(N));
 
+    y += VectorXf::Random(y.rows()); // add noise
     for (int j = 0; j < X.cols(); ++j) X.col(j) /= X.col(j).cast<double>().norm();
     y /= y.cast<double>().norm();
 
+/*
+    ok - for some reason this is not working when we dont normalize the Y??
+    but it should work
+    so dump the X and Y matrixes in numpy and see if you can duplicate your work
+    it may be that your "slow" versions are not workin
+*/
+
     double dsse1, dsse2;
     double mse1, mse2;
+    int xcol, bcol;
 
     std::vector<int64_t> mask = {0};
     MarsAlgo algo(X.data(), y.data(), w.data(), X.rows(), X.cols(), X.cols()/2, X.rows());
@@ -421,50 +458,71 @@ TEST(MarsTest, DeltaSSE)
     ArrayXd hinge_cut (ArrayXd::Zero(m));
     MatrixXd ALL_B(MatrixXd::Zero(N,m));
     ALL_B.col(0).array() = 1;
-    int bcol = 1;
+    int b_cols = 1; // number of valid columns in B
 
     //-------------------------------------------------------------------------
     // Pick the first linear basis
     //-------------------------------------------------------------------------
-    int xcol = 3; // just pick one
-    algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), mask.size(), 0, 0);
+    xcol = 3; // just pick one
+    algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), mask.size(), 0, 1);
     dsse1 = linear_sse[0];
-    ALL_B.col(bcol) = X.col(xcol).cast<double>();
-    dsse2 = slow_dsse(ALL_B.leftCols(bcol+1), y.cast<double>());
+    ALL_B.col(b_cols) = x3.cast<double>();
+    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y.cast<double>());
     ASSERT_NEAR(dsse1, dsse2, 1e-8);
 
     mse1 = algo.append('l', xcol, 0, 0);
-    mask.push_back(bcol);
-    ALL_B.col(bcol++) = X.col(xcol).cast<double>();
-    mse2 = slow_mse(ALL_B.leftCols(bcol), y.cast<double>());
+    mask.push_back(b_cols);
+    b_cols++;
+    mse2 = slow_mse(ALL_B.leftCols(b_cols), y.cast<double>());
     ASSERT_NEAR(mse1, mse2, 1e-8);
 
     //-------------------------------------------------------------------------
     // Try adding another linear basis
     //-------------------------------------------------------------------------
     xcol = 9; // pick another column
-    algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), mask.size(), 0, 0);
+    algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), mask.size(), 0, 1);
     dsse1 = linear_sse[0];
-    ALL_B.col(bcol) = X.col(xcol).cast<double>();
-    dsse2 = slow_dsse(ALL_B.leftCols(bcol+1), y.cast<double>());
+    ALL_B.col(b_cols) = x9.cast<double>();
+    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y.cast<double>());
     ASSERT_NEAR(dsse1, dsse2, 1e-8);
 
     mse1 = algo.append('l', xcol, 0, 0);
-    mask.push_back(bcol);
-    ALL_B.col(bcol++) = X.col(xcol).cast<double>();
-    mse2 = slow_mse(ALL_B.leftCols(bcol), y.cast<double>());
+    mask.push_back(b_cols);
+    b_cols++;
+    mse2 = slow_mse(ALL_B.leftCols(b_cols), y.cast<double>());
     ASSERT_NEAR(mse1, mse2, 1e-8);
 
     //-------------------------------------------------------------------------
-    // Ok now add the interaction
+    // Ok, now add the interaction
     //-------------------------------------------------------------------------
     xcol = 9;
+    bcol = 1; // use x3 as interaction
+    algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), mask.size(), 0, 1);
+    ASSERT_EQ(bcol, argmax(linear_sse));
+    dsse1 = linear_sse[bcol];
+    ALL_B.col(b_cols) = (x3*x9).cast<double>();
+    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y.cast<double>());
+    ASSERT_NEAR(dsse1, dsse2, 2e-8);
+
+    mse1 = algo.append('l', xcol, bcol, 0);
+    mask.push_back(b_cols);
+    b_cols++;
+    mse2 = slow_mse(ALL_B.leftCols(b_cols), y.cast<double>());
+    ASSERT_NEAR(mse1, mse2, 1e-8);
+
+    //-------------------------------------------------------------------------
+    // Try adding the hinge at x7
+    //-------------------------------------------------------------------------
+    xcol = 7;
+    bcol = 0;
     algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), mask.size(), 0, 0);
-    dsse1 = linear_sse[1]; // use x3 as interaction
-    ALL_B.col(bcol) = (x3*x9).cast<double>();
-    dsse2 = slow_dsse(ALL_B.leftCols(bcol+1), y.cast<double>());
-    ASSERT_NEAR(dsse1, dsse2, 1e-8);
-    ASSERT_EQ(1, argmax(linear_sse));
+    ASSERT_EQ(bcol, argmax(hinge_sse));
+    ASSERT_GT(hinge_sse.maxCoeff(),linear_sse.maxCoeff());
+    dsse1 = hinge_sse[bcol];
+
+    ALL_B.col(b_cols) = (x7-.4).cwiseMax(0).cast<double>();
+    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y.cast<double>());
+    //ASSERT_NEAR(dsse1, dsse2, 1e-8);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
