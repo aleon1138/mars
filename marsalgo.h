@@ -1,6 +1,7 @@
 #include <Eigen/Dense>
 #include <numeric> // for std::iota
 #include <cfloat>  // for DBL_EPSILON
+#include <xmmintrin.h> // for _mm_getcsr
 
 using namespace Eigen;
 typedef Matrix<double,Dynamic,Dynamic,RowMajor> MatrixXdC;
@@ -142,6 +143,8 @@ public:
         if (p > _m) {
             throw std::runtime_error("invalid mask array");
         }
+        const unsigned csr = _mm_getcsr();
+        _mm_setcsr(csr | 0x8040); // FTZ and DAZ
 
         const int n = _X.rows();
         const int m = _m;
@@ -247,6 +250,7 @@ public:
                 hinge_cut[j] = hinge_idx[j]>=0? x[k[hinge_idx[j]]]/_s[xcol] : NAN;
             }
         }
+        _mm_setcsr(csr); // revert
     }
 
     ///////////////////////////////////////////////////////////////////////////
