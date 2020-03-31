@@ -21,9 +21,8 @@ void argsort(int32_t *idx, const float *v, int n) {
 void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXdC> &Bo,
                     const ArrayXf &x, const ArrayXi64 &mask, double tol)
 {
-    assert(B.cols()  == Bo.cols());
+    assert(B.cols()  == Bo.cols() && Bx.rows() == B.rows());
     assert(Bx.cols() == mask.rows());
-    assert(Bx.rows() == B.rows());
 
     for (int j = 0; j < mask.rows(); ++j) {
         Bx.col(j) = (B.col(mask[j]).array() * x).cast<double>();

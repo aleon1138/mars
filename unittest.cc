@@ -1,4 +1,4 @@
-#include "marsalgo.cc" // << -- MARS code gets included here
+#include "marsalgo.h"
 #include <gtest/gtest.h>
 #include <vector>
 constexpr double EPS = 1e-14;
