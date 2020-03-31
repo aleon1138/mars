@@ -9,8 +9,6 @@
 #     sudo cp *.a /usr/lib
 
 
-#DEFINES += -DNDEBUG
-
 CFLAGS = -Wall $(DEFINES) -O2 -mfma -mavx -march=native -I/usr/include/eigen3
 
 unittest: marsalgo.cpp

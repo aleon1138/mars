@@ -532,22 +532,22 @@ TEST(MarsTest, DeltaSSE)
     ALL_B.col(b_cols  ) = ALL_B.col(0).array() * (x7 - hinge_cut[0]).cwiseMax(0);
     ALL_B.col(b_cols+1) = ALL_B.col(0).array() * (hinge_cut[0] - x7).cwiseMax(0);
     dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-    ASSERT_NEAR(hinge_sse[0]/N, dsse2/N, 1e-7);
+    ASSERT_NEAR(hinge_sse[0]/N, dsse2/N, 1e-6);
 
     ALL_B.col(b_cols  ) = ALL_B.col(1).array() * (x7 - hinge_cut[1]).cwiseMax(0);
     ALL_B.col(b_cols+1) = ALL_B.col(1).array() * (hinge_cut[1] - x7).cwiseMax(0);
     dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-    ASSERT_NEAR(hinge_sse[1]/N, dsse2/N, 1e-7);
+    ASSERT_NEAR(hinge_sse[1]/N, dsse2/N, 1e-6);
 
     ALL_B.col(b_cols  ) = ALL_B.col(2).array() * (x7 - hinge_cut[2]).cwiseMax(0);
     ALL_B.col(b_cols+1) = ALL_B.col(2).array() * (hinge_cut[2] - x7).cwiseMax(0);
     dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-    ASSERT_NEAR(hinge_sse[2]/N, dsse2/N, 1e-7);
+    ASSERT_NEAR(hinge_sse[2]/N, dsse2/N, 1e-6);
 
     ALL_B.col(b_cols  ) = ALL_B.col(3).array() * (x7 - hinge_cut[3]).cwiseMax(0);
     ALL_B.col(b_cols+1) = ALL_B.col(3).array() * (hinge_cut[3] - x7).cwiseMax(0);
     dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-    ASSERT_NEAR(hinge_sse[3]/N, dsse2/N, 1e-7);
+    ASSERT_NEAR(hinge_sse[3]/N, dsse2/N, 1e-6);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
