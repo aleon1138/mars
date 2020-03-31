@@ -1,26 +1,28 @@
 #include "marsalgo.h"
 #include <pybind11/pybind11.h>
+#include <pybind11/eigen.h>
 namespace py = pybind11;
 
-int add(int i, int j) {
-    return i + j;
+
+MarsAlgo * new_algo(
+    const Ref<const MatrixXf> &X,
+    const Ref<const VectorXf> &y,
+    const Ref<const VectorXf> &w, int p)
+{
+    return new MarsAlgo(X.data(), y.data(), w.data(),
+        X.rows(), X.cols(), p, X.outerStride());
 }
 
-struct Pet {
-    Pet(const std::string &name) : name(name) { }
-    void setName(const std::string &name_) { name = name_; }
-    const std::string &getName() const { return name; }
-
-    std::string name;
-};
-
+using namespace pybind11::literals;
 
 PYBIND11_MODULE(mars, m) {
-    m.doc() = "pybind11 example plugin"; // optional module docstring
-    m.def("add", &add, "A function which adds two numbers");
+    m.doc() = "Multivariate Adaptive Regression Splines";
 
-    py::class_<Pet>(m, "MarsAlgo")
-        .def(py::init<const std::string &>())
-        .def("setName", &Pet::setName)
-        .def("getName", &Pet::getName);
+    py::class_<MarsAlgo>(m, "MarsAlgo")
+        .def(py::init(&new_algo))
+        , "X"_a.noconvert()
+        , "y"_a.noconvert()
+        , "w"_a.noconvert()
+        , "p"_a
+        ;
 }
