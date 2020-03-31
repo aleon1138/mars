@@ -182,9 +182,9 @@ public:
             //-----------------------------------------------------------------
             // Sort all rows of y, Bo, Bx and take the deltas of x
             //-----------------------------------------------------------------
-            VectorXd y(n);
+            VectorXd yk(n);
             for (int i = 0; i < n; ++i) {
-                y[i] = _y(k[i]);
+                yk[i] = _y(k[i]);
                 Bok.row(i) = Bo.row(k[i]);
             }
             sort_columns(Bx, k);
@@ -208,19 +208,19 @@ public:
                 double k1 = 0;
                 double w  = 0;
                 double bd = 0;
-                double vb = b_i*y[0];
+                double vb = b_i*yk[0];
                 double b2 = b_i*b_i;
                 ArrayXd f = ArrayXd::Zero(m+1);
                 ArrayXd g = ArrayXd::Zero(m+1);
                 double ff = 0;
                 double fy = 0;
 
-                covariates(&ff,&fy,f,g,Bo.row(0),yb,0,b_i);
+                covariates(&ff,&fy,f,g,Bok.row(0),yb,0,b_i);
                 g[m] += b_i*bx[0];
 
                 for (int i = 1; i < tail; ++i) {
                     b_i = b[k[i]]; // sort and upcast to double
-                    covariates(&ff,&fy,f,g,Bo.row(i),yb,d[i],b_i);
+                    covariates(&ff,&fy,f,g,Bok.row(i),yb,d[i],b_i);
                     f[m] = fma(d[i],g[m],f[m]);
                     g[m] = fma(b_i,bx[i],g[m]);
                     ff   = fma(f[m],f[m],ff);
@@ -231,7 +231,7 @@ public:
                     w  = fma(d[i],vb,w);
                     bd = fma(d[i],b2,bd);
                     b2 = fma(b_i, b_i,b2);
-                    vb = fma(y[i],b_i,vb);
+                    vb = fma(yk[i],b_i,vb);
 
                     const double uw  = fy - w;
                     const double den = (k0+k1) - ff;
@@ -279,6 +279,8 @@ public:
         // Use Gram-Schmidt orthogonalization.
         //---------------------------------------------------------------------
         VectorXd v = _B.col(_m).cast<double>(); // make a copy
+        _B.col(_m) /= v.norm();
+
         for (int j = 0; j < _m; ++j) {
             v -= (_Bo.col(j).transpose()*v) * _Bo.col(j);
         }
@@ -286,6 +288,8 @@ public:
         const double w = v.norm();
         if (w*w > _tol) {
             _Bo.col(_m) = v/w;
+
+            // This assumes the norm of '_y' == 1
             VectorXd yb = _Bo.leftCols(_m+1).transpose() * _y.matrix();
             const double mse = (1. - yb.squaredNorm()) / _X.rows();
             if (mse >= 0.) {
@@ -333,10 +337,10 @@ double slow_dsse(Ref<const MatrixXd> X, VectorXd y) {
     return b.transpose() * xy;
 }
 
-double slow_mse(Ref<MatrixXd> X, VectorXd y) {
+double slow_mse(MatrixXd X, VectorXd y) {
     VectorXd b = X.fullPivHouseholderQr().solve(y);
     VectorXd e = X * b - y;
-    return e.squaredNorm()/X.rows();
+    return e.squaredNorm()/e.rows();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -351,7 +355,7 @@ TEST(MarsTest, ArgSort)
     std::sort(y.data(), y.data()+n, [](float a, float b) { return a > b; });
     argsort(k.data(), x.data(), n);
 
-    for (int i = 0; i < n; ++i){
+    for (int i = 0; i < n; ++i) {
         ASSERT_EQ(x[k[i]],y[i]);
     }
 }
@@ -426,33 +430,30 @@ TEST(MarsTest, SortColumns)
 
 TEST(MarsTest, DeltaSSE)
 {
-    const int N = 3891;  // number of rows
+    const int N = 5891;  // number of rows
     const int m = 13;    // number of basis
+    const double CUT = 0.25;
 
-    MatrixXf X(MatrixXf::Random(N,m));
-    ArrayXf  x3 = X.col(3).array();
-    ArrayXf  x7 = X.col(7).array();
-    ArrayXf  x9 = X.col(9).array();
-    VectorXf y  = (x3*.3 - x9*.2 + x3*x9*.25 - 0.2*(x7-.4).cwiseMax(0)).matrix();
-    ArrayXf  w(ArrayXf::Ones(N));
+    MatrixXd X(MatrixXd::Random(N,m));
+    ArrayXd  x3 = X.col(3).array();
+    ArrayXd  x7 = X.col(7).array(); x7[100] = CUT;
+    ArrayXd  x9 = X.col(9).array();
+    VectorXd y  = (x3*.3 - x9*.2 + x3*x9*.25
+                   -5*(x7-CUT).cwiseMax(0) + 2*(CUT-x7).cwiseMax(0)).matrix();
 
-    y += VectorXf::Random(y.rows()); // add noise
-    for (int j = 0; j < X.cols(); ++j) X.col(j) /= X.col(j).cast<double>().norm();
-    y /= y.cast<double>().norm();
+    y += VectorXd::Random(y.rows()); // add noise
+    y /= y.norm();
 
-/*
-    ok - for some reason this is not working when we dont normalize the Y??
-    but it should work
-    so dump the X and Y matrixes in numpy and see if you can duplicate your work
-    it may be that your "slow" versions are not workin
-*/
+    MatrixXf X32 = X.cast<float>();
+    VectorXf y32 = y.cast<float>();
+    ArrayXf  w32 = ArrayXf::Ones(N);
 
     double dsse1, dsse2;
     double mse1, mse2;
     int xcol, bcol;
 
     std::vector<int64_t> mask = {0};
-    MarsAlgo algo(X.data(), y.data(), w.data(), X.rows(), X.cols(), X.cols()/2, X.rows());
+    MarsAlgo algo(X32.data(), y32.data(), w32.data(), X.rows(), X.cols(), X.cols()/2, X.rows());
     ArrayXd linear_sse(ArrayXd::Zero(m));
     ArrayXd hinge_sse (ArrayXd::Zero(m));
     ArrayXd hinge_cut (ArrayXd::Zero(m));
@@ -468,7 +469,7 @@ TEST(MarsTest, DeltaSSE)
     dsse1 = linear_sse[0];
     ALL_B.col(b_cols) = x3.cast<double>();
     dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y.cast<double>());
-    ASSERT_NEAR(dsse1, dsse2, 1e-8);
+    ASSERT_NEAR(dsse1, dsse2, 1e-7);
 
     mse1 = algo.append('l', xcol, 0, 0);
     mask.push_back(b_cols);
@@ -484,7 +485,7 @@ TEST(MarsTest, DeltaSSE)
     dsse1 = linear_sse[0];
     ALL_B.col(b_cols) = x9.cast<double>();
     dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y.cast<double>());
-    ASSERT_NEAR(dsse1, dsse2, 1e-8);
+    ASSERT_NEAR(dsse1, dsse2, 1e-7);
 
     mse1 = algo.append('l', xcol, 0, 0);
     mask.push_back(b_cols);
@@ -500,9 +501,9 @@ TEST(MarsTest, DeltaSSE)
     algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), mask.size(), 0, 1);
     ASSERT_EQ(bcol, argmax(linear_sse));
     dsse1 = linear_sse[bcol];
-    ALL_B.col(b_cols) = (x3*x9).cast<double>();
+    ALL_B.col(b_cols) = x3.cast<double>()*x9.cast<double>();
     dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y.cast<double>());
-    ASSERT_NEAR(dsse1, dsse2, 2e-8);
+    ASSERT_NEAR(dsse1, dsse2, 1e-7);
 
     mse1 = algo.append('l', xcol, bcol, 0);
     mask.push_back(b_cols);
@@ -520,9 +521,33 @@ TEST(MarsTest, DeltaSSE)
     ASSERT_GT(hinge_sse.maxCoeff(),linear_sse.maxCoeff());
     dsse1 = hinge_sse[bcol];
 
-    ALL_B.col(b_cols) = (x7-.4).cwiseMax(0).cast<double>();
-    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y.cast<double>());
-    //ASSERT_NEAR(dsse1, dsse2, 1e-8);
+    ALL_B.col(b_cols  ) = (x7 - CUT).cwiseMax(0);
+    ALL_B.col(b_cols+1) = (CUT - x7).cwiseMax(0);
+    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
+    ASSERT_NEAR(dsse1/N, dsse2/N, 1e-7);
+
+    //-------------------------------------------------------------------------
+    // Test all permutations
+    //-------------------------------------------------------------------------
+    ALL_B.col(b_cols  ) = ALL_B.col(0).array() * (x7 - hinge_cut[0]).cwiseMax(0);
+    ALL_B.col(b_cols+1) = ALL_B.col(0).array() * (hinge_cut[0] - x7).cwiseMax(0);
+    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
+    ASSERT_NEAR(hinge_sse[0]/N, dsse2/N, 1e-7);
+
+    ALL_B.col(b_cols  ) = ALL_B.col(1).array() * (x7 - hinge_cut[1]).cwiseMax(0);
+    ALL_B.col(b_cols+1) = ALL_B.col(1).array() * (hinge_cut[1] - x7).cwiseMax(0);
+    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
+    ASSERT_NEAR(hinge_sse[1]/N, dsse2/N, 1e-7);
+
+    ALL_B.col(b_cols  ) = ALL_B.col(2).array() * (x7 - hinge_cut[2]).cwiseMax(0);
+    ALL_B.col(b_cols+1) = ALL_B.col(2).array() * (hinge_cut[2] - x7).cwiseMax(0);
+    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
+    ASSERT_NEAR(hinge_sse[2]/N, dsse2/N, 1e-7);
+
+    ALL_B.col(b_cols  ) = ALL_B.col(3).array() * (x7 - hinge_cut[3]).cwiseMax(0);
+    ALL_B.col(b_cols+1) = ALL_B.col(3).array() * (hinge_cut[3] - x7).cwiseMax(0);
+    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
+    ASSERT_NEAR(hinge_sse[3]/N, dsse2/N, 1e-7);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
