@@ -163,7 +163,7 @@ public:
         //---------------------------------------------------------------------
         VectorXd yb  = (Bo.transpose() * _y.matrix());
         ArrayXd  yb2 = (Bx.transpose() * _y.matrix()).array();
-        Map<ArrayXd>(linear_sse,p) = (yb.transpose()*yb) + yb2.square();
+        Map<ArrayXd>(linear_sse,p) = yb.squaredNorm() + yb2.square();
 
         //---------------------------------------------------------------------
         // Evaluate the delta SSE on all hinge locations
