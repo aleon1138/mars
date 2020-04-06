@@ -68,7 +68,7 @@ TEST(MarsTest, Orthonormalize)
     B.col(BAD_COL) = B.col(1); // add a co-linear column
 
     //-------------------------------------------------------------------------
-    // Initialize 'Bo' as the orthonomal projection of 'B'
+    // Initialize 'Bo' as the ortho-normal projection of 'B'
     //-------------------------------------------------------------------------
     Bo = B.cast<double>();
     Bo.col(0) *= invnorm(Bo.col(0));
@@ -88,7 +88,7 @@ TEST(MarsTest, Orthonormalize)
     ASSERT_TRUE((Bo.transpose()*Bo).isApprox(BoBo,EPS));
 
     //-------------------------------------------------------------------------
-    // Test out orthonormalize utility.
+    // Test out ortho-normalize utility.
     //-------------------------------------------------------------------------
     MatrixXd Bx(n,p);
     orthonormalize(Bx, B, Bo, x, mask, EPS);
@@ -252,22 +252,17 @@ TEST(MarsTest, DeltaSSE)
     mask.push_back(b_cols++);
     mse2 = slow_mse(ALL_B.leftCols(b_cols), y);
     ASSERT_NEAR(mse1, mse2, 2e-8);
-/*
+
+    double cur_dsse = y.transpose()*y - mse1*N; // keep track of this for later...
+
     //-------------------------------------------------------------------------
     // Try adding an empty data column
     //-------------------------------------------------------------------------
     xcol = 10;
     bcol = 0;
     algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), mask.size(), 0, 0);
-    ASSERT_EQ(bcol, argmax(hinge_sse));
-    ASSERT_GT(hinge_sse.maxCoeff(),linear_sse.maxCoeff());
-    dsse1 = hinge_sse[bcol];
-
-    ALL_B.col(b_cols  ) = (x7 - CUT).cwiseMax(0);
-    ALL_B.col(b_cols+1) = (CUT - x7).cwiseMax(0);
-    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-    ASSERT_NEAR(dsse1/N, dsse2/N, 1e-8);
-    */
+    ASSERT_TRUE(linear_sse.head(b_cols).isConstant(cur_dsse,1e-8));
+    ASSERT_TRUE(hinge_sse. head(b_cols).isConstant(cur_dsse,1e-8));
 }
 
 ///////////////////////////////////////////////////////////////////////////////
