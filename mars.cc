@@ -37,7 +37,7 @@ void dsse(MarsAlgo &algo,
 
 using namespace pybind11::literals;
 
-PYBIND11_MODULE(mars, m) {
+PYBIND11_MODULE(marslib, m) {
     m.doc() = "Multivariate Adaptive Regression Splines";
 
     py::class_<MarsAlgo>(m, "MarsAlgo")
