@@ -46,6 +46,6 @@ PYBIND11_MODULE(marslib, m) {
         , "y"_a.noconvert()
         , "w"_a.noconvert()
         , "max_terms"_a)
-        .def("dsse", &dsse)
+        .def("dsse", &dsse, "delta SSE")
         ;
 }
