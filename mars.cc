@@ -26,6 +26,11 @@ void dsse(MarsAlgo &algo,
     int endspan,
     bool linear_only)
 {
+    if (linear_sse.rows() != mask.rows() ||
+        hinge_sse.rows()  != mask.rows() ||
+        hinge_cut.rows()  != mask.rows()) {
+        throw std::runtime_error("invalid dataset lengths");
+    }
     algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(),
         xcol, mask.data(), mask.rows(), endspan, linear_only);
 }

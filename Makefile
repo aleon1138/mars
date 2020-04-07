@@ -4,7 +4,7 @@ CFLAGS += -mfma -mavx2 -march=native -I/usr/include/eigen3
 PYBIND += $(shell python3 -m pybind11 --includes)
 PYBIND += $(shell python3-config --includes)
 
-mars.so: mars.cc marsalgo.h
+marslib.so: mars.cc marsalgo.h
 	c++ $(CFLAGS) -shared -fPIC $(PYBIND) -o $@ mars.cc
 
 test: unittest
@@ -14,4 +14,4 @@ unittest: unittest.cc marsalgo.h
 	c++ $(CFLAGS) -o $@ $< -lgtest -lpthread
 
 clean:
-	rm -f unittest mars.so
+	rm -f unittest marslib.so

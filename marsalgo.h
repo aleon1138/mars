@@ -143,6 +143,9 @@ public:
         if (p > _m) {
             throw std::runtime_error("invalid mask array");
         }
+        if (xcol < 0 || xcol >= _X.cols()) {
+            throw std::runtime_error("invalid X column index");
+        }
         const unsigned csr = _mm_getcsr();
         _mm_setcsr(csr | 0x8040); // FTZ and DAZ
 
