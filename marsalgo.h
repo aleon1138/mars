@@ -151,7 +151,7 @@ public:
 
         const int n = _X.rows();
         const int m = _m;
-        ArrayXf   x = _X.col(xcol) * _s[xcol]; // normalize 'x' column
+        ArrayXf   x = _X.col(xcol) * _s[xcol]; // normalize 'X' column
         Ref<MatrixXd>  Bx  = _Bx.leftCols(p);
         Ref<MatrixXdC> Bo  = _Bo.leftCols(m);
         Ref<MatrixXdC> Bok = _Bok.leftCols(m);
@@ -250,7 +250,7 @@ public:
 
             for (int j = 0; j < p; ++j) {
                 hinge_sse[j] += linear_sse[j];
-                hinge_cut[j] = hinge_idx[j]>=0? x[k[hinge_idx[j]]]/_s[xcol] : NAN;
+                hinge_cut[j] = hinge_idx[j]>=0? _X(k[hinge_idx[j]],xcol) : NAN;
             }
         }
         _mm_setcsr(csr); // revert

@@ -56,6 +56,7 @@ def fit(X, y, w=None, **kwargs):
     assert len(X) == len(y) == len(w)
     assert len(X) > 0, "empty dataset"
 
+    # fmt: off
     max_epochs    = kwargs.pop('max_epochs', min(X.shape[1]+len(X)//20, 15))
     max_degree    = kwargs.pop('max_degree', 3)
     penalty       = kwargs.pop('penalty', 3.0)
@@ -69,9 +70,10 @@ def fit(X, y, w=None, **kwargs):
     r2_thresh     = kwargs.pop('r2_thresh', 3e-5)
     labels        = kwargs.pop('labels', None)
     aux_filter    = kwargs.pop('xfilter', lambda x,b: True)
-    max_basis     = kwargs.pop('max_basis', max_epochs*2)
-    max_inputs    = kwargs.pop('max_inputs', X.shape[1])
+    max_basis     = kwargs.pop('max_basis', max_epochs*2) # for "Fast MARS"
+    max_inputs    = kwargs.pop('max_inputs', X.shape[1])  # for "Faster MARS v2"
     aging_factor  = kwargs.pop('aging_factor', 1.0)
+    # fmt: on
 
     if kwargs:
         raise TypeError('unknown argument: %s' % kwargs)
@@ -134,7 +136,7 @@ def fit(X, y, w=None, **kwargs):
 
             if len(mask) > 0:
                 inputs_used += np.isfinite(input_sse[i]) # don't count unseen inputs
-                byyb,sse1,sse2,cut = algo.dsse(i,mask,tail,linear_only)
+                sse1,sse2,cut = algo.dsse(i,mask,tail,linear_only)
 
                 # TODO - we should use GCV adjusted SSE here
                 for j, sse2_j in zip(mask,sse2):
@@ -144,10 +146,8 @@ def fit(X, y, w=None, **kwargs):
 
                 j1 = sse1.argmax() # SSE improvement by adding a linear term
                 j2 = sse2.argmax() # SSE improvement by adding two disjoint hinges
-                if sse1[j1] > 0:
-                    results.append((i,mask[j1],np.nan, 1,(1.-byyb-sse1[j1])/n))
-                if sse2[j2] > 0:
-                    results.append((i,mask[j2],cut[j2],2,(1.-byyb-sse2[j2])/n))
+                results.append((i,mask[j1],np.nan, 1,(1.-sse1[j1])/n))
+                results.append((i,mask[j2],cut[j2],2,(1.-sse2[j2])/n))
 
                 if inputs_used >= max_inputs:
                     break
