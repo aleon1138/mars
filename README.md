@@ -16,7 +16,7 @@ the library is no longer available pre-compiled on Ubuntu.
     sudo cp *.a /usr/lib
 ```
 
-[pybind11](https://github.com/pybind/pybind11)
+[pybind11](https://github.com/pybind/pybind11) - Install using your python package manager
 ```bash
-    conda install -y pybind11  # or via pip
+    conda install -y pybind11
 ```
