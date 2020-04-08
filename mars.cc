@@ -3,6 +3,7 @@
 #include <pybind11/pybind11.h>
 namespace py = pybind11;
 
+///////////////////////////////////////////////////////////////////////////////
 
 MarsAlgo * new_algo(
     const Ref<const MatrixXf> &X,
@@ -17,6 +18,7 @@ MarsAlgo * new_algo(
                         X.rows(), X.cols(), max_terms, X.outerStride());
 }
 
+///////////////////////////////////////////////////////////////////////////////
 
 void dsse(MarsAlgo &algo,
           Ref<ArrayXd> &linear_sse,
@@ -28,14 +30,15 @@ void dsse(MarsAlgo &algo,
           bool linear_only)
 {
     if (linear_sse.rows() != mask.rows() ||
-            hinge_sse.rows()  != mask.rows() ||
-            hinge_cut.rows()  != mask.rows()) {
+        hinge_sse.rows()  != mask.rows() ||
+        hinge_cut.rows()  != mask.rows()) {
         throw std::runtime_error("invalid dataset lengths");
     }
     algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(),
               xcol, mask.data(), endspan, linear_only);
 }
 
+///////////////////////////////////////////////////////////////////////////////
 
 PYBIND11_MODULE(marslib, m) {
     py::options options;
@@ -50,7 +53,7 @@ PYBIND11_MODULE(marslib, m) {
          , py::arg("y").noconvert()
          , py::arg("w").noconvert()
          , py::arg("max_terms")
-    )
+        )
     .def("dsse", &dsse)
     ;
 }
