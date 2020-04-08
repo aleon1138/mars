@@ -1,6 +1,6 @@
 #include "marsalgo.h"
-#include <pybind11/pybind11.h>
 #include <pybind11/eigen.h>
+#include <pybind11/pybind11.h>
 namespace py = pybind11;
 
 
@@ -16,6 +16,7 @@ MarsAlgo * new_algo(
     return new MarsAlgo(X.data(), y.data(), w.data(),
                         X.rows(), X.cols(), max_terms, X.outerStride());
 }
+
 
 void dsse(MarsAlgo &algo,
           Ref<ArrayXd> &linear_sse,
@@ -35,17 +36,21 @@ void dsse(MarsAlgo &algo,
               xcol, mask.data(), endspan, linear_only);
 }
 
-using namespace pybind11::literals;
 
 PYBIND11_MODULE(marslib, m) {
+    py::options options;
+    options.disable_function_signatures();
+
     m.doc() = "Multivariate Adaptive Regression Splines";
+    m.attr("__version__") = "dev";
 
     py::class_<MarsAlgo>(m, "MarsAlgo")
     .def(py::init(&new_algo)
-         , "X"_a.noconvert()
-         , "y"_a.noconvert()
-         , "w"_a.noconvert()
-         , "max_terms"_a)
-    .def("dsse", &dsse, "delta SSE")
+         , py::arg("X").noconvert()
+         , py::arg("y").noconvert()
+         , py::arg("w").noconvert()
+         , py::arg("max_terms")
+    )
+    .def("dsse", &dsse)
     ;
 }
