@@ -21,7 +21,7 @@ void dsse(MarsAlgo &algo,
     Ref<ArrayXd> &linear_sse,
     Ref<ArrayXd> &hinge_sse,
     Ref<ArrayXd> &hinge_cut,
-    const Ref<const ArrayXi64> &mask,
+    const Ref<const ArrayXb> &mask,
     int xcol,
     int endspan,
     bool linear_only)
@@ -32,7 +32,7 @@ void dsse(MarsAlgo &algo,
         throw std::runtime_error("invalid dataset lengths");
     }
     algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(),
-        xcol, mask.data(), mask.rows(), endspan, linear_only);
+        xcol, mask.data(), endspan, linear_only);
 }
 
 using namespace pybind11::literals;

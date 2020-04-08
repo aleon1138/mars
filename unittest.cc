@@ -287,13 +287,23 @@ TEST(MarsTest, DeltaSSE)
     mask[bcol] = false;
     algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), 0, 0);
 
-    ASSERT_EQ(linear_sse[bcol],0);
-    ASSERT_EQ(hinge_sse [bcol],0);
+    ASSERT_TRUE(std::isnan(hinge_cut[bcol]));
+    hinge_cut[bcol] = 42; // replace NAN value
 
-    linear_sse[bcol] = 1e9;
-    hinge_sse [bcol] = 1e9;
-    ASSERT_TRUE((linear_sse.head(b_cols) > cur_dsse).all());
-    ASSERT_TRUE((hinge_sse. head(b_cols) > cur_dsse).all());
+    ArrayXd linear_sse_2(b_cols);
+    ArrayXd hinge_sse_2 (b_cols);
+    ArrayXd hinge_cut_2 (b_cols);
+
+    mask[bcol] = true;
+    algo.dsse(linear_sse_2.data(), hinge_sse_2.data(), hinge_cut_2.data(), xcol, mask.data(), 0, 0);
+
+    linear_sse_2[bcol] = 0;
+    hinge_sse_2 [bcol] = 0;
+    hinge_cut_2 [bcol] = 42; // make match with NAN value
+
+    ASSERT_TRUE(linear_sse.head(b_cols).isApprox(linear_sse_2));
+    ASSERT_TRUE(hinge_sse.head(b_cols).isApprox(hinge_sse_2));
+    ASSERT_TRUE(hinge_cut.head(b_cols).isApprox(hinge_cut_2));
 }
 
 ///////////////////////////////////////////////////////////////////////////////

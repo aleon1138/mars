@@ -126,28 +126,30 @@ def fit(X, y, w=None, **kwargs):
         basis_to_use = np.argsort(basis_sse)[::-1][:max_basis] # "Fast MARS" tweak
         input_to_use = np.argsort(_ranks(input_sse) + aging_factor*(epoch-input_age)*(input_sse>0))[::-1]
 
-        for i in basis_to_use:
-            basis_sse[i] = -np.inf # reset cache, so that max() works later on
+        basis_mask = np.zeros(len(basis),dtype='b')
+        basis_mask[basis_to_use] = True
+        basis_sse[basis_to_use] = -np.inf # reset cache, so that max() works later on
 
         inputs_used = 0
         for i in input_to_use:
-            mask = [(basic_filter(i,b) and aux_filter(i,b)) for b in basis]
-            mask = np.intersect1d(np.nonzero(mask)[0], basis_to_use)
+            mask = np.array([(basic_filter(i,b) and aux_filter(i,b)) for b in basis],dtype='b')
+            mask = mask & basis_mask
 
-            if len(mask) > 0:
+            if mask.any():
                 inputs_used += np.isfinite(input_sse[i]) # don't count unseen inputs
                 sse1,sse2,cut = algo.dsse(i,mask,tail,linear_only)
 
                 # TODO - we should use GCV adjusted SSE here
-                for j, sse2_j in zip(mask,sse2):
-                    basis_sse[j] = max(sse2_j,basis_sse[j])
+                basis_sse[mask] = np.maximum(sse2[mask],basis_sse[mask])
                 input_sse[i] = sse2.max()
                 input_age[i] = epoch
 
                 j1 = sse1.argmax() # SSE improvement by adding a linear term
                 j2 = sse2.argmax() # SSE improvement by adding two disjoint hinges
-                results.append((i,mask[j1],np.nan, 1,(1.-sse1[j1])/n))
-                results.append((i,mask[j2],cut[j2],2,(1.-sse2[j2])/n))
+                if sse1[j1] > 0:
+                    results.append((i,mask[j1],np.nan, 1,(1.-sse1[j1])/n))
+                if sse2[j2] > 0:
+                    results.append((i,mask[j2],cut[j2],2,(1.-sse2[j2])/n))
 
                 if inputs_used >= max_inputs:
                     break
