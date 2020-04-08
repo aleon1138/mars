@@ -10,6 +10,8 @@ the library is no longer available pre-compiled on Ubuntu.
 ```bash
     conda install -y pybind11  # install via your python package manager
     sudo apt install -y libeigen3-dev libgtest-dev cmake
+
+    # gtest must be installed manually
     cd /usr/src/gtest
     sudo cmake CMakeLists.txt && sudo make
     sudo cp *.a /usr/lib
