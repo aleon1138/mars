@@ -7,9 +7,10 @@ using namespace Eigen;
 typedef Matrix<double,Dynamic,Dynamic,RowMajor> MatrixXdC;
 typedef Array<int32_t,Dynamic,1> ArrayXi32;
 typedef Array<int64_t,Dynamic,1> ArrayXi64;
+typedef Array<bool,Dynamic,1> ArrayXb;
 
 ///////////////////////////////////////////////////////////////////////////////
-///  Return indices in REVERSED order
+///  Return indexes in REVERSED order
 ///////////////////////////////////////////////////////////////////////////////
 void argsort(int32_t *idx, const float *v, int n) {
     std::iota(idx, idx+n, 0);
@@ -17,10 +18,24 @@ void argsort(int32_t *idx, const float *v, int n) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+///  Return the indexes of all non-zero values
+///////////////////////////////////////////////////////////////////////////////
+ArrayXi nonzero(const ArrayXb &x) {
+    ArrayXi y(x.size());
+    int n = 0;
+    for (int i = 0; i < x.rows(); ++i) {
+        if (x[i]) {
+            y[n++] = i;
+        }
+    }
+    return y.head(n);
+}
+
+///////////////////////////////////////////////////////////////////////////////
 ///  Ortho-normalize via inverse Cholesky method
 ///////////////////////////////////////////////////////////////////////////////
 void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXdC> &Bo,
-                    const ArrayXf &x, const ArrayXi64 &mask, double tol)
+                    const ArrayXf &x, const ArrayXi &mask, double tol)
 {
     assert(B.cols()  == Bo.cols() && Bx.rows() == B.rows());
     assert(Bx.cols() == mask.rows());
@@ -137,21 +152,21 @@ public:
 
     ///////////////////////////////////////////////////////////////////////////
 
-    void dsse(double *linear_sse, double *hinge_sse, double *hinge_cut,
-              int xcol, const int64_t *mask, int p, int endspan, bool linear_only)
+    void dsse(double *linear_sse_, double *hinge_sse_, double *hinge_cut_,
+              int xcol, const bool *mask, int endspan, bool linear_only)
     {
-        if (p > _m) {
-            throw std::runtime_error("invalid mask array");
-        }
         if (xcol < 0 || xcol >= _X.cols()) {
             throw std::runtime_error("invalid X column index");
         }
         const unsigned csr = _mm_getcsr();
         _mm_setcsr(csr | 0x8040); // FTZ and DAZ
 
+        ArrayXi Bcols = nonzero(Map<const ArrayXb>(mask,_m));
         const int n = _X.rows();
         const int m = _m;
-        ArrayXf   x = _X.col(xcol) * _s[xcol]; // normalize 'X' column
+        const int p = Bcols.rows();
+
+        ArrayXf        x   = _X.col(xcol) * _s[xcol]; // copy and normalize 'X' column
         Ref<MatrixXd>  Bx  = _Bx.leftCols(p);
         Ref<MatrixXdC> Bo  = _Bo.leftCols(m);
         Ref<MatrixXdC> Bok = _Bok.leftCols(m);
@@ -159,27 +174,34 @@ public:
         //---------------------------------------------------------------------
         // Ortho-normalize via inverse Cholesky method
         //---------------------------------------------------------------------
-        orthonormalize(Bx, _B.leftCols(m), Bo, x, Map<const ArrayXi64>(mask,p), _tol);
+        orthonormalize(Bx, _B.leftCols(m), Bo, x, Bcols, _tol);
 
         //---------------------------------------------------------------------
         // Calculate the linear delta SSE
         //---------------------------------------------------------------------
         VectorXd yb  = (Bo.transpose() * _y.matrix());
         ArrayXd  yb2 = (Bx.transpose() * _y.matrix()).array();
-        Map<ArrayXd>(linear_sse,p) = yb.squaredNorm() + yb2.square();
+        ArrayXd  linear_sse = yb.squaredNorm() + yb2.square();
+
+        //---------------------------------------------------------------------
+        // Map the results to the output arrays
+        //---------------------------------------------------------------------
+        Map<ArrayXd>(linear_sse_,_m) = ArrayXd::Zero(_m);
+        for (int j = 0; j < p; ++j) {
+            linear_sse_[Bcols[j]] = linear_sse[j];
+        }
 
         //---------------------------------------------------------------------
         // Evaluate the delta SSE on all hinge locations
         //---------------------------------------------------------------------
         if (linear_only == false) {
-            ArrayXi hinge_idx(p);
-            for (int j = 0; j < p; ++j) {
-                hinge_idx[j] = -1;
-                hinge_sse[j] =  0;
-            }
+            ArrayXi hinge_idx = ArrayXi::Constant(p,-1);
+            ArrayXd hinge_sse = ArrayXd::Constant(p,0);
+            ArrayXd hinge_cut = ArrayXd::Constant(p,NAN);
 
             //-----------------------------------------------------------------
-            // Get sort indices
+            // Get sort indexes
+            // TODO - this needs to be cached ?
             //-----------------------------------------------------------------
             ArrayXi32 k(n);
             argsort(k.data(), _X.col(xcol).data(), n);
@@ -205,7 +227,7 @@ public:
             static_assert(FP_FAST_FMA, "-mfma must be enabled");
 
             for (int j = 0; j < p; ++j) {
-                const Ref<VectorXf> b  = _B.col(mask[j]);
+                const Ref<VectorXf> b  = _B.col(Bcols[j]);
                 const Ref<VectorXd> bx = Bx.col(j);
 
                 double b_i = b[k[0]]; // sort and upscale to double
@@ -248,9 +270,16 @@ public:
                 }
             }
 
+            //-----------------------------------------------------------------
+            // Map the results to the output arrays
+            //-----------------------------------------------------------------
+            Map<ArrayXd>(hinge_sse_,_m) = ArrayXd::Zero(_m);
+            Map<ArrayXd>(hinge_cut_,_m) = ArrayXd::Constant(_m,NAN);
             for (int j = 0; j < p; ++j) {
-                hinge_sse[j] += linear_sse[j];
-                hinge_cut[j] = hinge_idx[j]>=0? _X(k[hinge_idx[j]],xcol) : NAN;
+                if (hinge_idx[j] >= 0) {
+                    hinge_sse_[Bcols[j]] = linear_sse[j] + hinge_sse[j];
+                    hinge_cut_[Bcols[j]] = _X(k[hinge_idx[j]],xcol);
+                }
             }
         }
         _mm_setcsr(csr); // revert
