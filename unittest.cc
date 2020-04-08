@@ -43,7 +43,9 @@ TEST(MarsTest, ArgSort)
     ArrayXf y = x;
     ArrayXi32 k(n);
 
-    std::sort(y.data(), y.data()+n, [](float a, float b) { return a > b; });
+    std::sort(y.data(), y.data()+n, [](float a, float b) {
+        return a > b;
+    });
     argsort(k.data(), x.data(), n);
 
     for (int i = 0; i < n; ++i) {
@@ -142,11 +144,12 @@ TEST(MarsTest, DeltaSSE)
 
     MatrixXd X(MatrixXd::Random(N,M));
     ArrayXd  x3 = X.col(3).array();
-    ArrayXd  x7 = X.col(7).array(); x7[100] = CUT;
+    ArrayXd  x7 = X.col(7).array();
+    x7[100] = CUT;
     ArrayXd  x9 = X.col(9).array();
     X.col(10) = VectorXd::Zero(N);
     VectorXd y = (x3*.3 - x9*.2 + x3*x9*.25
-                 -5*(x7-CUT).cwiseMax(0) + 2*(CUT-x7).cwiseMax(0)).matrix();
+                  -5*(x7-CUT).cwiseMax(0) + 2*(CUT-x7).cwiseMax(0)).matrix();
 
     y += VectorXd::Random(y.rows()); // add noise
     y /= y.norm();

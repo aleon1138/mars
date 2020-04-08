@@ -14,7 +14,9 @@ typedef Array<bool,Dynamic,1> ArrayXb;
 ///////////////////////////////////////////////////////////////////////////////
 void argsort(int32_t *idx, const float *v, int n) {
     std::iota(idx, idx+n, 0);
-    std::sort(idx, idx+n, [&v](size_t i, size_t j) { return v[i] > v[j]; });
+    std::sort(idx, idx+n, [&v](size_t i, size_t j) {
+        return v[i] > v[j];
+    });
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -45,10 +47,10 @@ void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXd
     }
 
     const MatrixXd h = Bo.transpose() * Bx;
-    const ArrayXd  s = (Bx.colwise().squaredNorm() - h.colwise().squaredNorm()).array() + tol;
+    const ArrayXd  s = (Bx.colwise().squaredNorm() - h.colwise().squaredNorm()).array();
 
     Bx -= Bo * h;
-    Bx *= (s > 0).select(1/s.sqrt(), 0).matrix().asDiagonal();
+    Bx *= (s > tol).select(1/(s+tol).sqrt(), 0).matrix().asDiagonal();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -68,7 +70,7 @@ void sort_columns(Ref<MatrixXd> X, const ArrayXi32 &k)
 }
 
 void covariates(double *ff_, double *fy_, ArrayXd &f, ArrayXd &g,
-    const Ref<VectorXd> &x, const VectorXd &y, double k0, double k1)
+                const Ref<VectorXd> &x, const VectorXd &y, double k0, double k1)
 {
     assert(x.cols()==1 && x.rows()>=x.cols());
     assert(x.rows()==y.rows());
@@ -107,12 +109,12 @@ class MarsAlgo {
 
 public:
     MarsAlgo(const float *x, const float *y, const float *w, int n, int m, int p, int ldx)
-       : _X  (x,n,m,Stride<Dynamic,1>(ldx,1))
-       , _B  (MatrixXf ::Zero(n,p))
-       , _Bo (MatrixXdC::Zero(n,p))
-       , _Bok(MatrixXdC::Zero(n,p))
-       , _Bx (MatrixXdC::Zero(n,p))
-       , _tol((n*0.02)*DBL_EPSILON) // rough guess
+        : _X  (x,n,m,Stride<Dynamic,1>(ldx,1))
+        , _B  (MatrixXf ::Zero(n,p))
+        , _Bo (MatrixXdC::Zero(n,p))
+        , _Bok(MatrixXdC::Zero(n,p))
+        , _Bx (MatrixXdC::Zero(n,p))
+        , _tol((n*0.02)*DBL_EPSILON) // rough guess
     {
         if (std::isfinite(NAN)) {
             throw std::runtime_error("NAN check is disabled, recompile without --fast-math");
@@ -125,7 +127,9 @@ public:
         // Filter out NAN's and apply weight to the target 'y'.
         //---------------------------------------------------------------------
         for (int i = 0; i < n; ++i) {
-            if (!std::isfinite(y[i])) { _y[i] = vv[i] = 0; }
+            if (!std::isfinite(y[i])) {
+                _y[i] = vv[i] = 0;
+            }
         }
         _y *= vv; // apply weight to target
 
@@ -297,17 +301,17 @@ public:
         Ref<const ArrayXf> x = _X.col(xcol).array();
 
         switch(type) {
-            case 'l':
-                _B.col(_m) = (s*b*x);
-                break;
-            case '+':
-                _B.col(_m) = (s*b*(x-h).cwiseMax(0));
-                break;
-            case '-':
-                _B.col(_m) = (s*b*(h-x).cwiseMax(0));
-                break;
-            default:
-                throw std::runtime_error("invalid basis type");
+        case 'l':
+            _B.col(_m) = (s*b*x);
+            break;
+        case '+':
+            _B.col(_m) = (s*b*(x-h).cwiseMax(0));
+            break;
+        case '-':
+            _B.col(_m) = (s*b*(h-x).cwiseMax(0));
+            break;
+        default:
+            throw std::runtime_error("invalid basis type");
         }
 
         //---------------------------------------------------------------------
