@@ -5,8 +5,8 @@ CFLAGS += -I/usr/include/eigen3
 PYBIND += $(shell python3 -m pybind11 --includes)
 PYBIND += $(shell python3-config --includes)
 
-marslib.so: mars.cc marsalgo.h
-	c++ $(CFLAGS) -shared -fPIC $(PYBIND) -o $@ mars.cc
+marslib.so: marslib.cc marsalgo.h
+	c++ $(CFLAGS) -shared -fPIC $(PYBIND) -o $@ $<
 
 test: unittest
 	./unittest
