@@ -22,17 +22,38 @@ ArrayXi create_mask(int m, int p) {
     return Map<ArrayXi>(idx.data(),p);
 }
 
+//
+// Return the delta sum of squared errors (SSE), discarding the Y variance.
+//   sse  = y' * y - beta' * (X' * y)
+//
 double slow_dsse(Ref<const MatrixXd> X, VectorXd y) {
     VectorXd xy = X.transpose() * y;
     VectorXd b  = X.fullPivHouseholderQr().solve(y);
-    return b.transpose() * xy;
+    double dsse = b.transpose() * xy;
+    return dsse / y.squaredNorm();
 }
 
 double slow_mse(MatrixXd X, VectorXd y) {
     VectorXd b = X.fullPivHouseholderQr().solve(y);
     VectorXd e = X * b - y;
-    return e.squaredNorm()/e.rows();
+    double mse = e.squaredNorm()/e.rows();
+    return mse / y.squaredNorm();
 }
+
+struct Result {
+    Result(MarsAlgo &algo, int xcol, const ArrayXb &mask, bool linear) {
+        linear_dsse = ArrayXd(mask.rows());
+        hinge_dsse  = ArrayXd(mask.rows());
+        hinge_cut   = ArrayXd(mask.rows());
+        algo.dsse(&base_dsse, linear_dsse.data(), hinge_dsse.data(),
+            hinge_cut.data(), xcol, mask.data(), 0, linear);
+    }
+
+    double  base_dsse;
+    ArrayXd linear_dsse;
+    ArrayXd hinge_dsse;
+    ArrayXd hinge_cut;
+};
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -143,16 +164,17 @@ TEST(MarsTest, DeltaSSE)
     const double CUT = 0.25;
 
     MatrixXd X(MatrixXd::Random(N,M));
-    ArrayXd  x3 = X.col(3).array();
-    ArrayXd  x7 = X.col(7).array();
+    ArrayXd x3 = X.col(3).array();
+    ArrayXd x7 = X.col(7).array();
     x7[100] = CUT;
-    ArrayXd  x9 = X.col(9).array();
+    ArrayXd x9 = X.col(9).array();
     X.col(10) = VectorXd::Zero(N);
+
     VectorXd y = (x3*.3 - x9*.2 + x3*x9*.25
                   -5*(x7-CUT).cwiseMax(0) + 2*(CUT-x7).cwiseMax(0)).matrix();
-
     y += VectorXd::Random(y.rows()); // add noise
-    y /= y.norm();
+
+    //-------------------------------------------------------------------------
 
     MatrixXf X32 = X.cast<float>();
     VectorXf y32 = y.cast<float>();
@@ -160,14 +182,10 @@ TEST(MarsTest, DeltaSSE)
 
     double dsse1, dsse2;
     double mse1, mse2;
-    int xcol, bcol;
 
     ArrayXb mask = ArrayXb::Zero(M);
     mask[0] = true;
     MarsAlgo algo(X32.data(), y32.data(), w32.data(), X.rows(), X.cols(), X.cols()/2, X.rows());
-    ArrayXd linear_sse(ArrayXd::Zero(M));
-    ArrayXd hinge_sse (ArrayXd::Zero(M));
-    ArrayXd hinge_cut (ArrayXd::Zero(M));
     MatrixXd ALL_B(MatrixXd::Zero(N,M));
     ALL_B.col(0).array() = 1;
     int b_cols = 1; // number of valid columns in B
@@ -175,138 +193,161 @@ TEST(MarsTest, DeltaSSE)
     //-------------------------------------------------------------------------
     // Pick the first linear basis
     //-------------------------------------------------------------------------
-    xcol = 3; // just pick one
-    algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), 0, 1);
-    dsse1 = linear_sse[0];
-    ALL_B.col(b_cols) = x3;
-    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y);
-    ASSERT_NEAR(dsse1, dsse2, 1e-7);
+    {
+        const int xcol = 3; // just pick one
+        Result res(algo, xcol, mask.head(b_cols), 1);
 
-    mse1 = algo.append('l', xcol, 0, 0);
-    mask[b_cols++] = true;
-    mse2 = slow_mse(ALL_B.leftCols(b_cols), y);
-    ASSERT_NEAR(mse1, mse2, 1e-8);
+        double dsse1 = res.base_dsse + res.linear_dsse[0];
+        ALL_B.col(b_cols) = x3;
+        double dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y);
+        ASSERT_NEAR(dsse1, dsse2, 1e-7);
+
+        mse1 = algo.append('l', xcol, 0, 0);
+        mask[b_cols++] = true;
+        mse2 = slow_mse(ALL_B.leftCols(b_cols), y);
+        ASSERT_NEAR(mse1, mse2, 1e-8);
+    }
 
     //-------------------------------------------------------------------------
     // Try adding another linear basis
     //-------------------------------------------------------------------------
-    xcol = 9; // pick another column
-    algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), 0, 1);
-    dsse1 = linear_sse[0];
-    ALL_B.col(b_cols) = x9;
-    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y);
-    ASSERT_NEAR(dsse1, dsse2, 1e-7);
+    {
+        const int xcol = 9; // pick another column
+        Result res(algo, xcol, mask.head(b_cols), 1);
 
-    mse1 = algo.append('l', xcol, 0, 0);
-    mask[b_cols++] = true;
-    mse2 = slow_mse(ALL_B.leftCols(b_cols), y);
-    ASSERT_NEAR(mse1, mse2, 1e-8);
+        dsse1 = res.base_dsse + res.linear_dsse[0];
+        ALL_B.col(b_cols) = x9;
+        dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y);
+        ASSERT_NEAR(dsse1, dsse2, 1e-7);
+
+        mse1 = algo.append('l', xcol, 0, 0);
+        mask[b_cols++] = true;
+        mse2 = slow_mse(ALL_B.leftCols(b_cols), y);
+        ASSERT_NEAR(mse1, mse2, 1e-8);
+    }
 
     //-------------------------------------------------------------------------
     // Ok, now add the interaction
     //-------------------------------------------------------------------------
-    xcol = 9;
-    bcol = 1; // use x3 as interaction
-    algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), 0, 1);
-    ASSERT_EQ(bcol, argmax(linear_sse));
-    dsse1 = linear_sse[bcol];
-    ALL_B.col(b_cols) = x3*x9;
-    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y);
-    ASSERT_NEAR(dsse1, dsse2, 1e-7);
+    {
+        const int xcol = 9;
+        const int bcol = 1; // use x3 as interaction
+        Result res(algo, xcol, mask.head(b_cols), 1);
 
-    mse1 = algo.append('l', xcol, bcol, 0);
-    mask[b_cols++] = true;
-    mse2 = slow_mse(ALL_B.leftCols(b_cols), y);
-    ASSERT_NEAR(mse1, mse2, 1e-8);
+        ASSERT_EQ(bcol, argmax(res.linear_dsse));
+        dsse1 = res.base_dsse + res.linear_dsse[bcol];
+        ALL_B.col(b_cols) = x3*x9;
+        dsse2 = slow_dsse(ALL_B.leftCols(b_cols+1), y);
+        ASSERT_NEAR(dsse1, dsse2, 1e-7);
+
+        mse1 = algo.append('l', xcol, bcol, 0);
+        mask[b_cols++] = true;
+        mse2 = slow_mse(ALL_B.leftCols(b_cols), y);
+        ASSERT_NEAR(mse1, mse2, 1e-8);
+    }
 
     //-------------------------------------------------------------------------
     // Try adding the hinge at x7
     //-------------------------------------------------------------------------
-    xcol = 7;
-    bcol = 0;
-    algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), 0, 0);
-    ASSERT_EQ(bcol, argmax(hinge_sse));
-    ASSERT_GT(hinge_sse.maxCoeff(),linear_sse.maxCoeff());
-    dsse1 = hinge_sse[bcol];
+    double last_mse;
+    {
+        const int xcol = 7;
+        const int bcol = 0;
+        Result res(algo, xcol, mask.head(b_cols), 0);
 
-    ALL_B.col(b_cols  ) = (x7 - CUT).cwiseMax(0);
-    ALL_B.col(b_cols+1) = (CUT - x7).cwiseMax(0);
-    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-    ASSERT_NEAR(dsse1/N, dsse2/N, 1e-8);
+        ASSERT_EQ(bcol, argmax(res.hinge_dsse));
+        ASSERT_TRUE((res.hinge_dsse > res.linear_dsse).all());
+        dsse1 = res.base_dsse + res.hinge_dsse[bcol];
 
-    //-------------------------------------------------------------------------
-    // Test all permutations
-    //-------------------------------------------------------------------------
-    ALL_B.col(b_cols  ) = ALL_B.col(0).array() * (x7 - hinge_cut[0]).cwiseMax(0);
-    ALL_B.col(b_cols+1) = ALL_B.col(0).array() * (hinge_cut[0] - x7).cwiseMax(0);
-    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-    ASSERT_NEAR(hinge_sse[0]/N, dsse2/N, 1e-8);
+        ALL_B.col(b_cols  ) = (x7 - CUT).cwiseMax(0);
+        ALL_B.col(b_cols+1) = (CUT - x7).cwiseMax(0);
+        dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
+        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-8);
 
-    ALL_B.col(b_cols  ) = ALL_B.col(1).array() * (x7 - hinge_cut[1]).cwiseMax(0);
-    ALL_B.col(b_cols+1) = ALL_B.col(1).array() * (hinge_cut[1] - x7).cwiseMax(0);
-    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-    ASSERT_NEAR(hinge_sse[1]/N, dsse2/N, 1e-8);
+        //---------------------------------------------------------------------
+        // Test all permutations
+        //---------------------------------------------------------------------
+        ALL_B.col(b_cols  ) = ALL_B.col(0).array() * (x7 - res.hinge_cut[0]).cwiseMax(0);
+        ALL_B.col(b_cols+1) = ALL_B.col(0).array() * (res.hinge_cut[0] - x7).cwiseMax(0);
+        dsse1 = res.base_dsse+res.hinge_dsse[0];
+        dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
+        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-8);
 
-    ALL_B.col(b_cols  ) = ALL_B.col(2).array() * (x7 - hinge_cut[2]).cwiseMax(0);
-    ALL_B.col(b_cols+1) = ALL_B.col(2).array() * (hinge_cut[2] - x7).cwiseMax(0);
-    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-    ASSERT_NEAR(hinge_sse[2]/N, dsse2/N, 1e-8);
+        ALL_B.col(b_cols  ) = ALL_B.col(1).array() * (x7 - res.hinge_cut[1]).cwiseMax(0);
+        ALL_B.col(b_cols+1) = ALL_B.col(1).array() * (res.hinge_cut[1] - x7).cwiseMax(0);
+        dsse1 = res.base_dsse+res.hinge_dsse[1];
+        dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
+        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-8);
 
-    ALL_B.col(b_cols  ) = ALL_B.col(3).array() * (x7 - hinge_cut[3]).cwiseMax(0);
-    ALL_B.col(b_cols+1) = ALL_B.col(3).array() * (hinge_cut[3] - x7).cwiseMax(0);
-    dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-    ASSERT_NEAR(hinge_sse[3]/N, dsse2/N, 1e-8);
+        ALL_B.col(b_cols  ) = ALL_B.col(2).array() * (x7 - res.hinge_cut[2]).cwiseMax(0);
+        ALL_B.col(b_cols+1) = ALL_B.col(2).array() * (res.hinge_cut[2] - x7).cwiseMax(0);
+        dsse1 = res.base_dsse+res.hinge_dsse[2];
+        dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
+        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-8);
 
-    //-------------------------------------------------------------------------
-    // Append the hinges
-    //-------------------------------------------------------------------------
-    mse1 = algo.append('+', xcol, bcol, CUT);
-    ALL_B.col(b_cols) = (x7 - CUT).cwiseMax(0);
-    mask[b_cols++] = true;
-    mse2 = slow_mse(ALL_B.leftCols(b_cols), y);
-    ASSERT_NEAR(mse1, mse2, 2e-8);
+        ALL_B.col(b_cols  ) = ALL_B.col(3).array() * (x7 - res.hinge_cut[3]).cwiseMax(0);
+        ALL_B.col(b_cols+1) = ALL_B.col(3).array() * (res.hinge_cut[3] - x7).cwiseMax(0);
+        dsse1 = res.base_dsse+res.hinge_dsse[3];
+        dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
+        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-8);
 
-    mse1 = algo.append('-', xcol, bcol, CUT);
-    ALL_B.col(b_cols) = (CUT - x7).cwiseMax(0);
-    mask[b_cols++] = true;
-    mse2 = slow_mse(ALL_B.leftCols(b_cols), y);
-    ASSERT_NEAR(mse1, mse2, 2e-8);
+        //---------------------------------------------------------------------
+        // Append the hinges
+        //---------------------------------------------------------------------
+        mse1 = algo.append('+', xcol, bcol, CUT);
+        ALL_B.col(b_cols) = (x7 - CUT).cwiseMax(0);
+        mask[b_cols++] = true;
+        mse2 = slow_mse(ALL_B.leftCols(b_cols), y);
+        ASSERT_NEAR(mse1, mse2, 2e-8);
 
-    double cur_dsse = y.transpose()*y - mse1*N; // keep track of this for later...
+        mse1 = algo.append('-', xcol, bcol, CUT);
+        ALL_B.col(b_cols) = (CUT - x7).cwiseMax(0);
+        mask[b_cols++] = true;
+        mse2 = slow_mse(ALL_B.leftCols(b_cols), y);
+        ASSERT_NEAR(mse1, mse2, 2e-8);
+
+        last_mse = mse1; // save for later
+    }
 
     //-------------------------------------------------------------------------
     // Try adding an empty data column
     //-------------------------------------------------------------------------
-    xcol = 10;
-    algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), 0, 0);
-    ASSERT_TRUE(linear_sse.head(b_cols).isConstant(cur_dsse,1e-8));
-    ASSERT_TRUE(hinge_sse. head(b_cols).isConstant(0));
+    {
+        const int xcol = 10;
+        Result res(algo, xcol, mask.head(b_cols), 0);
+
+        ASSERT_NEAR(res.base_dsse, 1-last_mse*N, 1e-8);
+        ASSERT_TRUE(res.linear_dsse.head(b_cols).isConstant(0));
+        ASSERT_TRUE(res.hinge_dsse. head(b_cols).isConstant(0));
+    }
 
     //-------------------------------------------------------------------------
     // Try adding a mask
     //-------------------------------------------------------------------------
-    xcol = 2;
-    bcol = 3;
-    mask[bcol] = false;
-    algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(), xcol, mask.data(), 0, 0);
+    {
+        const int xcol = 2;
+        const int bcol = 3;
+        mask[bcol] = false;
+        Result res(algo, xcol, mask.head(b_cols), 0);
 
-    ASSERT_TRUE(std::isnan(hinge_cut[bcol]));
-    hinge_cut[bcol] = 42; // replace NAN value
+        ASSERT_TRUE(std::isnan(res.hinge_cut[bcol]));
+        res.hinge_cut[bcol] = 42; // replace NAN value
 
-    ArrayXd linear_sse_2(b_cols);
-    ArrayXd hinge_sse_2 (b_cols);
-    ArrayXd hinge_cut_2 (b_cols);
+        ArrayXd linear_sse_2(b_cols);
+        ArrayXd hinge_sse_2 (b_cols);
+        ArrayXd hinge_cut_2 (b_cols);
 
-    mask[bcol] = true;
-    algo.dsse(linear_sse_2.data(), hinge_sse_2.data(), hinge_cut_2.data(), xcol, mask.data(), 0, 0);
+        mask[bcol] = true;
+        Result foo(algo, xcol, mask.head(b_cols), 0);
 
-    linear_sse_2[bcol] = 0;
-    hinge_sse_2 [bcol] = 0;
-    hinge_cut_2 [bcol] = 42; // make match with NAN value
+        foo.linear_dsse[bcol] = 0;
+        foo.hinge_dsse [bcol] = 0;
+        foo.hinge_cut  [bcol] = 42; // make match with NAN value
 
-    ASSERT_TRUE(linear_sse.head(b_cols).isApprox(linear_sse_2));
-    ASSERT_TRUE(hinge_sse.head(b_cols).isApprox(hinge_sse_2));
-    ASSERT_TRUE(hinge_cut.head(b_cols).isApprox(hinge_cut_2));
+        ASSERT_TRUE(res.linear_dsse.isApprox(foo.linear_dsse));
+        ASSERT_TRUE(res.hinge_dsse.isApprox(foo.hinge_dsse));
+        ASSERT_TRUE(res.hinge_cut.isApprox(foo.hinge_cut));
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////

@@ -154,45 +154,74 @@ public:
         _s = (_s > 0.f).select(1.f/_s, 1.f);
     }
 
-    ///////////////////////////////////////////////////////////////////////////
+    int size() const {
+        return _m;
+    }
 
-    void dsse(double *linear_sse_, double *hinge_sse_, double *hinge_cut_,
-              int xcol, const bool *mask, int endspan, bool linear_only)
+    ///////////////////////////////////////////////////////////////////////////
+    //  Returns the delta SSE (sum of squared errors).
+    //
+    //  base_dsse : [out] the baseline delta SSE of the current model without
+    //      any additional bases.
+    //
+    //  linear_dsse : [out]
+    //
+    //  hinge_dsse : [out]
+    //
+    //  hinge_cuts : [out]
+    //
+    //  xol : which column of the training data to use.
+    //
+    //  bmask : a boolean mask to filter out which bases to use.
+    //
+    //  endspan : how many samples to ignore from both ends of the training data.
+    //
+    //  linear_only : do not find the optimal hinge cuts, only build a linear
+    //      model. You can set "hinge_sse" and "hinge_cut" as NULL.
+    ///////////////////////////////////////////////////////////////////////////
+    void dsse(double *base_dsse, double *linear_dsse, double *hinge_dsse,
+        double *hinge_cuts, int xcol, const bool *bmask, int endspan,
+        bool linear_only)
     {
         if (xcol < 0 || xcol >= _X.cols()) {
             throw std::runtime_error("invalid X column index");
         }
+
+        //---------------------------------------------------------------------
+        // Enable Flush-to-Zero (FTZ) and Denorms-as-Zero (DAZ)
+        //---------------------------------------------------------------------
         const unsigned csr = _mm_getcsr();
         _mm_setcsr(csr | 0x8040); // FTZ and DAZ
 
-        ArrayXi Bcols = nonzero(Map<const ArrayXb>(mask,_m));
+        ArrayXi Bcols = nonzero(Map<const ArrayXb>(bmask,_m));
         const int n = _X.rows();
         const int m = _m;
         const int p = Bcols.rows();
 
         ArrayXf        x   = _X.col(xcol) * _s[xcol]; // copy and normalize 'X' column
-        Ref<MatrixXd>  Bx  = _Bx.leftCols(p);
         Ref<MatrixXdC> Bo  = _Bo.leftCols(m);
         Ref<MatrixXdC> Bok = _Bok.leftCols(m);
+        Ref<MatrixXd>  Bx  = _Bx.leftCols(p);
 
         //---------------------------------------------------------------------
-        // Ortho-normalize via inverse Cholesky method
+        // Orthonormalize via inverse Cholesky method
         //---------------------------------------------------------------------
         orthonormalize(Bx, _B.leftCols(m), Bo, x, Bcols, _tol);
 
         //---------------------------------------------------------------------
         // Calculate the linear delta SSE
         //---------------------------------------------------------------------
-        VectorXd yb  = (Bo.transpose() * _y.matrix());
-        ArrayXd  yb2 = (Bx.transpose() * _y.matrix()).array();
-        ArrayXd  linear_sse = yb.squaredNorm() + yb2.square();
+        const VectorXd yb  = Bo.transpose() * _y.matrix();
+        const VectorXd yb2 = Bx.transpose() * _y.matrix();
+        const ArrayXd  linear_sse = yb2.array().square();
 
         //---------------------------------------------------------------------
-        // Map the results to the output arrays
+        // Map the results to the output buffers
         //---------------------------------------------------------------------
-        Map<ArrayXd>(linear_sse_,_m) = ArrayXd::Zero(_m);
+        *base_dsse = yb.squaredNorm();
+        Map<ArrayXd>(linear_dsse,_m) = ArrayXd::Zero(_m);
         for (int j = 0; j < p; ++j) {
-            linear_sse_[Bcols[j]] = linear_sse[j];
+            linear_dsse[Bcols[j]] = linear_sse[j];
         }
 
         //---------------------------------------------------------------------
@@ -277,12 +306,12 @@ public:
             //-----------------------------------------------------------------
             // Map the results to the output arrays
             //-----------------------------------------------------------------
-            Map<ArrayXd>(hinge_sse_,_m) = ArrayXd::Zero(_m);
-            Map<ArrayXd>(hinge_cut_,_m) = ArrayXd::Constant(_m,NAN);
+            Map<ArrayXd>(hinge_dsse,_m) = ArrayXd::Zero(_m);
+            Map<ArrayXd>(hinge_cuts,_m) = ArrayXd::Constant(_m,NAN);
             for (int j = 0; j < p; ++j) {
                 if (hinge_idx[j] >= 0) {
-                    hinge_sse_[Bcols[j]] = linear_sse[j] + hinge_sse[j];
-                    hinge_cut_[Bcols[j]] = _X(k[hinge_idx[j]],xcol);
+                    hinge_dsse[Bcols[j]] = linear_sse[j] + hinge_sse[j];
+                    hinge_cuts[Bcols[j]] = _X(k[hinge_idx[j]],xcol);
                 }
             }
         }

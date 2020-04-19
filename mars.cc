@@ -20,22 +20,29 @@ MarsAlgo * new_algo(
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void dsse(MarsAlgo &algo,
-          Ref<ArrayXd> &linear_sse,
-          Ref<ArrayXd> &hinge_sse,
-          Ref<ArrayXd> &hinge_cut,
-          const Ref<const ArrayXb> &mask,
-          int xcol,
-          int endspan,
-          bool linear_only)
+double dsse(MarsAlgo &algo,
+            Ref<ArrayXd> &linear_dsse,
+            Ref<ArrayXd> &hinge_dsse,
+            Ref<ArrayXd> &hinge_cuts,
+            const Ref<const ArrayXb> &mask,
+            int xcol,
+            int endspan,
+            bool linear_only)
 {
-    if (linear_sse.rows() != mask.rows() ||
-        hinge_sse.rows()  != mask.rows() ||
-        hinge_cut.rows()  != mask.rows()) {
+    if (mask.rows() != algo.size()) {
+      throw std::runtime_error("invalid basis mask length");
+    }
+
+    if (linear_dsse.rows() != algo.size() ||
+        hinge_dsse.rows()  != algo.size() ||
+        hinge_cuts.rows()  != algo.size()) {
         throw std::runtime_error("invalid dataset lengths");
     }
-    algo.dsse(linear_sse.data(), hinge_sse.data(), hinge_cut.data(),
+
+    double base_dsse = 0;
+    algo.dsse(&base_dsse, linear_dsse.data(), hinge_dsse.data(), hinge_cuts.data(),
               xcol, mask.data(), endspan, linear_only);
+    return base_dsse;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
