@@ -45,7 +45,8 @@ struct Result {
         linear_dsse = ArrayXd(mask.rows());
         hinge_dsse  = ArrayXd(mask.rows());
         hinge_cut   = ArrayXd(mask.rows());
-        algo.dsse(&base_dsse, linear_dsse.data(), hinge_dsse.data(),
+        base_dsse = algo.dsse();
+        algo.eval(linear_dsse.data(), hinge_dsse.data(),
             hinge_cut.data(), xcol, mask.data(), 0, linear);
     }
 

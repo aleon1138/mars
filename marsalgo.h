@@ -34,7 +34,7 @@ ArrayXi nonzero(const ArrayXb &x) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-///  Ortho-normalize via inverse Cholesky method
+///  Orthonormalize via inverse Cholesky method
 ///////////////////////////////////////////////////////////////////////////////
 void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXdC> &Bo,
                     const ArrayXf &x, const ArrayXi &mask, double tol)
@@ -102,6 +102,7 @@ class MarsAlgo {
     MatrixXdC   _Bo;        // all basis, ortho-normalized
     MatrixXdC   _Bok;       // all basis, ortho-normalized and sorted (scratch buffer)
     MatrixXd    _Bx;        // B[k,mask]*x[k,None] (scratch buffer)
+    VectorXd    _By;        // dot product of basis Bo with Y target
     ArrayXf     _s;         // scale of columns of 'X'
     int         _m    = 1;  // number of basis found
     double      _yvar = 0;  // variance of 'y'
@@ -141,6 +142,7 @@ public:
         //---------------------------------------------------------------------
         _B .col(0) = vv.cast<float>();
         _Bo.col(0) = vv;
+        _By = _Bo.leftCols(1).transpose() * _y.matrix();
 
         //---------------------------------------------------------------------
         // Calculate the sample variance of the target 'y'.
@@ -154,15 +156,16 @@ public:
         _s = (_s > 0.f).select(1.f/_s, 1.f);
     }
 
-    int size() const {
+    int nbasis() const {
         return _m;
+    }
+
+    double dsse() const {
+        return _By.squaredNorm();
     }
 
     ///////////////////////////////////////////////////////////////////////////
     //  Returns the delta SSE (sum of squared errors).
-    //
-    //  base_dsse : [out] the baseline delta SSE of the current model without
-    //      any additional bases.
     //
     //  linear_dsse : [out]
     //
@@ -179,9 +182,8 @@ public:
     //  linear_only : do not find the optimal hinge cuts, only build a linear
     //      model. You can set "hinge_sse" and "hinge_cut" as NULL.
     ///////////////////////////////////////////////////////////////////////////
-    void dsse(double *base_dsse, double *linear_dsse, double *hinge_dsse,
-        double *hinge_cuts, int xcol, const bool *bmask, int endspan,
-        bool linear_only)
+    void eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
+        int xcol, const bool *bmask, int endspan, bool linear_only)
     {
         if (xcol < 0 || xcol >= _X.cols()) {
             throw std::runtime_error("invalid X column index");
@@ -211,14 +213,13 @@ public:
         //---------------------------------------------------------------------
         // Calculate the linear delta SSE
         //---------------------------------------------------------------------
-        const VectorXd yb  = Bo.transpose() * _y.matrix();
+        const VectorXd &yb = _By; // Bo.transpose() * _y.matrix();
         const VectorXd yb2 = Bx.transpose() * _y.matrix();
         const ArrayXd  linear_sse = yb2.array().square();
 
         //---------------------------------------------------------------------
         // Map the results to the output buffers
         //---------------------------------------------------------------------
-        *base_dsse = yb.squaredNorm();
         Map<ArrayXd>(linear_dsse,_m) = ArrayXd::Zero(_m);
         for (int j = 0; j < p; ++j) {
             linear_dsse[Bcols[j]] = linear_sse[j];
@@ -361,7 +362,8 @@ public:
             VectorXd yb = _Bo.leftCols(_m+1).transpose() * _y.matrix();
             const double mse = (1. - yb.squaredNorm()) / _X.rows();
             if (mse >= 0.) {
-                ++_m;
+                _m += 1;
+                _By = yb; // save for next iteration
                 return mse;
             }
         }

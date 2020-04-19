@@ -20,7 +20,7 @@ MarsAlgo * new_algo(
 
 ///////////////////////////////////////////////////////////////////////////////
 
-double dsse(MarsAlgo &algo,
+void eval(MarsAlgo &algo,
             Ref<ArrayXd> &linear_dsse,
             Ref<ArrayXd> &hinge_dsse,
             Ref<ArrayXd> &hinge_cuts,
@@ -29,20 +29,18 @@ double dsse(MarsAlgo &algo,
             int endspan,
             bool linear_only)
 {
-    if (mask.rows() != algo.size()) {
+    if (mask.rows() != algo.nbasis()) {
       throw std::runtime_error("invalid basis mask length");
     }
 
-    if (linear_dsse.rows() != algo.size() ||
-        hinge_dsse.rows()  != algo.size() ||
-        hinge_cuts.rows()  != algo.size()) {
+    if (linear_dsse.rows() != algo.nbasis() ||
+        hinge_dsse.rows()  != algo.nbasis() ||
+        hinge_cuts.rows()  != algo.nbasis()) {
         throw std::runtime_error("invalid dataset lengths");
     }
 
-    double base_dsse = 0;
-    algo.dsse(&base_dsse, linear_dsse.data(), hinge_dsse.data(), hinge_cuts.data(),
+    algo.eval(linear_dsse.data(), hinge_dsse.data(), hinge_cuts.data(),
               xcol, mask.data(), endspan, linear_only);
-    return base_dsse;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -61,6 +59,8 @@ PYBIND11_MODULE(marslib, m) {
          , py::arg("w").noconvert()
          , py::arg("max_terms")
         )
-    .def("dsse", &dsse)
+    .def("eval", &eval)
+    .def("dsse", &MarsAlgo::dsse)
+    .def("nbasis", &MarsAlgo::nbasis)
     ;
 }
