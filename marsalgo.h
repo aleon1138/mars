@@ -164,6 +164,10 @@ public:
         return _By.squaredNorm();
     }
 
+    double yvar() const {
+        return _yvar;
+    }
+
     ///////////////////////////////////////////////////////////////////////////
     //  Returns the delta SSE (sum of squared errors).
     //

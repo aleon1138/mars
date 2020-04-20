@@ -43,19 +43,19 @@ def _dump_row(logger, epoch, nbasis, dt, row, labels):
         logger.write("\n")
 
 
-def _all_dsse(algo, bmask, tail, linear_only):
+def _all_dsse(algo, bmask, tail, linear):
     """
     TODO - The idea is to put this in the C++ code and parallelize it.
     """
-    dsse1 = np.zeros(bmask.shape, order="F")
-    dsse2 = np.zeros(bmask.shape, order="F")
-    h_cut = np.full(bmask.shape, np.nan, order="F")
-    for j in range(len(bmask.shape[1])):
-        if bmask[:, j].any():
-            algo.dsse(
-                dsse1[:, j], dsse2[:, j], h_cut[:, j], j, bmask[:, j], tail, linear_only
-            )
-    return dsse1, dsse2, h_cut
+    dsse1 = np.zeros(bmask.shape)
+    dsse2 = np.zeros(bmask.shape)
+    h_cut = np.full(bmask.shape, np.nan)
+
+    ybby = algo.dsse()
+    for i in range(len(bmask)):
+        if bmask[i].any():
+            algo.eval(dsse1[i], dsse2[i], h_cut[i], i, bmask[i], tail, linear)
+    return ybby, dsse1, dsse2, h_cut
 
 
 # -----------------------------------------------------------------------------
@@ -165,79 +165,66 @@ def fit(X, y, w=None, **kwargs):
         return y
 
     while algo.nbasis() < max_terms and epoch < max_epochs:
-        results = []  # delta-SSE results for new potential candidates
-        basis_to_use = np.argsort(basis_sse)[::-1][:max_basis]  # "Fast MARS" tweak
+        # "Fast MARS" - rank the basis and inputs by delta SSE
+        # contribution and take only the most promising ones.
+        basis_to_use = np.argsort(basis_sse)[::-1][:max_basis]
         input_to_use = np.argsort(
             _ranks(input_sse) + aging_factor * (epoch - input_age) * (input_sse > 0)
-        )[::-1]
-        input_to_use = input_to_use[
-            : (max_inputs + np.isinf(input_to_use).sum())
-        ]  # "Faster MARS v2" tweak
-
-        basis_mask = np.zeros(len(basis), dtype="b")
-        basis_mask[basis_to_use] = True
+        )
+        input_to_use = input_to_use[::-1][: (max_inputs + np.isinf(input_sse).sum())]
 
         # Build up the mask block here
-        bmask = np.zeros((len(basis), X.shape[1]), order="F", dtype="b")
+        bmask = np.zeros((X.shape[1], len(basis)), dtype="b")
         for i in input_to_use:
-            bmask[:, i] &= np.array([basic_filter(i, b) for b in basis])
-            bmask[:, i] &= np.array([aux_filter(i, b) for b in basis])
-            bmask[:, i] &= basis_mask
+            bmask[i, basis_to_use] = True
+            bmask[i] &= np.array([basic_filter(i, b) for b in basis])
+            bmask[i] &= np.array([aux_filter(i, b) for b in basis])
 
         # Find the delta-SSE for the entire block
-        sse1, sse2, cut = _all_dsse(algo, bmask, tail, linear_only)
+        # 'sse1' is the improvement by adding a linear term
+        # 'sse2' is the improvement by adding two disjoint hinges
+        sse0, sse1, sse2, cut = _all_dsse(algo, bmask, tail, linear_only)
 
         # Update the delta-SSE cache
         # TODO - should we really be using GCV adjusted SSE instead?
-        basis_sse[bmask.any(axis=1)] = sse2[bmask.any(axis=1)].max(axis=1)
-        input_sse[input_to_use] = sse2[:, input_to_use].max(axis=0)
+        basis_sse[bmask.any(axis=0)] = sse2[:, bmask.any(axis=0)].max(axis=0)
+        input_sse[input_to_use] = sse2[input_to_use].max(axis=0)
         input_age[input_to_use] = epoch
         epoch += 1
 
-        # 'sse1' is the improvement by adding a linear term
-        # 'sse2' is the improvement by adding two disjoint hinges
+        m  = algo.nbasis()
         j1 = np.unravel_index(np.argmax(sse1), sse1.shape)
         j2 = np.unravel_index(np.argmax(sse2), sse2.shape)
-        if sse1[j1] > 0:
-            results.append((j2[1], j1[0], np.nan, 1, (1.0 - sse1[j1]) / n))
-        if sse2[j2] > 0:
-            results.append((j2[1], j2[0], cut[j2], 2, (1.0 - sse2[j2]) / n))
+        dt = time.time() - start_t
+
+        if sse1[j1] <= 0 and sse2[j2] <= 0:
+            break # no progress
 
         # Estimate the out-sample error with Generalized Cross-Validation
-        dt = time.time() - start_t
-        m0 = m = algo.nbasis()
-        if len(results) > 0:
-            results = np.array(
-                results,
-                dtype=[
-                    ("i", "i4"),
-                    ("j", "i4"),
-                    ("t", "f8"),
-                    ("dm", "i4"),
-                    ("mse", "f8"),
-                ],
-            )
-            dof = get_dof(m + results["dm"])
-            best = gcv_adj(results["mse"], dof).argmin()
-            i, j, t, dm = results[best][["i", "j", "t", "dm"]]
+        if sse1[j1] >= sse2[j2]:
+            mse = gcv_adj((1.0 - sse0 - sse1[j1]) / n, get_dof(m+1))
+            i,j,t = j1[1], j1[0], np.nan
+            htypes = ["l"]
+        else:
+            mse = gcv_adj((1.0 - sse0 - sse2[j2]) / n, get_dof(m+2))
+            i,j,t = j2[1], j2[0], cut[j2]
+            htypes = ["+", "-"]
 
-            for htype in ["l"] if dm == 1 else ["+", "-"]:
-                mse = algo.append(htype, i, j, t)
-                if mse > 0:
-                    r2 = 1 - mse / var_y
-                    gr2 = 1 - gcv_adj(mse, get_dof(m + 1)) / var_y
-                    basis.append(basis[j] + [i])
-                    model[m] = (htype, j, i, t, r2, gr2, len(basis[-1]), dt)
-                    basis_sse = np.append(basis_sse, [0.0])
-                    m = m + 1
-            assert algo.nbasis() == len(basis) == m
+        for htype in htypes:
+            mse = algo.append(htype, i, j, t)
+            if mse > 0:
+                r2 = 1 - mse / var_y
+                gr2 = 1 - gcv_adj(mse, get_dof(m + 1)) / var_y
+                basis.append(basis[j] + [i])
+                model[m] = (htype, j, i, t, r2, gr2, len(basis[-1]), dt)
+                basis_sse = np.append(basis_sse, [0.0])
+        assert algo.nbasis() == len(basis)
 
         _dump_row(logger, epoch, len(basis), dt, model[algo.nbasis() - 1], labels)
 
         # Stopping conditions
         model_tail = model[max(algo.nbasis() - r2_window - 1, 0) : algo.nbasis()]
-        if algo.nbasis() == m0:
-            break  # no progress made
+
         if model_tail[-1]["r2"] > 1 - r2_thresh:
             break  # R2 almost reached 100%
         if dt > max_runtime:
@@ -245,4 +232,4 @@ def fit(X, y, w=None, **kwargs):
         if avg_diff(model_tail["r2_cv"], r2_window) < r2_thresh:
             break  # no progress in GCV R2
 
-    return model[: algo.basis()]
+    return model[: algo.nbasis()]

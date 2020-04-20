@@ -62,5 +62,6 @@ PYBIND11_MODULE(marslib, m) {
     .def("eval", &eval)
     .def("dsse", &MarsAlgo::dsse)
     .def("nbasis", &MarsAlgo::nbasis)
+    .def("yvar", &MarsAlgo::yvar)
     ;
 }
