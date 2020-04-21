@@ -330,3 +330,24 @@ def expand(X, model):
             else:
                 assert False
     return B
+
+
+# -----------------------------------------------------------------------------
+
+
+def pprint(model, beta):
+    """
+    Pretty-print the model. Useful for debugging.
+    """
+    def get_inputs(i):
+        if model[i]['type'] == b'i':
+            node = []
+        else:
+            node = [model[i]['input']]
+        if model[i]['basis'] > 0:
+            return node + get_inputs(model[i]['basis'])
+        else:
+            return node
+
+    for i in range(len(model)):
+        print('  %+8.4g'%beta[i] + ''.join([" * X[%d]"%j for j in get_inputs(i)]))

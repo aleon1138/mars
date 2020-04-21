@@ -41,7 +41,7 @@ Here we train a linear model with a categorical interaction.
 import numpy as np
 X      = np.random.randn(10000,2)
 X[:,1] = np.random.binomial(1, .5, size=len(X))
-y      = 2 * X[:,0] + 3 * X[:,1] + np.random.normal(size=len(X))
+y      = 2*X[:,0] + 3*X[:,1] + X[:,0]*X[:,1] + np.random.normal(size=len(X))
 
 # convert to column-major float
 X = np.array(X,order='F',dtype='f')
@@ -55,12 +55,12 @@ beta  = np.linalg.lstsq(B,y,rcond=None)[0]
 y_hat = B @ beta
 ```
 
-Depending on the randomness of the inputs, the result should be somewhat like as follows:
+Depending on the random seed, the result should look similar to this:
 
 ```python
 mars.pprint(model,beta)
-  -0.0018
-  +1.9886*X[:,0]
-  +3.0228*X[:,1]
-  +0.9983*X[:,0]*X[:,1]
+    -0.023
+    +1.994 * X[0]
+    +3.018 * X[1]
+    +0.975 * X[0] * X[1]
 ```
