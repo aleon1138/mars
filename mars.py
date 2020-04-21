@@ -335,6 +335,49 @@ def expand(X, model):
 # -----------------------------------------------------------------------------
 
 
+def prune(XX, XY, YY, n_true, penalty=3, ridge=0, mask=None):
+    """
+    Solve for the linear coefficients, with pruning.
+    """
+    def _solve(xx, xy, mask):
+        # You must use 'lstsq' so we can handle under-determined problems
+        beta = np.zeros(len(xy))
+        if mask.any():
+            xx = xx[np.ix_(mask,mask)]
+            xy = xy[mask]
+            beta[mask] = np.linalg.lstsq(xx,xy,rcond=None)[0]
+        return beta
+
+    def _gcv_sse(xx,xy,yy,mask,dof,n_true):
+        sse = yy - np.dot(xy,_solve(xx,xy,mask))
+        return sse/(1.-dof/n_true)**2
+
+    M = len(XX)
+    mask = np.array(mask) if mask is not None else np.ones(M,dtype='bool')
+    mask = mask & (np.diag(XX) > 0)
+    dof  = M + penalty*(M-1)
+    min_sse = _gcv_sse(XX,XY,YY,mask,dof,n_true)
+
+    while True:
+        sse = np.ones(M)*np.inf
+        for i in np.where(mask)[0]:
+            k = mask & (np.arange(len(mask))!=i)
+            dof = sum(k) + penalty*(M-1)
+            sse[i] = _gcv_sse(XX,XY,YY,k,dof,n_true)
+        if sse.min() >= min_sse:
+            break
+        mask[np.argmin(sse)] = False
+        min_sse = sse.min()
+        assert np.isfinite(min_sse)
+
+    if ridge > 0:
+        assert np.allclose(np.diag(XX)[mask],np.ones(mask.sum()))
+        XX += np.eye(len(XX)) * ridge
+    return _solve(XX,XY,mask)
+
+# -----------------------------------------------------------------------------
+
+
 def pprint(model, beta):
     """
     Pretty-print the model. Useful for debugging.
@@ -344,10 +387,10 @@ def pprint(model, beta):
             node = []
         else:
             node = [model[i]['input']]
+
         if model[i]['basis'] > 0:
             return node + get_inputs(model[i]['basis'])
-        else:
-            return node
+        return node
 
     for i in range(len(model)):
         print('  %+8.4g'%beta[i] + ''.join([" * X[%d]"%j for j in get_inputs(i)]))
