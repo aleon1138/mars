@@ -11,8 +11,8 @@ import marslib
 
 def _dump_header(logger):
     if logger:
-        logger.write("time       #   n    b    x   o   r²    r²_cv\n")
-        logger.write("--------- --- --- ---- ---- -- ------ -------\n")
+        logger.write("time        #   n    b    x   o    r²    r²_cv\n")
+        logger.write("---------- --- --- ---- ---- --  ------ -------\n")
 
 
 def _dump_row(logger, epoch, nbasis, dt, row, labels):
