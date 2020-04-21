@@ -194,20 +194,21 @@ def fit(X, y, w=None, **kwargs):
     input_age = np.full(X.shape[1], epoch)
 
     # Define output data structure
-    model = np.zeros(
-        max_terms,
+    # fmt: off
+    model = np.zeros(max_terms,
         dtype=[
-            ("type", "S1"),
+            ("type",  "S1"),
             ("basis", "i4"),
             ("input", "i4"),
             ("hinge", "f8"),
-            ("r2", "f4"),
+            ("r2",    "f4"),
             ("r2_cv", "f4"),
             ("order", "i4"),
-            ("time", "f4"),
+            ("time",  "f4"),
         ],
     )
     model[0] = ("i", 0, 0, np.nan, 0, 0, 0, 0)  # add the intercept
+    # fmt: on
 
     _dump_header(logger)
 
@@ -245,31 +246,37 @@ def fit(X, y, w=None, **kwargs):
         input_age[input_to_use] = epoch
         epoch += 1
 
-        m  = algo.nbasis()
         j1 = np.unravel_index(np.argmax(sse1), sse1.shape)
         j2 = np.unravel_index(np.argmax(sse2), sse2.shape)
         dt = time.time() - start_t
-
         if sse1[j1] <= 0 and sse2[j2] <= 0:
             break # no progress
 
         # Estimate the out-sample error with Generalized Cross-Validation
+        m = algo.nbasis()
         mse1 = gcv_adj((1.0 - sse0 - sse1[j1]) / n, get_dof(m+1))
         mse2 = gcv_adj((1.0 - sse0 - sse2[j2]) / n, get_dof(m+2))
         if mse1 <= mse2:
-            xcol,bcol,t = j1[0], j1[1], np.nan
+            xcol,bcol,hcut = j1[0], j1[1], np.nan
             htypes = ["l"]
         else:
-            xcol,bcol,t = j2[0], j2[1], cut[j2]
+            xcol,bcol,hcut = j2[0], j2[1], cut[j2]
             htypes = ["+", "-"]
 
         for htype in htypes:
-            mse = algo.append(htype, xcol, bcol, t)
+            mse = algo.append(htype, xcol, bcol, hcut)
             if mse > 0:
-                r2 = 1 - mse / var_y
-                gr2 = 1 - gcv_adj(mse, get_dof(m + 1)) / var_y
                 basis.append(basis[bcol] + [xcol])
-                model[m] = (htype, bcol, xcol, t, r2, gr2, len(basis[-1]), dt)
+                model[m] = (
+                    htype,                                          # type
+                    bcol,                                           # basis
+                    xcol,                                           # input
+                    hcut,                                           # hinge
+                    1 - mse / var_y,                                # r2
+                    1 - gcv_adj(mse, get_dof(m + 1)) / var_y,       # r2_cv
+                    len(basis[-1]),                                 # order
+                    dt                                              # time
+                )
                 basis_sse = np.append(basis_sse, [0.0])
                 m += 1
         assert algo.nbasis() == len(basis) == m
@@ -278,7 +285,6 @@ def fit(X, y, w=None, **kwargs):
 
         # Stopping conditions
         model_tail = model[max(algo.nbasis() - r2_window - 1, 0) : algo.nbasis()]
-
         if model_tail[-1]["r2"] > 1 - r2_thresh:
             break  # R2 almost reached 100%
         if dt > max_runtime:
