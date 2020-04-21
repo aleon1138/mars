@@ -15,4 +15,4 @@ unittest: unittest.cc marsalgo.h
 	c++ $(CFLAGS) -o $@ $< -lgtest -lpthread
 
 clean:
-	rm -f unittest marslib.so
+	rm -rf __pycache__ unittest marslib.so
