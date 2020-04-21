@@ -251,10 +251,10 @@ def fit(X, y, w=None, **kwargs):
         j2 = np.unravel_index(np.argmax(sse2), sse2.shape)
         dt = time.time() - start_t
         if sse1[j1] <= 0 and sse2[j2] <= 0:
-            break # no progress
+            break # all input data is filtered or zero
 
         # Estimate the out-sample error with Generalized Cross-Validation
-        m = algo.nbasis()
+        m0 = m = algo.nbasis()
         mse1 = gcv_adj((1.0 - sse0 - sse1[j1]) / n, m+1)
         mse2 = gcv_adj((1.0 - sse0 - sse2[j2]) / n, m+2)
         if mse1 <= mse2:
@@ -286,6 +286,8 @@ def fit(X, y, w=None, **kwargs):
 
         # Stopping conditions
         model_tail = model[max(algo.nbasis() - r2_window - 1, 0) : algo.nbasis()]
+        if m == m0:
+            break # no progress
         if model_tail[-1]["r2"] > 1 - r2_thresh:
             break  # R2 almost reached 100%
         if dt > max_runtime:
