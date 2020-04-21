@@ -59,9 +59,10 @@ PYBIND11_MODULE(marslib, m) {
          , py::arg("w").noconvert()
          , py::arg("max_terms")
         )
-    .def("eval", &eval)
-    .def("dsse", &MarsAlgo::dsse)
+    .def("eval",   &eval)
+    .def("dsse",   &MarsAlgo::dsse)
     .def("nbasis", &MarsAlgo::nbasis)
-    .def("yvar", &MarsAlgo::yvar)
+    .def("yvar",   &MarsAlgo::yvar)
+    .def("append", &MarsAlgo::append)
     ;
 }

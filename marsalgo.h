@@ -329,6 +329,11 @@ public:
         if (_m >= _B.cols()) {
             throw std::runtime_error("basis matrix is full");
         }
+        if (bcol < 0 || bcol >= _m) {
+            char msg[80];
+            sprintf(msg, "invalid basis column number: %d", bcol);
+            throw std::runtime_error(msg);
+        }
 
         const float  s = _s[xcol];
         Ref<ArrayXf> b = _B.col(bcol).array();
