@@ -164,7 +164,7 @@ def fit(X, y, w=None, **kwargs):
 
     # Equation numbers refer to the original MARS paper
     get_dof = lambda m: m + penalty * (m - 1)  # Eq. (31,32)
-    gcv_adj = lambda mse, dof: mse / (1.0 - dof / n_true) ** 2 # Eq. (30)
+    gcv_adj = lambda mse, m: mse / (1.0 - get_dof(m) / n_true) ** 2 # Eq. (30)
     avg_diff = lambda x, n: np.sort(np.diff(x))[1:-1].mean() if len(x) > n else np.nan
 
     # Set up a basic filter which caps the polynomial degree of basis and optionally
@@ -195,7 +195,8 @@ def fit(X, y, w=None, **kwargs):
 
     # Define output data structure
     # fmt: off
-    model = np.zeros(max_terms,
+    model = np.zeros(
+        max_terms,
         dtype=[
             ("type",  "S1"),
             ("basis", "i4"),
@@ -254,8 +255,8 @@ def fit(X, y, w=None, **kwargs):
 
         # Estimate the out-sample error with Generalized Cross-Validation
         m = algo.nbasis()
-        mse1 = gcv_adj((1.0 - sse0 - sse1[j1]) / n, get_dof(m+1))
-        mse2 = gcv_adj((1.0 - sse0 - sse2[j2]) / n, get_dof(m+2))
+        mse1 = gcv_adj((1.0 - sse0 - sse1[j1]) / n, m+1)
+        mse2 = gcv_adj((1.0 - sse0 - sse2[j2]) / n, m+2)
         if mse1 <= mse2:
             xcol,bcol,hcut = j1[0], j1[1], np.nan
             htypes = ["l"]
@@ -268,14 +269,14 @@ def fit(X, y, w=None, **kwargs):
             if mse > 0:
                 basis.append(basis[bcol] + [xcol])
                 model[m] = (
-                    htype,                                          # type
-                    bcol,                                           # basis
-                    xcol,                                           # input
-                    hcut,                                           # hinge
-                    1 - mse / var_y,                                # r2
-                    1 - gcv_adj(mse, get_dof(m + 1)) / var_y,       # r2_cv
-                    len(basis[-1]),                                 # order
-                    dt                                              # time
+                    htype,                              # type
+                    bcol,                               # basis
+                    xcol,                               # input
+                    hcut,                               # hinge
+                    1.0 - mse / var_y,                  # r2
+                    1.0 - gcv_adj(mse, m + 1) / var_y,  # r2_cv
+                    len(basis[-1]),                     # order
+                    dt                                  # time
                 )
                 basis_sse = np.append(basis_sse, [0.0])
                 m += 1
