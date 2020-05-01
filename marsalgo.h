@@ -1,7 +1,7 @@
 #include <Eigen/Dense>
-#include <numeric> // for std::iota
-#include <cfloat>  // for DBL_EPSILON
-#include <xmmintrin.h> // for _mm_getcsr
+#include <numeric>      // for std::iota
+#include <cfloat>       // for DBL_EPSILON
+#include <xmmintrin.h>  // for _mm_getcsr
 
 using namespace Eigen;
 typedef Matrix<double,Dynamic,Dynamic,RowMajor> MatrixXdC;

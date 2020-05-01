@@ -1,18 +1,19 @@
-CFLAGS += -O2 -Wall -DNDEBUG -DEIGEN_DONT_PARALLELIZE -std=c++11
-CFLAGS += -mfma -mavx2 -march=native -fvisibility=hidden
-CFLAGS += -I/usr/include/eigen3
+CXXFLAGS += -O2 -Wall -std=c++11
+CXXFLAGS += -mfma -mavx2 -march=native -fvisibility=hidden
 
-PYBIND += $(shell python3 -m pybind11 --includes)
-PYBIND += $(shell python3-config --includes)
+CPPFLAGS += -I/usr/include/eigen3
+CPPFLAGS += $(shell python3 -m pybind11 --includes)
+CPPFLAGS += $(shell python3-config --includes)
+CPPFLAGS += -DNDEBUG -DEIGEN_DONT_PARALLELIZE
 
 marslib.so: marslib.cc marsalgo.h
-	c++ $(CFLAGS) -shared -fPIC $(PYBIND) -o $@ $<
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -shared -fPIC -o $@ $<
 
 test: unittest
 	./unittest
 
 unittest: unittest.cc marsalgo.h
-	c++ $(CFLAGS) -o $@ $< -lgtest -lpthread
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $< -lgtest -lpthread
 
 clean:
 	rm -rf __pycache__ unittest marslib.so

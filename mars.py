@@ -97,7 +97,7 @@ def fit(X, y, w=None, **kwargs):
 
     self_interact : bool (default=False)
         Allow an input to interact with itself. This may cause some numerical
-        instability and is best modeled with a linear hinge instead.
+        instability and is best modelled with a linear hinge instead.
 
     linear_only : bool (default=False)
         Disable formation of any hinges. This will still find interactions
