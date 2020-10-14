@@ -385,7 +385,7 @@ def pprint(model, beta):
     """
     Pretty-print the model. Useful for debugging.
     """
-    def get_inputs(i):
+    def get_inputs(i: int):
         row = model[i]
         if row["type"] == b"+":
             node = "MAX(X[%d]-%g,0)" % (row["input"],row["hinge"])
@@ -395,7 +395,7 @@ def pprint(model, beta):
             node = "X[%d]" % row["input"]
 
         if row["basis"] > 0:
-            return [node] + [get_inputs(model[row["basis"]])]
+            return [node] + get_inputs(row["basis"])
         return [node]
 
     for i in range(len(model)):
