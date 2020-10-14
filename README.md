@@ -34,6 +34,17 @@ available pre-compiled](https://bit.ly/2vNUBWN) on Ubuntu.
     conda install -y pybind11
 ```
 
+## Build Instructions
+For now the package simply uses a Makefile:
+
+```bash
+    cd mars
+    make
+    make test # optional - build and run the unit tests
+```
+
+Eventually the plan is to provide a full installer with `setup.py` or similar.
+
 ## An Example
 Here we train a linear model with a categorical interaction.
 
@@ -49,8 +60,8 @@ y = np.array(y,dtype='f')
 
 # Fit the earth model
 import mars
-model = mars.fit(X,y,max_epochs=8)
-B     = mars.expand(X,model) # expand the basis
+model = mars.fit(X, y, max_epochs=8, tail_span=0)
+B     = mars.expand(X, model) # expand the basis
 beta  = np.linalg.lstsq(B,y,rcond=None)[0]
 y_hat = B @ beta
 ```
@@ -59,8 +70,8 @@ Depending on the random seed, the result should look similar to this:
 
 ```python
 mars.pprint(model,beta)
-    -0.023
-    +1.994 * X[0]
-    +3.018 * X[1]
-    +0.975 * X[0] * X[1]
+    -0.003
+    +1.972 * X[0]
+    +3.001 * X[1]
+    +1.048 * X[0] * X[1]
 ```

@@ -370,10 +370,10 @@ public:
             // This assumes the norm of '_y' == 1
             VectorXd yb = _Bo.leftCols(_m+1).transpose() * _y.matrix();
             const double mse = (1. - yb.squaredNorm()) / _X.rows();
-            if (mse >= 0.) {
+            if (mse >= -_tol) { // gracefully handle values close to zero
                 _m += 1;
                 _By = yb; // save for next iteration
-                return mse;
+                return std::max(mse,0.0);
             }
         }
         return -1.;

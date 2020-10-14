@@ -266,7 +266,9 @@ def fit(X, y, w=None, **kwargs):
 
         for htype in htypes:
             mse = algo.append(htype, xcol, bcol, hcut)
-            if mse > 0:
+
+            # If 'y' is noise-free then MSE might be 0.0; handle this edge case.
+            if mse >= 0:
                 basis.append(basis[bcol] + [xcol])
                 model[m] = (
                     htype,                              # type
@@ -276,7 +278,7 @@ def fit(X, y, w=None, **kwargs):
                     1.0 - mse / var_y,                  # r2
                     1.0 - gcv_adj(mse, m + 1) / var_y,  # r2_cv
                     len(basis[-1]),                     # order
-                    dt                                  # time
+                    dt,                                 # time
                 )
                 basis_sse = np.append(basis_sse, [0.0])
                 m += 1
@@ -305,27 +307,27 @@ def expand(X, model):
     """
     Expand a feature set X into the bases of a MARS model.
     """
-    decode = lambda s: s.decode('utf8') if isinstance(s,bytes) else s
+    decode = lambda s: s.decode("utf8") if isinstance(s,bytes) else s
     X = np.asarray(X)
-    B = np.empty((len(X),len(model)),order='F')
+    B = np.empty((len(X),len(model)),order="F")
 
     for i in range(len(model)):
-        t = decode(model[i]['type'])
-        b = model[i]['basis']
-        x = model[i]['input']
-        h = model[i]['hinge']
+        t = decode(model[i]["type"])
+        b = model[i]["basis"]
+        x = model[i]["input"]
+        h = model[i]["hinge"]
 
-        if t == 'i':
-            B[:,i] = 1.
+        if t == "i":
+            B[:,i] = 1.0
         else:
             assert 0 <= x < X.shape[1]
             assert (b == -1) or (0 <= b < i)
             parent = B[:,b] if b >= 0 else 1.0
-            if t == 'l':
+            if t == "l":
                 B[:,i] = parent * X[:,x]
-            elif t == '+':
+            elif t == "+":
                 B[:,i] = parent * np.maximum(X[:,x]-h,0)
-            elif t == '-':
+            elif t == "-":
                 B[:,i] = parent * np.maximum(h-X[:,x],0)
             else:
                 assert False
@@ -375,6 +377,7 @@ def prune(XX, XY, YY, n_true, penalty=3, ridge=0, mask=None):
         XX += np.eye(len(XX)) * ridge
     return _solve(XX,XY,mask)
 
+
 # -----------------------------------------------------------------------------
 
 
@@ -383,14 +386,20 @@ def pprint(model, beta):
     Pretty-print the model. Useful for debugging.
     """
     def get_inputs(i):
-        if model[i]['type'] == b'i':
-            node = []
+        row = model[i]
+        if row["type"] == b"+":
+            node = "MAX(X[%d]-%g,0)" % (row["input"],row["hinge"])
+        elif row["type"] == b"-":
+            node = "MAX(%g-X[%d],0)" % (row["hinge"],row["input"])
         else:
-            node = [model[i]['input']]
+            node = "X[%d]" % row["input"]
 
-        if model[i]['basis'] > 0:
-            return node + get_inputs(model[i]['basis'])
-        return node
+        if row["basis"] > 0:
+            return [node] + [get_inputs(model[row["basis"]])]
+        return [node]
 
     for i in range(len(model)):
-        print('  %+8.4g'%beta[i] + ''.join([" * X[%d]"%j for j in get_inputs(i)]))
+        if model[i]["type"] == b"i":
+            print("  %+8.4g"%beta[i])
+        else:
+            print('  %+8.4g * '%beta[i] + ' * '.join(get_inputs(i)))
