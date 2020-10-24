@@ -5,6 +5,7 @@
 
 using namespace Eigen;
 typedef Matrix<double,Dynamic,Dynamic,RowMajor> MatrixXdC;
+typedef Matrix<float, Dynamic,Dynamic,RowMajor> MatrixXfC;
 typedef Array<int32_t,Dynamic,1> ArrayXi32;
 typedef Array<int64_t,Dynamic,1> ArrayXi64;
 typedef Array<bool,Dynamic,1> ArrayXb;
@@ -74,13 +75,13 @@ void sort_columns(Ref<MatrixXd> X, const ArrayXi32 &k)
 ///////////////////////////////////////////////////////////////////////////////
 
 void covariates(double *ff_out, double *fy_out, ArrayXd &f, ArrayXd &g,
-                const Ref<VectorXd> &x, const VectorXd &y, double k0, double k1)
+                const Ref<VectorXf> &x, const ArrayXd &y, double k0, double k1)
 {
     assert(x.cols()==1 && x.rows()>=x.cols());
     assert(x.rows()==y.rows());
     const int m = x.rows();
 
-#if 0
+#if 1
     int i0 = 0;
     double s0 = 0;
     double s1 = 0;
@@ -115,13 +116,20 @@ void covariates(double *ff_out, double *fy_out, ArrayXd &f, ArrayXd &g,
     double s1 = S1[0]+S1[1]+S1[2]+S1[3];
 #endif
 
+    // Careful - without -mfma, you may get worse performance. By using FMA
+    // we incur only half the error of doing the add and multiply separately.
     static_assert(FP_FAST_FMA, "-mfma must be enabled");
     for (int i = i0; i < m; ++i) {
         f[i] = fma(k0,g[i],f[i]);
-        g[i] = fma(k1,x[i],g[i]);
         s0   = fma(f[i],f[i],s0);
         s1   = fma(f[i],y[i],s1);
     }
+
+    // It seems we have better cache locality if we split the loop as follows.
+    for (int i = i0; i < m; ++i) {
+        g[i] = fma(k1,x[i],g[i]);
+    }
+
     *ff_out = s0;
     *fy_out = s1;
 }
@@ -136,7 +144,7 @@ class MarsAlgo {
     ArrayXd     _y;         // target vector
     MatrixXf    _B;         // all basis
     MatrixXdC   _Bo;        // all basis, ortho-normalized
-    MatrixXdC   _Bok;       // all basis, ortho-normalized and sorted (scratch buffer)
+    MatrixXfC   _Bok;       // all basis, ortho-normalized and sorted (scratch buffer)
     MatrixXd    _Bx;        // B[k,mask]*x[k,None] (scratch buffer)
     VectorXd    _By;        // dot product of basis Bo with Y target
     ArrayXf     _s;         // scale of columns of 'X'
@@ -149,7 +157,7 @@ public:
         : _X  (x,n,m,Stride<Dynamic,1>(ldx,1))
         , _B  (MatrixXf ::Zero(n,p))
         , _Bo (MatrixXdC::Zero(n,p))
-        , _Bok(MatrixXdC::Zero(n,p))
+        , _Bok(MatrixXfC::Zero(n,p))
         , _Bx (MatrixXdC::Zero(n,p))
         , _tol((n*0.02)*DBL_EPSILON) // rough guess
     {
@@ -245,7 +253,7 @@ public:
 
         ArrayXf        x   = _X.col(xcol) * _s[xcol]; // copy and normalize 'X' column
         Ref<MatrixXdC> Bo  = _Bo.leftCols(m);
-        Ref<MatrixXdC> Bok = _Bok.leftCols(m);
+        Ref<MatrixXfC> Bok = _Bok.leftCols(m);
         Ref<MatrixXd>  Bx  = _Bx.leftCols(p);
 
         //---------------------------------------------------------------------
@@ -289,7 +297,7 @@ public:
             VectorXd yk(n);
             for (int i = 0; i < n; ++i) {
                 yk[i] = _y[k[i]];
-                Bok.row(i) = Bo.row(k[i]);
+                Bok.row(i) = Bo.row(k[i]).cast<float>();
             }
             sort_columns(Bx, k);
 
