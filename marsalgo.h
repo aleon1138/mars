@@ -92,6 +92,11 @@ void covariates(double *ff_out, double *fy_out, ArrayXd &f, ArrayXd &g,
 
     int i0 = m - m%4;
     for (int i = 0; i < i0; i+=4) {
+        _mm_prefetch(&f[i+16],_MM_HINT_T0);
+        _mm_prefetch(&g[i+16],_MM_HINT_T0);
+        _mm_prefetch(&x[i+16],_MM_HINT_T0);
+        _mm_prefetch(&y[i+16],_MM_HINT_T0);
+
         __m256d f0 = _mm256_load_pd(&f[i]);
         __m256d g0 = _mm256_load_pd(&g[i]);
         __m256d x0 = _mm256_load_pd(&x[i]);
