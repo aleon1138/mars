@@ -81,7 +81,7 @@ void covariates(double *ff_out, double *fy_out, ArrayXd &f, ArrayXd &g,
     assert(x.rows()==y.rows());
     const int m = x.rows();
 
-#if 1
+#if 0
     int i0 = 0;
     double s0 = 0;
     double s1 = 0;
@@ -100,7 +100,7 @@ void covariates(double *ff_out, double *fy_out, ArrayXd &f, ArrayXd &g,
 
         __m256d f0 = _mm256_load_pd(&f[i]);
         __m256d g0 = _mm256_load_pd(&g[i]);
-        __m256d x0 = _mm256_load_pd(&x[i]);
+        __m256d x0 = _mm256_cvtps_pd(_mm_load_ps(&x[i]));
         __m256d y0 = _mm256_load_pd(&y[i]);
 
         f0 = _mm256_fmadd_pd(K0,g0,f0);
