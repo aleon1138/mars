@@ -12,7 +12,8 @@ typedef Array<bool,Dynamic,1> ArrayXb;
 ///////////////////////////////////////////////////////////////////////////////
 ///  Return indexes in REVERSED order
 ///////////////////////////////////////////////////////////////////////////////
-void argsort(int32_t *idx, const float *v, int n) {
+void argsort(int32_t *idx, const float *v, int n)
+{
     std::iota(idx, idx+n, 0);
     std::sort(idx, idx+n, [&v](size_t i, size_t j) {
         return v[i] > v[j];
@@ -22,7 +23,8 @@ void argsort(int32_t *idx, const float *v, int n) {
 ///////////////////////////////////////////////////////////////////////////////
 ///  Return the indexes of all non-zero values
 ///////////////////////////////////////////////////////////////////////////////
-ArrayXi nonzero(const ArrayXb &x) {
+ArrayXi nonzero(const ArrayXb &x)
+{
     ArrayXi y(x.size());
     int n = 0;
     for (int i = 0; i < x.rows(); ++i) {
@@ -156,15 +158,18 @@ public:
         _s = (_s > 0.f).select(1.f/_s, 1.f);
     }
 
-    int nbasis() const {
+    int nbasis() const
+    {
         return _m;
     }
 
-    double dsse() const {
+    double dsse() const
+    {
         return _By.squaredNorm();
     }
 
-    double yvar() const {
+    double yvar() const
+    {
         return _yvar;
     }
 
@@ -187,7 +192,7 @@ public:
     //      model. You can set "hinge_sse" and "hinge_cut" as NULL.
     ///////////////////////////////////////////////////////////////////////////
     void eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
-        int xcol, const bool *bmask, int endspan, bool linear_only)
+              int xcol, const bool *bmask, int endspan, bool linear_only)
     {
         if (xcol < 0 || xcol >= _X.cols()) {
             throw std::runtime_error("invalid X column index");
@@ -268,7 +273,7 @@ public:
                 const Ref<VectorXf> b  = _B.col(Bcols[j]);
                 const Ref<VectorXd> bx = Bx.col(j);
 
-                double b_i = b[k[0]]; // sort and upscale to double
+                double b_i = b[k[0]]; // sort and upcast to double
                 double k0 = 0;
                 double k1 = 0;
                 double w  = 0;
@@ -325,7 +330,8 @@ public:
 
     ///////////////////////////////////////////////////////////////////////////
 
-    double append(char type, int xcol, int bcol, float h) {
+    double append(char type, int xcol, int bcol, float h)
+    {
         if (_m >= _B.cols()) {
             throw std::runtime_error("basis matrix is full");
         }
@@ -340,17 +346,17 @@ public:
         Ref<const ArrayXf> x = _X.col(xcol).array();
 
         switch(type) {
-        case 'l':
-            _B.col(_m) = (s*b*x);
-            break;
-        case '+':
-            _B.col(_m) = (s*b*(x-h).cwiseMax(0));
-            break;
-        case '-':
-            _B.col(_m) = (s*b*(h-x).cwiseMax(0));
-            break;
-        default:
-            throw std::runtime_error("invalid basis type");
+            case 'l':
+                _B.col(_m) = (s*b*x);
+                break;
+            case '+':
+                _B.col(_m) = (s*b*(x-h).cwiseMax(0));
+                break;
+            case '-':
+                _B.col(_m) = (s*b*(h-x).cwiseMax(0));
+                break;
+            default:
+                throw std::runtime_error("invalid basis type");
         }
 
         //---------------------------------------------------------------------

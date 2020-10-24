@@ -3,18 +3,21 @@
 #include <vector>
 constexpr double EPS = 1e-14;
 
-double invnorm(VectorXd x) {
+double invnorm(VectorXd x)
+{
     const double s = x.norm();
     return s > EPS? 1.0/s : 0.0;
 }
 
-int argmax(const ArrayXd &x) {
+int argmax(const ArrayXd &x)
+{
     int i;
     x.maxCoeff(&i);
     return i;
 }
 
-ArrayXi create_mask(int m, int p) {
+ArrayXi create_mask(int m, int p)
+{
     std::vector<int> idx(m);
     std::iota(idx.begin(), idx.end(), 0);
     std::random_shuffle(idx.begin(), idx.end());
@@ -26,14 +29,16 @@ ArrayXi create_mask(int m, int p) {
 // Return the delta sum of squared errors (SSE), discarding the Y variance.
 //   sse  = y' * y - beta' * (X' * y)
 //
-double slow_dsse(Ref<const MatrixXd> X, VectorXd y) {
+double slow_dsse(Ref<const MatrixXd> X, VectorXd y)
+{
     VectorXd xy = X.transpose() * y;
     VectorXd b  = X.fullPivHouseholderQr().solve(y);
     double dsse = b.transpose() * xy;
     return dsse / y.squaredNorm();
 }
 
-double slow_mse(MatrixXd X, VectorXd y) {
+double slow_mse(MatrixXd X, VectorXd y)
+{
     VectorXd b = X.fullPivHouseholderQr().solve(y);
     VectorXd e = X * b - y;
     double mse = e.squaredNorm()/e.rows();
@@ -41,13 +46,14 @@ double slow_mse(MatrixXd X, VectorXd y) {
 }
 
 struct Result {
-    Result(MarsAlgo &algo, int xcol, const ArrayXb &mask, bool linear) {
+    Result(MarsAlgo &algo, int xcol, const ArrayXb &mask, bool linear)
+    {
         linear_dsse = ArrayXd(mask.rows());
         hinge_dsse  = ArrayXd(mask.rows());
         hinge_cut   = ArrayXd(mask.rows());
         base_dsse = algo.dsse();
         algo.eval(linear_dsse.data(), hinge_dsse.data(),
-            hinge_cut.data(), xcol, mask.data(), 0, linear);
+                  hinge_cut.data(), xcol, mask.data(), 0, linear);
     }
 
     double  base_dsse;

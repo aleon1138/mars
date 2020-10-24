@@ -21,16 +21,16 @@ MarsAlgo * new_algo(
 ///////////////////////////////////////////////////////////////////////////////
 
 void eval(MarsAlgo &algo,
-            Ref<ArrayXd> &linear_dsse,
-            Ref<ArrayXd> &hinge_dsse,
-            Ref<ArrayXd> &hinge_cuts,
-            const Ref<const ArrayXb> &mask,
-            int xcol,
-            int endspan,
-            bool linear_only)
+          Ref<ArrayXd> &linear_dsse,
+          Ref<ArrayXd> &hinge_dsse,
+          Ref<ArrayXd> &hinge_cuts,
+          const Ref<const ArrayXb> &mask,
+          int xcol,
+          int endspan,
+          bool linear_only)
 {
     if (mask.rows() != algo.nbasis()) {
-      throw std::runtime_error("invalid basis mask length");
+        throw std::runtime_error("invalid basis mask length");
     }
 
     if (linear_dsse.rows() != algo.nbasis() ||
@@ -45,7 +45,8 @@ void eval(MarsAlgo &algo,
 
 ///////////////////////////////////////////////////////////////////////////////
 
-PYBIND11_MODULE(marslib, m) {
+PYBIND11_MODULE(marslib, m)
+{
     py::options options;
     options.disable_function_signatures();
 
