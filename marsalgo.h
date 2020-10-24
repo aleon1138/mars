@@ -71,25 +71,54 @@ void sort_columns(Ref<MatrixXd> X, const ArrayXi32 &k)
     }
 }
 
-void covariates(double *ff_, double *fy_, ArrayXd &f, ArrayXd &g,
+///////////////////////////////////////////////////////////////////////////////
+
+void covariates(double *ff_out, double *fy_out, ArrayXd &f, ArrayXd &g,
                 const Ref<VectorXd> &x, const VectorXd &y, double k0, double k1)
 {
     assert(x.cols()==1 && x.rows()>=x.cols());
     assert(x.rows()==y.rows());
-
     const int m = x.rows();
+
+#if 0
+    int i0 = 0;
     double s0 = 0;
     double s1 = 0;
+#else
+    __m256d K0 = _mm256_set1_pd(k0);
+    __m256d K1 = _mm256_set1_pd(k1);
+    __m256d S0 = _mm256_setzero_pd();
+    __m256d S1 = _mm256_setzero_pd();
+
+    int i0 = m - m%4;
+    for (int i = 0; i < i0; i+=4) {
+        __m256d f0 = _mm256_load_pd(&f[i]);
+        __m256d g0 = _mm256_load_pd(&g[i]);
+        __m256d x0 = _mm256_load_pd(&x[i]);
+        __m256d y0 = _mm256_load_pd(&y[i]);
+
+        f0 = _mm256_fmadd_pd(K0,g0,f0);
+        g0 = _mm256_fmadd_pd(K1,x0,g0);
+        S0 = _mm256_fmadd_pd(f0,f0,S0);
+        S1 = _mm256_fmadd_pd(f0,y0,S1);
+
+        _mm256_store_pd(&f[i], f0);
+        _mm256_store_pd(&g[i], g0);
+    }
+
+    double s0 = S0[0]+S0[1]+S0[2]+S0[3];
+    double s1 = S1[0]+S1[1]+S1[2]+S1[3];
+#endif
 
     static_assert(FP_FAST_FMA, "-mfma must be enabled");
-    for (int i = 0; i < m; ++i) {
+    for (int i = i0; i < m; ++i) {
         f[i] = fma(k0,g[i],f[i]);
         g[i] = fma(k1,x[i],g[i]);
         s0   = fma(f[i],f[i],s0);
         s1   = fma(f[i],y[i],s1);
     }
-    *ff_ = s0;
-    *fy_ = s1;
+    *ff_out = s0;
+    *fy_out = s1;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
