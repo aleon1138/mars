@@ -12,6 +12,9 @@ marslib.so: marslib.cc marsalgo.h
 test: unittest
 	./unittest
 
+format:
+	astyle -A4 -S -z2 -n -j *.h *.cc
+
 unittest: unittest.cc marsalgo.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $< -lgtest -lpthread
 
