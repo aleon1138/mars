@@ -74,8 +74,12 @@ void sort_columns(Ref<MatrixXd> X, const ArrayXi32 &k)
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void covariates(double *ff_out, double *fy_out, ArrayXd &f, ArrayXd &g,
-                const Ref<VectorXf> &x, const ArrayXd &y, double k0, double k1)
+struct cov_t {
+    double ff;
+    double fy;
+};
+
+cov_t covariates(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x, const ArrayXd &y, double k0, double k1)
 {
     assert(x.cols()==1 && x.rows()>=x.cols());
     assert(x.rows()==y.rows());
@@ -93,6 +97,12 @@ void covariates(double *ff_out, double *fy_out, ArrayXd &f, ArrayXd &g,
 
     int i0 = m - m%4;
     for (int i = 0; i < i0; i+=4) {
+        //
+        // TODO:
+        //  * you need to interleave this loop to get rid of latency due to dependencies
+        //  * perhaps get rid of the prefetch
+        //  * also add a benchmark test
+        //
         _mm_prefetch(&f[i+16],_MM_HINT_T0);
         _mm_prefetch(&g[i+16],_MM_HINT_T0);
         _mm_prefetch(&x[i+16],_MM_HINT_T0);
@@ -112,8 +122,8 @@ void covariates(double *ff_out, double *fy_out, ArrayXd &f, ArrayXd &g,
         _mm256_store_pd(&g[i], g0);
     }
 
-    double s0 = S0[0]+S0[1]+S0[2]+S0[3];
-    double s1 = S1[0]+S1[1]+S1[2]+S1[3];
+    double s0 = (S0[0]+S0[1])+(S0[2]+S0[3]);
+    double s1 = (S1[0]+S1[1])+(S1[2]+S1[3]);
 #endif
 
     // Careful - without -mfma, you may get worse performance. By using FMA
@@ -130,8 +140,7 @@ void covariates(double *ff_out, double *fy_out, ArrayXd &f, ArrayXd &g,
         g[i] = fma(k1,x[i],g[i]);
     }
 
-    *ff_out = s0;
-    *fy_out = s1;
+    return cov_t{s0,s1};
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -324,19 +333,17 @@ public:
                 double b2 = b_i*b_i;
                 ArrayXd f = ArrayXd::Zero(m+1);
                 ArrayXd g = ArrayXd::Zero(m+1);
-                double ff = 0;
-                double fy = 0;
 
-                covariates(&ff,&fy,f,g,Bok.row(0),yb,0,b_i);
+                covariates(f,g,Bok.row(0),yb,0,b_i);
                 g[m] += b_i*bx[0];
 
                 for (int i = 1; i < tail; ++i) {
                     b_i = b[k[i]]; // sort and upcast to double
-                    covariates(&ff,&fy,f,g,Bok.row(i),yb,d[i],b_i);
+                    cov_t o = covariates(f,g,Bok.row(i),yb,d[i],b_i);
                     f[m] = fma(d[i],g[m],f[m]);
                     g[m] = fma(b_i,bx[i],g[m]);
-                    ff   = fma(f[m],f[m],ff);
-                    fy   = fma(f[m],yb2[j],fy);
+                    o.ff = fma(f[m],f[m],o.ff);
+                    o.fy = fma(f[m],yb2[j],o.fy);
 
                     k0 = fma(d[i]*d[i],b2,k0);
                     k1 = fma(d[i]*2,bd,k1);
@@ -345,8 +352,8 @@ public:
                     b2 = fma(b_i, b_i,b2);
                     vb = fma(yk[i],b_i,vb);
 
-                    const double uw  = fy - w;
-                    const double den = (k0+k1) - ff;
+                    const double uw  = o.fy - w;
+                    const double den = (k0+k1) - o.ff;
                     const double sse = den > _tol? (uw*uw)/(den+_tol) : 0;
                     if ((i > head) and (sse > hinge_sse[j])) {
                         hinge_sse[j] = sse;
