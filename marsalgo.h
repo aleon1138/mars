@@ -81,6 +81,8 @@ struct cov_t {
 
 cov_t covariates(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x, const ArrayXd &y, double k0, double k1)
 {
+    assert(f.rows()==x.rows()+1);
+    assert(g.rows()==x.rows()+1);
     assert(x.cols()==1 && x.rows()>=x.cols());
     assert(x.rows()==y.rows());
     const int m = x.rows();
@@ -97,17 +99,6 @@ cov_t covariates(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x, const ArrayXd &
 
     int i0 = m - m%4;
     for (int i = 0; i < i0; i+=4) {
-        //
-        // TODO:
-        //  * you need to interleave this loop to get rid of latency due to dependencies
-        //  * perhaps get rid of the prefetch
-        //  * also add a benchmark test
-        //
-        _mm_prefetch(&f[i+16],_MM_HINT_T0);
-        _mm_prefetch(&g[i+16],_MM_HINT_T0);
-        _mm_prefetch(&x[i+16],_MM_HINT_T0);
-        _mm_prefetch(&y[i+16],_MM_HINT_T0);
-
         __m256d f0 = _mm256_load_pd(&f[i]);
         __m256d g0 = _mm256_load_pd(&g[i]);
         __m256d x0 = _mm256_cvtps_pd(_mm_load_ps(&x[i]));

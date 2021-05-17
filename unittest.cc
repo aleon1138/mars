@@ -164,8 +164,46 @@ TEST(MarsTest, NonZero)
 
 ///////////////////////////////////////////////////////////////////////////////
 
+cov_t covariates_slow(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x,
+                      const ArrayXd &y, double k0, double k1)
+{
+    cov_t o = {0};
+    for (int i = 0; i < x.rows(); ++i) {
+        f[i] += k0*g[i];
+        g[i] += k1*x[i];
+        o.ff += f[i]*f[i];
+        o.fy += f[i]*y[i];
+    }
+    return o;
+}
+
+TEST(MarsTest, Covariates)
+{
+    int n = 809;
+    int m = 131;
+
+    MatrixXfC X  = MatrixXfC::Random(n,m);
+    ArrayXd   f0 = ArrayXd::Zero(m+1);
+    ArrayXd   g0 = ArrayXd::Zero(m+1);
+    ArrayXd   f1 = ArrayXd::Zero(m+1);
+    ArrayXd   g1 = ArrayXd::Zero(m+1);
+    VectorXd  y  = VectorXd::Random(m);
+    MatrixXd  k  = MatrixXd::Random(n,2);
+
+    for (int i = 0; i < X.rows(); ++i) {
+        cov_t o0 = covariates(f0, g0, X.row(i), y, k(i,0), k(i,1));
+        cov_t o1 = covariates_slow(f1, g1, X.row(i), y, k(i,0), k(i,1));
+        ASSERT_NEAR(o0.ff, o1.ff, 1e-8);
+        ASSERT_NEAR(o0.fy, o1.fy, 1e-8);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
 TEST(MarsTest, DeltaSSE)
 {
+    srand(0);
+
     const int N = 5891;  // number of rows
     const int M = 13;    // number of basis
     const double CUT = 0.25;
