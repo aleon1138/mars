@@ -88,17 +88,16 @@ cov_t covariates(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x, const ArrayXd &
     const int m = x.rows();
 
 #if 0
-    int i0 = 0;
-    double s0 = 0;
-    double s1 = 0;
+    int m0 = 0;
+    cov_t o = {0};
 #else
     __m256d K0 = _mm256_set1_pd(k0);
     __m256d K1 = _mm256_set1_pd(k1);
     __m256d S0 = _mm256_setzero_pd();
     __m256d S1 = _mm256_setzero_pd();
 
-    int i0 = m - m%4;
-    for (int i = 0; i < i0; i+=4) {
+    int m0 = m - m%4;
+    for (int i = 0; i < m0; i+=4) {
         __m256d f0 = _mm256_load_pd(&f[i]);
         __m256d g0 = _mm256_load_pd(&g[i]);
         __m256d x0 = _mm256_cvtps_pd(_mm_load_ps(&x[i]));
@@ -113,25 +112,27 @@ cov_t covariates(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x, const ArrayXd &
         _mm256_store_pd(&g[i], g0);
     }
 
-    double s0 = (S0[0]+S0[1])+(S0[2]+S0[3]);
-    double s1 = (S1[0]+S1[1])+(S1[2]+S1[3]);
+    cov_t o = {
+        ff: (S0[0]+S0[1])+(S0[2]+S0[3]),
+        fy: (S1[0]+S1[1])+(S1[2]+S1[3]),
+    };
 #endif
 
     // Careful - without -mfma, you may get worse performance. By using FMA
     // we incur only half the error of doing the add and multiply separately.
     static_assert(FP_FAST_FMA, "-mfma must be enabled");
-    for (int i = i0; i < m; ++i) {
+    for (int i = m0; i < m; ++i) {
         f[i] = fma(k0,g[i],f[i]);
-        s0   = fma(f[i],f[i],s0);
-        s1   = fma(f[i],y[i],s1);
+        o.ff = fma(f[i],f[i],o.ff);
+        o.fy = fma(f[i],y[i],o.fy);
     }
 
     // It seems we have better cache locality if we split the loop as follows.
-    for (int i = i0; i < m; ++i) {
+    for (int i = m0; i < m; ++i) {
         g[i] = fma(k1,x[i],g[i]);
     }
 
-    return cov_t{s0,s1};
+    return o;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
