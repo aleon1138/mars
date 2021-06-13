@@ -79,7 +79,8 @@ struct cov_t {
     double fy;
 };
 
-cov_t covariates(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x, const ArrayXd &y, double k0, double k1)
+cov_t covariates(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x, const ArrayXd &y,
+                 double k0, float k1)
 {
     assert(f.rows()==x.rows()+1);
     assert(g.rows()==x.rows()+1);
@@ -92,7 +93,7 @@ cov_t covariates(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x, const ArrayXd &
     cov_t o = {0};
 #else
     __m256d K0 = _mm256_set1_pd(k0);
-    __m256d K1 = _mm256_set1_pd(k1);
+    __m128  K1 = _mm_set1_ps(k1);
     __m256d S0 = _mm256_setzero_pd();
     __m256d S1 = _mm256_setzero_pd();
 
@@ -100,11 +101,12 @@ cov_t covariates(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x, const ArrayXd &
     for (int i = 0; i < m0; i+=4) {
         __m256d f0 = _mm256_load_pd(&f[i]);
         __m256d g0 = _mm256_load_pd(&g[i]);
-        __m256d x0 = _mm256_cvtps_pd(_mm_load_ps(&x[i]));
+        __m128  x0 = _mm_load_ps   (&x[i]);
         __m256d y0 = _mm256_load_pd(&y[i]);
+        __m256d k1_x0 = _mm256_cvtps_pd(_mm_mul_ps(K1,x0));
 
         f0 = _mm256_fmadd_pd(K0,g0,f0);
-        g0 = _mm256_fmadd_pd(K1,x0,g0);
+        g0 = _mm256_add_pd  (k1_x0,g0);
         S0 = _mm256_fmadd_pd(f0,f0,S0);
         S1 = _mm256_fmadd_pd(f0,y0,S1);
 

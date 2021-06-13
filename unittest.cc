@@ -165,7 +165,7 @@ TEST(MarsTest, NonZero)
 ///////////////////////////////////////////////////////////////////////////////
 
 cov_t covariates_slow(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x,
-                      const ArrayXd &y, double k0, double k1)
+                      const ArrayXd &y, double k0, float k1)
 {
     cov_t o = {0};
     for (int i = 0; i < x.rows(); ++i) {
@@ -188,13 +188,13 @@ TEST(MarsTest, Covariates)
     ArrayXd   f1 = ArrayXd::Zero(m+1);
     ArrayXd   g1 = ArrayXd::Zero(m+1);
     VectorXd  y  = VectorXd::Random(m);
-    MatrixXd  k  = MatrixXd::Random(n,2);
+    MatrixXf  k  = MatrixXf::Random(n,2);
 
     for (int i = 0; i < X.rows(); ++i) {
         cov_t o0 = covariates(f0, g0, X.row(i), y, k(i,0), k(i,1));
         cov_t o1 = covariates_slow(f1, g1, X.row(i), y, k(i,0), k(i,1));
-        ASSERT_NEAR(o0.ff, o1.ff, 1e-8);
-        ASSERT_NEAR(o0.fy, o1.fy, 1e-8);
+        ASSERT_NEAR(o1.ff > 0? o0.ff/o1.ff : 1, 1, 1e-6);
+        ASSERT_NEAR(o1.fy > 0? o0.fy/o1.fy : 1, 1, 1e-6);
     }
 }
 
