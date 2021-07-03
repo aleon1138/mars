@@ -165,15 +165,18 @@ TEST(MarsTest, NonZero)
 ///////////////////////////////////////////////////////////////////////////////
 
 cov_t covariates_slow(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x,
-                      const ArrayXd &y, double k0, float k1)
+                      const ArrayXd &y, double xm, double k0, float k1)
 {
+    int m = x.rows();
     cov_t o = {0};
-    for (int i = 0; i < x.rows(); ++i) {
+    for (int i = 0; i < m; ++i) {
         f[i] += k0*g[i];
         g[i] += k1*x[i];
         o.ff += f[i]*f[i];
         o.fy += f[i]*y[i];
     }
+    f[m] += k0*g[m];
+    g[m] += k1*xm;
     return o;
 }
 
@@ -188,11 +191,14 @@ TEST(MarsTest, Covariates)
     ArrayXd   f1 = ArrayXd::Zero(m+1);
     ArrayXd   g1 = ArrayXd::Zero(m+1);
     VectorXd  y  = VectorXd::Random(m);
-    MatrixXf  k  = MatrixXf::Random(n,2);
+    MatrixXf  k  = MatrixXf::Random(n,3);
 
     for (int i = 0; i < X.rows(); ++i) {
-        cov_t o0 = covariates(f0, g0, X.row(i), y, k(i,0), k(i,1));
-        cov_t o1 = covariates_slow(f1, g1, X.row(i), y, k(i,0), k(i,1));
+        cov_t o0 = covariates(f0, g0, X.row(i), y, k(i,0), k(i,1), k(i,2));
+        cov_t o1 = covariates_slow(f1, g1, X.row(i), y, k(i,0), k(i,1), k(i,2));
+
+        ASSERT_NEAR((f0-f1).matrix().norm(), 0, 1e-9);
+        ASSERT_NEAR((g0-g1).matrix().norm(), 0, 1e-9);
         ASSERT_NEAR(o1.ff > 0? o0.ff/o1.ff : 1, 1, 1e-6);
         ASSERT_NEAR(o1.fy > 0? o0.fy/o1.fy : 1, 1, 1e-6);
     }

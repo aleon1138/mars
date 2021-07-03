@@ -79,9 +79,24 @@ struct cov_t {
     double fy;
 };
 
+///////////////////////////////////////////////////////////////////////////////
+//  f :
+//  g :
+//  x : float[]
+//      a row of ortho-normalized and pre-sorted basis that have already been
+//      chosen in the model. This is labelled as `Bok` elsewhere in the code.
+//  y : double[]
+//      This is the result of `dot(Bo.T,y)`. It has the same length as `x`.
+//  k0 :
+//  k1 :
+///////////////////////////////////////////////////////////////////////////////
 cov_t covariates(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x, const ArrayXd &y,
-                 double k0, float k1)
+                 double xm, double k0, float k1)
 {
+    // Careful - without -mfma, you may get worse performance. By using FMA
+    // we incur only half the error of doing the add and multiply separately.
+    static_assert(FP_FAST_FMA, "-mfma must be enabled");
+
     assert(f.rows()==x.rows()+1);
     assert(g.rows()==x.rows()+1);
     assert(x.cols()==1 && x.rows()>=x.cols());
@@ -120,19 +135,23 @@ cov_t covariates(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x, const ArrayXd &
     };
 #endif
 
-    // Careful - without -mfma, you may get worse performance. By using FMA
-    // we incur only half the error of doing the add and multiply separately.
-    static_assert(FP_FAST_FMA, "-mfma must be enabled");
+    // Arithmetic intensity: 2 FLOP / 32 BYTES  ~=  0.06
     for (int i = m0; i < m; ++i) {
         f[i] = fma(k0,g[i],f[i]);
+    }
+    f[m] = fma(k0,g[m],f[m]);
+
+    // Arithmetic intensity: 4 FLOP / 64 BYTES  ~=  0.06
+    for (int i = m0; i < m; ++i) {
         o.ff = fma(f[i],f[i],o.ff);
         o.fy = fma(f[i],y[i],o.fy);
     }
 
-    // It seems we have better cache locality if we split the loop as follows.
+    // Arithmetic intensity: 2 FLOP / 24 BYTES  ~=  0.08
     for (int i = m0; i < m; ++i) {
-        g[i] = fma(k1,x[i],g[i]);
+        g[i] += k1 * x[i];
     }
+    g[m] = fma(k1,xm,g[m]);
 
     return o;
 }
@@ -226,15 +245,15 @@ public:
     //  hinge_dsse : [out]
     //
     //  hinge_cuts : [out]
-    //
-    //  xol : which column of the training data to use.
-    //
-    //  bmask : a boolean mask to filter out which bases to use.
-    //
-    //  endspan : how many samples to ignore from both ends of the training data.
-    //
-    //  linear_only : do not find the optimal hinge cuts, only build a linear
-    //      model. You can set "hinge_sse" and "hinge_cut" as NULL.
+    //  xol : int
+    //      which column of the training data to use.
+    //  bmask : bool[]
+    //      a boolean mask to filter out which bases to use.
+    //  endspan : int
+    //      how many samples to ignore from both ends of the training data.
+    //  linear_only : bool
+    //      do not find the optimal hinge cuts, only build a linear model.
+    //      You can set "hinge_sse" and "hinge_cut" as NULL.
     ///////////////////////////////////////////////////////////////////////////
     void eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
               int xcol, const bool *bmask, int endspan, bool linear_only)
@@ -327,15 +346,11 @@ public:
                 double b2 = b_i*b_i;
                 ArrayXd f = ArrayXd::Zero(m+1);
                 ArrayXd g = ArrayXd::Zero(m+1);
-
-                covariates(f,g,Bok.row(0),yb,0,b_i);
-                g[m] += b_i*bx[0];
+                covariates(f,g,Bok.row(0),yb,bx[0],0,b_i);
 
                 for (int i = 1; i < tail; ++i) {
                     b_i = b[k[i]]; // sort and upcast to double
-                    cov_t o = covariates(f,g,Bok.row(i),yb,d[i],b_i);
-                    f[m] = fma(d[i],g[m],f[m]);
-                    g[m] = fma(b_i,bx[i],g[m]);
+                    cov_t o = covariates(f,g,Bok.row(i),yb,bx[i],d[i],b_i);
                     o.ff = fma(f[m],f[m],o.ff);
                     o.fy = fma(f[m],yb2[j],o.fy);
 
