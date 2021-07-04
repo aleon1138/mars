@@ -165,13 +165,13 @@ TEST(MarsTest, NonZero)
 ///////////////////////////////////////////////////////////////////////////////
 
 cov_t covariates_slow(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x,
-                      const ArrayXd &y, double xm, double k0, float k1)
+                      const ArrayXd &y, double xm, double k0, double k1)
 {
     int m = x.rows();
     cov_t o = {0};
     for (int i = 0; i < m; ++i) {
         f[i] += k0*g[i];
-        g[i] += k1*x[i];
+        g[i] += k1*double(x[i]);
         o.ff += f[i]*f[i];
         o.fy += f[i]*y[i];
     }
