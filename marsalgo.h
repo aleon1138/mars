@@ -90,50 +90,56 @@ struct cov_t {
 //  k0 :
 //  k1 :
 ///////////////////////////////////////////////////////////////////////////////
-cov_t covariates(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x, const ArrayXd &y,
+cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &x_, const ArrayXd &y_,
                  double xm, double k0, float k1)
 {
+    //-------------------------------------------------------------------------
     // Careful - without -mfma, you may get worse performance. By using FMA
     // we incur only half the error of doing the add and multiply separately.
+    //-------------------------------------------------------------------------
     static_assert(FP_FAST_FMA, "-mfma must be enabled");
 
-    assert(f.rows()==x.rows()+1);
-    assert(g.rows()==x.rows()+1);
-    assert(x.cols()==1 && x.rows()>=x.cols());
-    assert(x.rows()==y.rows());
-    const int m = x.rows();
+    const int m = x_.rows();
+    assert(f_.rows()==m+1);
+    assert(g_.rows()==m+1);
+    assert(y_.rows()==m);
+
+    //-------------------------------------------------------------------------
+    // We cast Eigen to raw pointers, as the profiler showed that accessing the
+    // values via the [] operator is not zero cost as of yet.
+    //-------------------------------------------------------------------------
+    double *f = f_.data();
+    double *g = g_.data();
+    const float  *x = x_.data();
+    const double *y = y_.data();
 
 #if 0
     int m0 = 0;
     cov_t o = {0};
 #else
     __m256d K0 = _mm256_set1_pd(k0);
+    __m256d K1 = _mm256_set1_pd(k1);
     __m256d S0 = _mm256_setzero_pd();
     __m256d S1 = _mm256_setzero_pd();
 
     int m0 = m - m%4;
     for (int i = 0; i < m0; i+=4) {
-        __m256d f0 = _mm256_load_pd(&f[i]);
-        __m256d g0 = _mm256_load_pd(&g[i]);
-        __m256d y0 = _mm256_load_pd(&y[i]);
+        __m256d f0 = _mm256_load_pd(f+i);
+        __m256d g0 = _mm256_load_pd(g+i);
+        __m256d y0 = _mm256_load_pd(y+i);
 
         f0 = _mm256_fmadd_pd(K0,g0,f0);
         S0 = _mm256_fmadd_pd(f0,f0,S0);
         S1 = _mm256_fmadd_pd(f0,y0,S1);
-
-        _mm256_store_pd(&f[i], f0);
+        _mm256_store_pd(f+i, f0);
     }
 
-    // Arithmetic intensity: 8 FLOP / 80 BYTES  ~=  0.10
-    __m128 K1 = _mm_set1_ps(k1);
     for (int i = 0; i < m0; i+=4) {
-        __m256d g0 = _mm256_load_pd(&g[i]);
-        __m128  x0 = _mm_load_ps(&x[i]);
+        __m256d g0 = _mm256_load_pd(g+i);
+        __m256d x0 = _mm256_cvtps_pd(_mm_load_ps(x+i));
 
-        __m256d k1_x0 = _mm256_cvtps_pd(_mm_mul_ps(K1,x0));
-        g0 = _mm256_add_pd(k1_x0,g0);
-
-        _mm256_store_pd(&g[i], g0);
+        g0 = _mm256_fmadd_pd(K1,x0,g0);
+        _mm256_store_pd(g+i, g0);
     }
 
     cov_t o = {
@@ -142,23 +148,14 @@ cov_t covariates(ArrayXd &f, ArrayXd &g, const Ref<VectorXf> &x, const ArrayXd &
     };
 #endif
 
-    // Arithmetic intensity: 2 FLOP / 32 BYTES  ~=  0.06
     for (int i = m0; i < m; ++i) {
         f[i] = fma(k0,g[i],f[i]);
-    }
-    f[m] = fma(k0,g[m],f[m]);
-
-    // Arithmetic intensity: 4 FLOP / 64 BYTES  ~=  0.06
-    for (int i = m0; i < m; ++i) {
+        g[i] = fma(k1,x[i],g[i]);
         o.ff = fma(f[i],f[i],o.ff);
         o.fy = fma(f[i],y[i],o.fy);
     }
-
-    // Arithmetic intensity: 2 FLOP / 20 BYTES  ~=  0.10
-    for (int i = m0; i < m; ++i) {
-        g[i] += k1 * x[i];
-    }
-    g[m] = fma(k1,xm,g[m]);
+    f[m] = fma(k0,g[m],f[m]);
+    g[m] = fma(k1,xm,  g[m]);
 
     return o;
 }
