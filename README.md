@@ -28,8 +28,12 @@ available pre-compiled](https://bit.ly/2vNUBWN) on Ubuntu.
     sudo cp *.a /usr/lib
 ```
 
-[pybind11](https://github.com/pybind/pybind11) - Install using your python package manager
+[pybind11](https://github.com/pybind/pybind11) - Install using your python package manager of choice:
 
+```bash
+    pip3 install pybind11
+```
+... or ...
 ```bash
     conda install -y pybind11
 ```
@@ -50,26 +54,28 @@ Here we train a linear model with a categorical interaction.
 
 ```python
 import numpy as np
-X      = np.random.randn(10000,2)
+X      = np.random.randn(10000, 2)
 X[:,1] = np.random.binomial(1, .5, size=len(X))
-y      = 2*X[:,0] + 3*X[:,1] + X[:,0]*X[:,1] + np.random.normal(size=len(X))
+y      = 2*X[:,0] + 3*X[:,1] + X[:,0]*X[:,1] + np.random.randn(len(X))
 
 # convert to column-major float
-X = np.array(X,order='F',dtype='f')
-y = np.array(y,dtype='f')
+X = np.array(X, order='F', dtype='f')
+y = np.array(y, dtype='f')
 
 # Fit the earth model
 import mars
-model = mars.fit(X, y, max_epochs=8, tail_span=0)
+model = mars.fit(X, y, max_epochs=8, tail_span=0, linear_only=True)
 B     = mars.expand(X, model) # expand the basis
-beta  = np.linalg.lstsq(B,y,rcond=None)[0]
+beta  = np.linalg.lstsq(B, y, rcond=None)[0]
 y_hat = B @ beta
+
+# Pretty-print the model
+mars.pprint(model, beta)
 ```
 
 Depending on the random seed, the result should look similar to this:
 
-```python
-mars.pprint(model,beta)
+```
     -0.003
     +1.972 * X[0]
     +3.001 * X[1]
