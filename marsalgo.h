@@ -1,8 +1,8 @@
 #include <Eigen/Dense>
 #include <numeric>      // for std::iota
 #include <cfloat>       // for DBL_EPSILON
-#ifdef __AVX2__
-#   include <xmmintrin.h>  // for _mm_getcsr
+#ifdef __SSE__
+#   include <immintrin.h>  // for _mm_getcsr
 #endif
 
 //-----------------------------------------------------------------------------
@@ -121,7 +121,7 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &x_, const ArrayX
     const float  *x = x_.data();
     const double *y = y_.data();
 
-#ifndef __AVX2__
+#ifndef __AVX__
     int m0 = 0;
     cov_t o = {0};
 #else
@@ -277,9 +277,9 @@ public:
         //---------------------------------------------------------------------
         // Enable Flush-to-Zero (FTZ) and Denorms-as-Zero (DAZ)
         //---------------------------------------------------------------------
-#       ifdef __AVX2__
-            const unsigned csr = _mm_getcsr();
-            _mm_setcsr(csr | 0x8040); // FTZ and DAZ
+#       ifdef __SSE__
+        const unsigned csr = _mm_getcsr();
+        _mm_setcsr(csr | 0x8040); // FTZ and DAZ
 #       endif
 
         ArrayXi Bcols = nonzero(Map<const ArrayXb>(bmask,_m));
@@ -397,7 +397,7 @@ public:
             }
         }
 
-#       ifdef __AVX2__
+#       ifdef __SSE__
         _mm_setcsr(csr); // revert
 #       endif
     }
