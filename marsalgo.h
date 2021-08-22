@@ -1,7 +1,11 @@
 #include <Eigen/Dense>
 #include <numeric>      // for std::iota
 #include <cfloat>       // for DBL_EPSILON
-#include <xmmintrin.h>  // for _mm_getcsr
+#if defined __has_include
+#   if __has_include (<xmmintrin.h>)
+#       include <xmmintrin.h>  // for _mm_getcsr
+#   endif
+#endif
 
 //-----------------------------------------------------------------------------
 // The main benefit of using FMA is that you only incur half the error of doing
@@ -9,7 +13,7 @@
 // std::fma() is much slower than the underlying implementation. So disable it.
 //-----------------------------------------------------------------------------
 #ifndef FP_FAST_FMA
-    #undef fma
+#   undef fma
     inline double fma(double x, double y, double z) {
         return x * y + z;
     }
