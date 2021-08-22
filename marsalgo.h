@@ -3,6 +3,18 @@
 #include <cfloat>       // for DBL_EPSILON
 #include <xmmintrin.h>  // for _mm_getcsr
 
+//-----------------------------------------------------------------------------
+// The main benefit of using FMA is that you only incur half the error of doing
+// the add and multiply separately. If the below macro is not available, then
+// std::fma() is much slower than the underlying implementation. So disable it.
+//-----------------------------------------------------------------------------
+#ifndef FP_FAST_FMA
+    #undef fma
+    inline double fma(double x, double y, double z) {
+        return x * y + z;
+    }
+#endif
+
 using namespace Eigen;
 typedef Matrix<double,Dynamic,Dynamic,RowMajor> MatrixXdC;
 typedef Matrix<float, Dynamic,Dynamic,RowMajor> MatrixXfC;
@@ -93,12 +105,6 @@ struct cov_t {
 cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &x_, const ArrayXd &y_,
                  double xm, double k0, float k1)
 {
-    //-------------------------------------------------------------------------
-    // Careful - without -mfma, you may get worse performance. By using FMA
-    // we incur only half the error of doing the add and multiply separately.
-    //-------------------------------------------------------------------------
-    static_assert(FP_FAST_FMA, "-mfma must be enabled");
-
     const int m = x_.rows();
     assert(f_.rows()==m+1);
     assert(g_.rows()==m+1);
@@ -113,7 +119,7 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &x_, const ArrayX
     const float  *x = x_.data();
     const double *y = y_.data();
 
-#if 0
+#ifndef __AVX2__
     int m0 = 0;
     cov_t o = {0};
 #else
@@ -335,7 +341,6 @@ public:
 
             const int head = endspan;
             const int tail = n-endspan;
-            static_assert(FP_FAST_FMA, "-mfma must be enabled");
 
             for (int j = 0; j < p; ++j) {
                 const Ref<VectorXf> b  = _B.col(Bcols[j]);
