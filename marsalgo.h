@@ -1,10 +1,8 @@
 #include <Eigen/Dense>
 #include <numeric>      // for std::iota
 #include <cfloat>       // for DBL_EPSILON
-#if defined __has_include
-#   if __has_include (<xmmintrin.h>)
-#       include <xmmintrin.h>  // for _mm_getcsr
-#   endif
+#ifdef __AVX2__
+#   include <xmmintrin.h>  // for _mm_getcsr
 #endif
 
 //-----------------------------------------------------------------------------
@@ -279,8 +277,10 @@ public:
         //---------------------------------------------------------------------
         // Enable Flush-to-Zero (FTZ) and Denorms-as-Zero (DAZ)
         //---------------------------------------------------------------------
-        const unsigned csr = _mm_getcsr();
-        _mm_setcsr(csr | 0x8040); // FTZ and DAZ
+#       ifdef __AVX2__
+            const unsigned csr = _mm_getcsr();
+            _mm_setcsr(csr | 0x8040); // FTZ and DAZ
+#       endif
 
         ArrayXi Bcols = nonzero(Map<const ArrayXb>(bmask,_m));
         const int n = _X.rows();
@@ -396,7 +396,10 @@ public:
                 }
             }
         }
+
+#       ifdef __AVX2__
         _mm_setcsr(csr); // revert
+#       endif
     }
 
     ///////////////////////////////////////////////////////////////////////////
