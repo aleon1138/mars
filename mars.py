@@ -164,7 +164,7 @@ def fit(X, y, w=None, **kwargs):
 
     # Equation numbers refer to the original MARS paper
     get_dof = lambda m: m + penalty * (m - 1)  # Eq. (31,32)
-    gcv_adj = lambda mse, m: mse / (1.0 - get_dof(m) / n_true) ** 2 # Eq. (30)
+    gcv_adj = lambda mse, m: mse / (1.0 - get_dof(m) / n_true) ** 2  # Eq. (30)
     avg_diff = lambda x, n: np.sort(np.diff(x))[1:-1].mean() if len(x) > n else np.nan
 
     # Set up a basic filter which caps the polynomial degree of basis and optionally
@@ -230,7 +230,7 @@ def fit(X, y, w=None, **kwargs):
 
         # Build up the mask block here
         bmask = np.zeros((X.shape[1], len(basis)), dtype="bool")
-        bmask[np.ix_(input_to_use,basis_to_use)] = True
+        bmask[np.ix_(input_to_use, basis_to_use)] = True
         for i in input_to_use:
             bmask[i] &= np.array([basic_filter(i, b) for b in basis])
             bmask[i] &= np.array([aux_filter(i, b) for b in basis])
@@ -251,17 +251,17 @@ def fit(X, y, w=None, **kwargs):
         j2 = np.unravel_index(np.argmax(sse2), sse2.shape)
         dt = time.time() - start_t
         if sse1[j1] <= 0 and sse2[j2] <= 0:
-            break # all input data is filtered or zero
+            break  # all input data is filtered or zero
 
         # Estimate the out-sample error with Generalized Cross-Validation
         m0 = m = algo.nbasis()
-        mse1 = gcv_adj((1.0 - sse0 - sse1[j1]) / n, m+1)
-        mse2 = gcv_adj((1.0 - sse0 - sse2[j2]) / n, m+2)
+        mse1 = gcv_adj((1.0 - sse0 - sse1[j1]) / n, m + 1)
+        mse2 = gcv_adj((1.0 - sse0 - sse2[j2]) / n, m + 2)
         if mse1 <= mse2:
-            xcol,bcol,hcut = j1[0], j1[1], np.nan
+            xcol, bcol, hcut = j1[0], j1[1], np.nan
             htypes = ["l"]
         else:
-            xcol,bcol,hcut = j2[0], j2[1], cut[j2]
+            xcol, bcol, hcut = j2[0], j2[1], cut[j2]
             htypes = ["+", "-"]
 
         for htype in htypes:
@@ -289,7 +289,7 @@ def fit(X, y, w=None, **kwargs):
         # Stopping conditions
         model_tail = model[max(algo.nbasis() - r2_window - 1, 0) : algo.nbasis()]
         if m == m0:
-            break # no progress
+            break  # no progress
         if model_tail[-1]["r2"] > 1 - r2_thresh:
             break  # R2 almost reached 100%
         if dt > max_runtime:
@@ -307,9 +307,9 @@ def expand(X, model):
     """
     Expand a feature set X into the bases of a MARS model.
     """
-    decode = lambda s: s.decode("utf8") if isinstance(s,bytes) else s
+    decode = lambda s: s.decode("utf8") if isinstance(s, bytes) else s
     X = np.asarray(X)
-    B = np.empty((len(X),len(model)),order="F")
+    B = np.empty((len(X), len(model)), order="F")
 
     for i in range(len(model)):
         t = decode(model[i]["type"])
@@ -318,17 +318,17 @@ def expand(X, model):
         h = model[i]["hinge"]
 
         if t == "i":
-            B[:,i] = 1.0
+            B[:, i] = 1.0
         else:
             assert 0 <= x < X.shape[1]
             assert (b == -1) or (0 <= b < i)
-            parent = B[:,b] if b >= 0 else 1.0
+            parent = B[:, b] if b >= 0 else 1.0
             if t == "l":
-                B[:,i] = parent * X[:,x]
+                B[:, i] = parent * X[:, x]
             elif t == "+":
-                B[:,i] = parent * np.maximum(X[:,x]-h,0)
+                B[:, i] = parent * np.maximum(X[:, x] - h, 0)
             elif t == "-":
-                B[:,i] = parent * np.maximum(h-X[:,x],0)
+                B[:, i] = parent * np.maximum(h - X[:, x], 0)
             else:
                 assert False
     return B
@@ -341,31 +341,32 @@ def prune(XX, XY, YY, n_true, penalty=3, ridge=0, mask=None):
     """
     Solve for the linear coefficients, with pruning.
     """
+
     def _solve(xx, xy, mask):
         # You must use 'lstsq' so we can handle under-determined problems
         beta = np.zeros(len(xy))
         if mask.any():
-            xx = xx[np.ix_(mask,mask)]
+            xx = xx[np.ix_(mask, mask)]
             xy = xy[mask]
-            beta[mask] = np.linalg.lstsq(xx,xy,rcond=None)[0]
+            beta[mask] = np.linalg.lstsq(xx, xy, rcond=None)[0]
         return beta
 
-    def _gcv_sse(xx,xy,yy,mask,dof,n_true):
-        sse = yy - np.dot(xy,_solve(xx,xy,mask))
-        return sse/(1.-dof/n_true)**2
+    def _gcv_sse(xx, xy, yy, mask, dof, n_true):
+        sse = yy - np.dot(xy, _solve(xx, xy, mask))
+        return sse / (1.0 - dof / n_true) ** 2
 
     M = len(XX)
-    mask = np.array(mask) if mask is not None else np.ones(M,dtype='bool')
+    mask = np.array(mask) if mask is not None else np.ones(M, dtype="bool")
     mask = mask & (np.diag(XX) > 0)
-    dof  = M + penalty*(M-1)
-    min_sse = _gcv_sse(XX,XY,YY,mask,dof,n_true)
+    dof = M + penalty * (M - 1)
+    min_sse = _gcv_sse(XX, XY, YY, mask, dof, n_true)
 
     while True:
-        sse = np.ones(M)*np.inf
+        sse = np.ones(M) * np.inf
         for i in np.where(mask)[0]:
-            k = mask & (np.arange(len(mask))!=i)
-            dof = sum(k) + penalty*(M-1)
-            sse[i] = _gcv_sse(XX,XY,YY,k,dof,n_true)
+            k = mask & (np.arange(len(mask)) != i)
+            dof = sum(k) + penalty * (M - 1)
+            sse[i] = _gcv_sse(XX, XY, YY, k, dof, n_true)
         if sse.min() >= min_sse:
             break
         mask[np.argmin(sse)] = False
@@ -373,9 +374,9 @@ def prune(XX, XY, YY, n_true, penalty=3, ridge=0, mask=None):
         assert np.isfinite(min_sse)
 
     if ridge > 0:
-        assert np.allclose(np.diag(XX)[mask],np.ones(mask.sum()))
+        assert np.allclose(np.diag(XX)[mask], np.ones(mask.sum()))
         XX += np.eye(len(XX)) * ridge
-    return _solve(XX,XY,mask)
+    return _solve(XX, XY, mask)
 
 
 # -----------------------------------------------------------------------------
@@ -385,12 +386,13 @@ def pprint(model, beta):
     """
     Pretty-print the model. Useful for debugging.
     """
+
     def get_inputs(i: int):
         row = model[i]
         if row["type"] == b"+":
-            node = "MAX(X[%d]-%g,0)" % (row["input"],row["hinge"])
+            node = "MAX(X[%d]-%g,0)" % (row["input"], row["hinge"])
         elif row["type"] == b"-":
-            node = "MAX(%g-X[%d],0)" % (row["hinge"],row["input"])
+            node = "MAX(%g-X[%d],0)" % (row["hinge"], row["input"])
         else:
             node = "X[%d]" % row["input"]
 
@@ -400,6 +402,6 @@ def pprint(model, beta):
 
     for i in range(len(model)):
         if model[i]["type"] == b"i":
-            print("  %+8.4g"%beta[i])
+            print("  %+8.4g" % beta[i])
         else:
-            print('  %+8.4g * '%beta[i] + ' * '.join(get_inputs(i)))
+            print("  %+8.4g * " % beta[i] + " * ".join(get_inputs(i)))
