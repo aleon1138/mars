@@ -2,16 +2,23 @@
 
 A C++ implementation of [Multivariate Adaptive Regression Splines](https://bit.ly/3cAc7xp). This is
 a semi-brute force search for interactions and non-linearities. It will give almost as good
-performance as a neural network, but with much faster model evaluation runtimes.
+performance as a neural network, but with much faster model evaluation run-times.
 
 Some references:
-* There is a nice writeup [here](https://uc-r.github.io/mars) describing the method.
+* There is a nice write-up [here](https://uc-r.github.io/mars) describing the method.
 * There is also a commercial package [here](https://www.salford-systems.com/products/mars).
 * The documentation for the R "earth" package is [here](https://cran.r-project.org/web/packages/earth/earth.pdf).
 * Stephen Milborrow maintains an excellent resource [here](http://www.milbo.users.sonic.net/earth).
 * Additionally there is an module for to scikit-learn [here](https://contrib.scikit-learn.org/py-earth).
 
+## Supported Platforms
+
+These instructions have been verfied to work on the following platforms:
+* Ubuntu 18
+* Raspbian 10 
+
 ## Build Requirements
+
 [Eigen](http://eigen.tuxfamily.org/) - The code has been tested with version 3.3.4.
 
 ```bash
