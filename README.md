@@ -15,7 +15,8 @@ Some references:
 
 These instructions have been verfied to work on the following platforms:
 * Ubuntu 18
-* Raspbian 10 
+* Raspbian 10
+* macOS 10.13 (WIP)
 
 ## Build Requirements
 
@@ -23,6 +24,10 @@ These instructions have been verfied to work on the following platforms:
 
 ```bash
     sudo apt install -y libeigen3-dev
+```
+... on macOS:
+```bash
+    brew install pkg-config eigen
 ```
 
 [GoogleTest](https://github.com/google/googletest) - Unfortunately, the library is [no longer
