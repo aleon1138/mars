@@ -11,9 +11,7 @@ CPPFLAGS += $(shell python3 -m pybind11 --includes)
 CPPFLAGS += $(shell python3-config --includes)
 CPPFLAGS += -DNDEBUG -DEIGEN_DONT_PARALLELIZE
 
-TARGET = marslib$(shell python3-config --extension-suffix)
-
-$(TARGET): marslib.cc marsalgo.h
+marslib.so: marslib.cc marsalgo.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -shared -fPIC -o $@ $<
 
 test: unittest
@@ -26,4 +24,4 @@ unittest: unittest.cc marsalgo.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $< -lgtest -lpthread
 
 clean:
-	rm -rf __pycache__ unittest $(TARGET)
+	rm -rf __pycache__ unittest marslib.so
