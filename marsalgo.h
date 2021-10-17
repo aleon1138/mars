@@ -151,8 +151,8 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &x_, const ArrayX
     }
 
     cov_t o = {
-        ff: (S0[0]+S0[1])+(S0[2]+S0[3]),
-        fy: (S1[0]+S1[1])+(S1[2]+S1[3]),
+        .ff = (S0[0]+S0[1])+(S0[2]+S0[3]),
+        .fy = (S1[0]+S1[1])+(S1[2]+S1[3]),
     };
 #endif
 
