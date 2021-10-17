@@ -1,12 +1,17 @@
 CXXFLAGS += -O2 -Wall -std=c++11
 CXXFLAGS += -march=native -fvisibility=hidden
+ifeq ($(shell uname), Darwin)
+	CXXFLAGS += -mfma -undefined dynamic_lookup
+endif
 
 CPPFLAGS += $(shell pkg-config --cflags eigen3)
 CPPFLAGS += $(shell python3 -m pybind11 --includes)
 CPPFLAGS += $(shell python3-config --includes)
 CPPFLAGS += -DNDEBUG -DEIGEN_DONT_PARALLELIZE
 
-marslib.so: marslib.cc marsalgo.h
+TARGET = marslib$(shell python3-config --extension-suffix)
+
+$(TARGET): marslib.cc marsalgo.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -shared -fPIC -o $@ $<
 
 test: unittest
@@ -19,4 +24,4 @@ unittest: unittest.cc marsalgo.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $< -lgtest -lpthread
 
 clean:
-	rm -rf __pycache__ unittest marslib.so
+	rm -rf __pycache__ unittest $(TARGET)
