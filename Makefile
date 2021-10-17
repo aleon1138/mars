@@ -1,7 +1,9 @@
 CXXFLAGS += -O2 -Wall -std=c++11
 CXXFLAGS += -march=native -fvisibility=hidden
 ifeq ($(shell uname), Darwin)
-	CXXFLAGS += -mfma -undefined dynamic_lookup
+	CXXFLAGS += -mfma # strange, but this is not default under arch=native
+	CXXFLAGS += -undefined dynamic_lookup # needed for pybind
+	CXXFLAGS += -Wno-unknown-warning-option # needed for eigen
 endif
 
 CPPFLAGS += $(shell pkg-config --cflags eigen3)
