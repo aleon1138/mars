@@ -109,30 +109,34 @@ struct cov_t {
 };
 
 /*
- *  f :
- *  g :
- *  x : float[]
- *      a row of ortho-normalized and pre-sorted basis that have already been
- *      chosen in the model. This is labelled as `Bok` elsewhere in the code.
- *  y : double[]
- *      This is the result of `dot(Bo.T,y)`. It has the same length as `x`.
+ *  f :double(m+1)
+ *
+ *  g : double(m+1)
+ *
+ *  Bok_row : float(m)
+ *      a row of ortho-normalized and pre-sorted existing basis.
+ *
+ *  yb : double(m)
+ *      the result of `dot(Bo.T,y)`
+ *
  *  k0 :
+ *
  *  k1 :
  */
-cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &x_, const ArrayXd &y_,
-                 double xm, double k0, float k1)
+cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &Bok_row,
+                 const ArrayXd &yb, double xm, double k0, float k1)
 {
-    const int m = x_.rows();
+    const int m = Bok_row.rows();
     assert(f_.rows()==m+1);
     assert(g_.rows()==m+1);
-    assert(y_.rows()==m);
+    assert(yb.rows()==m);
 
     // Cast to raw pointers, as the profiler showed that accessing via the `[]`
     // operator is surprisingly not zero-cost as of yet.
     double *f = f_.data();
     double *g = g_.data();
-    const float  *x = x_.data();
-    const double *y = y_.data();
+    const float  *x = Bok_row.data();
+    const double *y = yb.data();
 
 #ifndef __AVX__
     int m0 = 0;
@@ -148,18 +152,14 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &x_, const ArrayX
         __m256d f0 = _mm256_load_pd(f+i);
         __m256d g0 = _mm256_load_pd(g+i);
         __m256d y0 = _mm256_load_pd(y+i);
-
-        f0 = _mm256_fmadd_pd(K0,g0,f0);
-        S0 = _mm256_fmadd_pd(f0,f0,S0);
-        S1 = _mm256_fmadd_pd(f0,y0,S1);
-        _mm256_store_pd(f+i, f0);
-    }
-
-    for (int i = 0; i < m0; i+=4) {
-        __m256d g0 = _mm256_load_pd(g+i);
         __m256d x0 = _mm256_cvtps_pd(_mm_load_ps(x+i));
 
+        f0 = _mm256_fmadd_pd(K0,g0,f0);
         g0 = _mm256_fmadd_pd(K1,x0,g0);
+        S0 = _mm256_fmadd_pd(f0,f0,S0);
+        S1 = _mm256_fmadd_pd(f0,y0,S1);
+
+        _mm256_store_pd(f+i, f0);
         _mm256_store_pd(g+i, g0);
     }
 
