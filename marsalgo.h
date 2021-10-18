@@ -5,11 +5,11 @@
 #   include <immintrin.h>  // for _mm_getcsr
 #endif
 
-//-----------------------------------------------------------------------------
-// The main benefit of using FMA is that you only incur half the error of doing
-// the add and multiply separately. If the below macro is not available, then
-// std::fma() is much slower than the underlying implementation. So disable it.
-//-----------------------------------------------------------------------------
+/*
+ *  The main benefit of using FMA is that you only incur half the error of doing
+ *  the add and multiply separately. If the below macro is not available, then
+ *  std::fma() is much slower than the underlying implementation. So disable it.
+ */
 #ifndef FP_FAST_FMA
 #   undef fma
     inline double fma(double x, double y, double z) {
@@ -24,9 +24,9 @@ typedef Array<int32_t,Dynamic,1> ArrayXi32;
 typedef Array<int64_t,Dynamic,1> ArrayXi64;
 typedef Array<bool,Dynamic,1> ArrayXb;
 
-///////////////////////////////////////////////////////////////////////////////
-///  Return indexes in REVERSED order
-///////////////////////////////////////////////////////////////////////////////
+/*
+ *  Return sort indexes in descending order.
+ */
 void argsort(int32_t *idx, const float *v, int n)
 {
     std::iota(idx, idx+n, 0);
@@ -35,9 +35,9 @@ void argsort(int32_t *idx, const float *v, int n)
     });
 }
 
-///////////////////////////////////////////////////////////////////////////////
-///  Return the indexes of all non-zero values
-///////////////////////////////////////////////////////////////////////////////
+/*
+ *  Return the indexes of non-zero values.
+ */
 ArrayXi nonzero(const ArrayXb &x)
 {
     ArrayXi y(x.size());
@@ -50,15 +50,32 @@ ArrayXi nonzero(const ArrayXb &x)
     return y.head(n);
 }
 
-///////////////////////////////////////////////////////////////////////////////
-///  Orthonormalize via inverse Cholesky method
-///////////////////////////////////////////////////////////////////////////////
+/*
+ *  Interact a candidate regressor `x` with all existing basis `B`, and then
+ *  ortho-normalize via inverse Cholesky method against the previous set
+ *  of normalized basis `Bo`.
+ *
+ *  Bx : double(n,p) [out]
+ *      returns `B * x`, ortho-normalized against `Bo`
+ *
+ *  B : float(n,m)
+ *      the existing set of basis.
+ *
+ *  Bo : double(n,m)
+ *      the existing set of ortho-normalized basis.
+ *
+ *  x : float(n)
+ *      the candidate regressor.
+ *
+ *  mask : int(p)
+ *      which columns of `B` to use.
+ *
+ *  tol : double
+ *      a small epsilpon used to truncate small values to zero.
+ */
 void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXdC> &Bo,
                     const ArrayXf &x, const ArrayXi &mask, double tol)
 {
-    assert(B.cols()  == Bo.cols() && Bx.rows() == B.rows());
-    assert(Bx.cols() == mask.rows());
-
     for (int j = 0; j < mask.rows(); ++j) {
         Bx.col(j) = (B.col(mask[j]).array() * x).cast<double>();
     }
@@ -70,9 +87,9 @@ void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXd
     Bx *= (s > tol).select(1/(s+tol).sqrt(), 0).matrix().asDiagonal();
 }
 
-///////////////////////////////////////////////////////////////////////////////
-///  Sort columns in-place
-///////////////////////////////////////////////////////////////////////////////
+/*
+ *  Sort columns in-place
+ */
 void sort_columns(Ref<MatrixXd> X, const ArrayXi32 &k)
 {
     VectorXd tmp;
@@ -86,24 +103,22 @@ void sort_columns(Ref<MatrixXd> X, const ArrayXi32 &k)
     }
 }
 
-///////////////////////////////////////////////////////////////////////////////
-
 struct cov_t {
     double ff;
     double fy;
 };
 
-///////////////////////////////////////////////////////////////////////////////
-//  f :
-//  g :
-//  x : float[]
-//      a row of ortho-normalized and pre-sorted basis that have already been
-//      chosen in the model. This is labelled as `Bok` elsewhere in the code.
-//  y : double[]
-//      This is the result of `dot(Bo.T,y)`. It has the same length as `x`.
-//  k0 :
-//  k1 :
-///////////////////////////////////////////////////////////////////////////////
+/*
+ *  f :
+ *  g :
+ *  x : float[]
+ *      a row of ortho-normalized and pre-sorted basis that have already been
+ *      chosen in the model. This is labelled as `Bok` elsewhere in the code.
+ *  y : double[]
+ *      This is the result of `dot(Bo.T,y)`. It has the same length as `x`.
+ *  k0 :
+ *  k1 :
+ */
 cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &x_, const ArrayXd &y_,
                  double xm, double k0, float k1)
 {
@@ -112,10 +127,8 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &x_, const ArrayX
     assert(g_.rows()==m+1);
     assert(y_.rows()==m);
 
-    //-------------------------------------------------------------------------
-    // We cast Eigen to raw pointers, as the profiler showed that accessing the
-    // values via the [] operator is not zero cost as of yet.
-    //-------------------------------------------------------------------------
+    // Cast to raw pointers, as the profiler showed that accessing via the `[]`
+    // operator is surprisingly not zero-cost as of yet.
     double *f = f_.data();
     double *g = g_.data();
     const float  *x = x_.data();
@@ -249,24 +262,30 @@ public:
         return _yvar;
     }
 
-    ///////////////////////////////////////////////////////////////////////////
-    //  Returns the delta SSE (sum of squared errors).
-    //
-    //  linear_dsse : [out]
-    //
-    //  hinge_dsse : [out]
-    //
-    //  hinge_cuts : [out]
-    //  xol : int
-    //      which column of the training data to use.
-    //  bmask : bool[]
-    //      a boolean mask to filter out which bases to use.
-    //  endspan : int
-    //      how many samples to ignore from both ends of the training data.
-    //  linear_only : bool
-    //      do not find the optimal hinge cuts, only build a linear model.
-    //      You can set "hinge_sse" and "hinge_cut" as NULL.
-    ///////////////////////////////////////////////////////////////////////////
+    /*
+     *  Returns the delta SSE (sum of squared errors) given the existing basis
+     *  set and a candidate column of `X` to evaluate.
+     *
+     *  linear_dsse : [out]
+     *
+     *  hinge_dsse : [out]
+     *
+     *  hinge_cuts : [out]
+     *
+     *  xol : int
+     *      which column of the training `X` data to use.
+     *
+     *  bmask : bool(m)
+     *      a boolean mask to filter out which bases to use.
+     *
+     *  endspan : int
+     *      how many samples to ignore from both the extreme ends of the
+     *      training data.
+     *
+     *  linear_only : bool
+     *      do not attempt to find any hinge cuts, only build a linear model.
+     *      This will ignore the input values of `hinge_sse` and `hinge_cut`
+     */
     void eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
               int xcol, const bool *bmask, int endspan, bool linear_only)
     {
@@ -282,10 +301,10 @@ public:
         _mm_setcsr(csr | 0x8040); // FTZ and DAZ
 #       endif
 
-        ArrayXi Bcols = nonzero(Map<const ArrayXb>(bmask,_m));
+        ArrayXi bcols = nonzero(Map<const ArrayXb>(bmask,_m));
         const int n = _X.rows();
-        const int m = _m;
-        const int p = Bcols.rows();
+        const int m = _m;           // number of all basis
+        const int p = bcols.rows(); // number of non-ignored basis
 
         ArrayXf        x   = _X.col(xcol) * _s[xcol]; // copy and normalize 'X' column
         Ref<MatrixXdC> Bo  = _Bo.leftCols(m);
@@ -293,9 +312,9 @@ public:
         Ref<MatrixXd>  Bx  = _Bx.leftCols(p);
 
         //---------------------------------------------------------------------
-        // Orthonormalize via inverse Cholesky method
+        // Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo`
         //---------------------------------------------------------------------
-        orthonormalize(Bx, _B.leftCols(m), Bo, x, Bcols, _tol);
+        orthonormalize(Bx, _B.leftCols(m), Bo, x, bcols, _tol);
 
         //---------------------------------------------------------------------
         // Calculate the linear delta SSE
@@ -309,7 +328,7 @@ public:
         //---------------------------------------------------------------------
         Map<ArrayXd>(linear_dsse,_m) = ArrayXd::Zero(_m);
         for (int j = 0; j < p; ++j) {
-            linear_dsse[Bcols[j]] = linear_sse[j];
+            linear_dsse[bcols[j]] = linear_sse[j];
         }
 
         //---------------------------------------------------------------------
@@ -347,7 +366,7 @@ public:
             const int tail = n-endspan;
 
             for (int j = 0; j < p; ++j) {
-                const Ref<VectorXf> b  = _B.col(Bcols[j]);
+                const Ref<VectorXf> b  = _B.col(bcols[j]);
                 const Ref<VectorXd> bx = Bx.col(j);
 
                 double b_i = b[k[0]]; // sort and upcast to double
@@ -371,7 +390,7 @@ public:
                     k1 = fma(d[i]*2,bd,k1);
                     w  = fma(d[i],vb,w);
                     bd = fma(d[i],b2,bd);
-                    b2 = fma(b_i, b_i,b2);
+                    b2 = fma(b_i,b_i,b2);
                     vb = fma(yk[i],b_i,vb);
 
                     const double uw  = o.fy - w;
@@ -391,8 +410,8 @@ public:
             Map<ArrayXd>(hinge_cuts,_m) = ArrayXd::Constant(_m,NAN);
             for (int j = 0; j < p; ++j) {
                 if (hinge_idx[j] >= 0) {
-                    hinge_dsse[Bcols[j]] = linear_sse[j] + hinge_sse[j];
-                    hinge_cuts[Bcols[j]] = _X(k[hinge_idx[j]],xcol);
+                    hinge_dsse[bcols[j]] = linear_sse[j] + hinge_sse[j];
+                    hinge_cuts[bcols[j]] = _X(k[hinge_idx[j]],xcol);
                 }
             }
         }
