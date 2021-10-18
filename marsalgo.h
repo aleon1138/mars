@@ -191,7 +191,6 @@ class MarsAlgo {
     ArrayXd     _y;         // target vector
     MatrixXf    _B;         // all basis
     MatrixXdC   _Bo;        // all basis, ortho-normalized
-    MatrixXfC   _Bok;       // all basis, ortho-normalized and sorted (scratch buffer)
     MatrixXd    _Bx;        // B[k,mask]*x[k,None] (scratch buffer)
     VectorXd    _By;        // dot product of basis Bo with Y target
     ArrayXf     _s;         // scale of columns of 'X'
@@ -204,7 +203,6 @@ public:
         : _X  (x,n,m,Stride<Dynamic,1>(ldx,1))
         , _B  (MatrixXf ::Zero(n,p))
         , _Bo (MatrixXdC::Zero(n,p))
-        , _Bok(MatrixXfC::Zero(n,p))
         , _Bx (MatrixXdC::Zero(n,p))
         , _tol((n*0.02)*DBL_EPSILON) // rough guess
     {
@@ -308,7 +306,6 @@ public:
 
         ArrayXf        x   = _X.col(xcol) * _s[xcol]; // copy and normalize 'X' column
         Ref<MatrixXdC> Bo  = _Bo.leftCols(m);
-        Ref<MatrixXfC> Bok = _Bok.leftCols(m);
         Ref<MatrixXd>  Bx  = _Bx.leftCols(p);
 
         //---------------------------------------------------------------------
@@ -349,6 +346,7 @@ public:
             //-----------------------------------------------------------------
             // Sort all rows of y, Bo, Bx and take the deltas of x
             //-----------------------------------------------------------------
+            MatrixXfC Bok(n,m); // TODO - put in thread-local storage?
             VectorXd yk(n);
             for (int i = 0; i < n; ++i) {
                 yk[i] = _y[k[i]];
