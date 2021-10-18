@@ -109,9 +109,9 @@ struct cov_t {
 };
 
 /*
- *  f :double(m+1)
+ *  f_ : double(m+1)
  *
- *  g : double(m+1)
+ *  g_ : double(m+1)
  *
  *  Bok_row : float(m)
  *      a row of ortho-normalized and pre-sorted existing basis.
@@ -124,15 +124,14 @@ struct cov_t {
  *  k1 :
  */
 cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &Bok_row,
-                 const ArrayXd &yb, double xm, double k0, float k1)
+                 const ArrayXd &yb, double xm, double ym, double k0, float k1)
 {
     const int m = Bok_row.rows();
     assert(f_.rows()==m+1);
     assert(g_.rows()==m+1);
     assert(yb.rows()==m);
 
-    // Cast to raw pointers, as the profiler showed that accessing via the `[]`
-    // operator is surprisingly not zero-cost as of yet.
+    // Cast to raw pointers, as the the `[]` operator is surprisingly expensive!
     double *f = f_.data();
     double *g = g_.data();
     const float  *x = Bok_row.data();
@@ -177,7 +176,8 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &Bok_row,
     }
     f[m] = fma(k0,g[m],f[m]);
     g[m] = fma(k1,xm,  g[m]);
-
+    o.ff = fma(f[m],f[m],o.ff);
+    o.fy = fma(f[m],ym,  o.fy);
     return o;
 }
 
@@ -376,13 +376,11 @@ public:
                 double b2 = b_i*b_i;
                 ArrayXd f = ArrayXd::Zero(m+1);
                 ArrayXd g = ArrayXd::Zero(m+1);
-                covariates(f,g,Bok.row(0),yb,bx[0],0,b_i);
+                covariates(f,g,Bok.row(0),yb,bx[0],yb2[0],0,b_i);
 
                 for (int i = 1; i < tail; ++i) {
                     b_i = b[k[i]]; // sort and upcast to double
-                    cov_t o = covariates(f,g,Bok.row(i),yb,bx[i],d[i],b_i);
-                    o.ff = fma(f[m],f[m],o.ff);
-                    o.fy = fma(f[m],yb2[j],o.fy);
+                    cov_t o = covariates(f,g,Bok.row(i),yb,bx[i],yb2[j],d[i],b_i);
 
                     k0 = fma(d[i]*d[i],b2,k0);
                     k1 = fma(d[i]*2,bd,k1);
