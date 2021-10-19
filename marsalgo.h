@@ -192,7 +192,7 @@ class MarsAlgo {
     MatrixXf    _B;         // all basis
     MatrixXdC   _Bo;        // all basis, ortho-normalized
     MatrixXd    _Bx;        // B[k,mask]*x[k,None] (scratch buffer)
-    VectorXd    _By;        // dot product of basis Bo with Y target
+    VectorXd    _ybo;       // dot product of basis Bo with Y target
     ArrayXf     _s;         // scale of columns of 'X'
     int         _m    = 1;  // number of basis found
     double      _yvar = 0;  // variance of 'y'
@@ -231,7 +231,7 @@ public:
         //---------------------------------------------------------------------
         _B .col(0) = vv.cast<float>();
         _Bo.col(0) = vv;
-        _By = _Bo.leftCols(1).transpose() * _y.matrix();
+        _ybo = _Bo.leftCols(1).transpose() * _y.matrix();
 
         //---------------------------------------------------------------------
         // Calculate the sample variance of the target 'y'.
@@ -252,7 +252,7 @@ public:
 
     double dsse() const
     {
-        return _By.squaredNorm();
+        return _ybo.squaredNorm();
     }
 
     double yvar() const
@@ -291,12 +291,9 @@ public:
             throw std::runtime_error("invalid X column index");
         }
 
-        //---------------------------------------------------------------------
-        // Enable Flush-to-Zero (FTZ) and Denorms-as-Zero (DAZ)
-        //---------------------------------------------------------------------
 #       ifdef __SSE__
         const unsigned csr = _mm_getcsr();
-        _mm_setcsr(csr | 0x8040); // FTZ and DAZ
+        _mm_setcsr(csr | 0x8040); // enable FTZ and DAZ
 #       endif
 
         ArrayXi bcols = nonzero(Map<const ArrayXb>(bmask,_m));
@@ -308,30 +305,21 @@ public:
         Ref<MatrixXdC> Bo  = _Bo.leftCols(m);
         Ref<MatrixXd>  Bx  = _Bx.leftCols(p);
 
-        //---------------------------------------------------------------------
         // Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo`
-        //---------------------------------------------------------------------
         orthonormalize(Bx, _B.leftCols(m), Bo, x, bcols, _tol);
 
-        //---------------------------------------------------------------------
-        // Calculate the linear delta SSE
-        //---------------------------------------------------------------------
-        const VectorXd &yb = _By; // Bo.transpose() * _y.matrix();
-        const VectorXd yb2 = Bx.transpose() * _y.matrix();
-        const ArrayXd  linear_sse = yb2.array().square();
-
-        //---------------------------------------------------------------------
-        // Map the results to the output buffers
-        //---------------------------------------------------------------------
+        // Calculate the linear delta SSE and map to the output buffer.
+        const VectorXd ybx = Bx.transpose() * _y.matrix();
         Map<ArrayXd>(linear_dsse,_m) = ArrayXd::Zero(_m);
         for (int j = 0; j < p; ++j) {
-            linear_dsse[bcols[j]] = linear_sse[j];
+            linear_dsse[bcols[j]] = ybx[j]*ybx[j];
         }
 
         //---------------------------------------------------------------------
         // Evaluate the delta SSE on all hinge locations
         //---------------------------------------------------------------------
         if (linear_only == false) {
+            const VectorXd &ybo = _ybo; // dot(Bo.T,_y);
             ArrayXi hinge_idx = ArrayXi::Constant(p,-1);
             ArrayXd hinge_sse = ArrayXd::Constant(p,0);
             ArrayXd hinge_cut = ArrayXd::Constant(p,NAN);
@@ -352,7 +340,7 @@ public:
                 yk[i] = _y[k[i]];
                 Bok.row(i) = Bo.row(k[i]).cast<float>();
             }
-            sort_columns(Bx, k);
+            sort_columns(Bx, k); // TODO - we could sort this in the inner loop
 
             ArrayXd _d(n-1);
             double *d = _d.data()-1; // note minus-one hack
@@ -365,7 +353,7 @@ public:
 
             for (int j = 0; j < p; ++j) {
                 const Ref<VectorXf> b  = _B.col(bcols[j]);
-                const Ref<VectorXd> bx = Bx.col(j);
+                const Ref<VectorXd> bx = Bx.col(j); // TODO - why not sort this here? see note (a) above
 
                 double b_i = b[k[0]]; // sort and upcast to double
                 double k0 = 0;
@@ -376,12 +364,14 @@ public:
                 double b2 = b_i*b_i;
                 ArrayXd f = ArrayXd::Zero(m+1);
                 ArrayXd g = ArrayXd::Zero(m+1);
-                covariates(f,g,Bok.row(0),yb,bx[0],yb2[0],0,b_i);
+                covariates(f,g,Bok.row(0),ybo,bx[0],ybx[0],0,b_i);
 
                 for (int i = 1; i < tail; ++i) {
                     b_i = b[k[i]]; // sort and upcast to double
-                    cov_t o = covariates(f,g,Bok.row(i),yb,bx[i],yb2[j],d[i],b_i);
+                    cov_t o = covariates(f,g,Bok.row(i),ybo,bx[i],ybx[j],d[i],b_i);
 
+                    // TODO - is the use of the [] operator slow?
+                    //        run with godbolt to understand this issue
                     k0 = fma(d[i]*d[i],b2,k0);
                     k1 = fma(d[i]*2,bd,k1);
                     w  = fma(d[i],vb,w);
@@ -406,7 +396,7 @@ public:
             Map<ArrayXd>(hinge_cuts,_m) = ArrayXd::Constant(_m,NAN);
             for (int j = 0; j < p; ++j) {
                 if (hinge_idx[j] >= 0) {
-                    hinge_dsse[bcols[j]] = linear_sse[j] + hinge_sse[j];
+                    hinge_dsse[bcols[j]] = linear_dsse[bcols[j]] + hinge_sse[j];
                     hinge_cuts[bcols[j]] = _X(k[hinge_idx[j]],xcol);
                 }
             }
@@ -463,11 +453,11 @@ public:
             _Bo.col(_m) = v/w;
 
             // This assumes the norm of '_y' == 1
-            VectorXd yb = _Bo.leftCols(_m+1).transpose() * _y.matrix();
-            const double mse = (1. - yb.squaredNorm()) / _X.rows();
+            VectorXd ybo = _Bo.leftCols(_m+1).transpose() * _y.matrix();
+            const double mse = (1. - ybo.squaredNorm()) / _X.rows();
             if (mse >= -_tol) { // gracefully handle values close to zero
                 _m += 1;
-                _By = yb; // save for next iteration
+                _ybo = ybo; // save for next iteration
                 return std::max(mse,0.0);
             }
         }
