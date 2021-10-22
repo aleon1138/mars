@@ -318,13 +318,7 @@ public:
             ArrayXi32 k(n);
             argsort(k.data(), _X.col(xcol).data(), n);
 
-            // Sort the rows of `Bo`
-            MatrixXfC Bok(n,m); // TODO - put in thread-local storage
-            for (int i = 0; i < n; ++i) {
-                Bok.row(i) = Bo.row(k[i]).cast<float>();
-            }
-
-            // Take the deltas of `x`
+            ArrayXf Bo_k(m);
             ArrayXd _d(n-1);
             double *d = _d.data()-1; // note minus-one hack
             for (int i = 1; i < n; ++i) {
@@ -343,7 +337,8 @@ public:
                 double b_k  = b [k[0]]; // sort and upcast to double
                 double bx_k = bx[k[0]];
                 double y_k  = _y[k[0]];
-                covariates(f,g,Bok.row(0).data(),ybo,bx_k,ybx[0],0,b_k,m);
+                Bo_k = Bo.row(k[0]).cast<float>();
+                covariates(f,g,Bo_k.data(),ybo,bx_k,ybx[0],0,b_k,m);
 
                 double k0 = 0;
                 double k1 = 0;
@@ -356,7 +351,8 @@ public:
                     b_k  = b [k[i]]; // sort and upcast to double
                     bx_k = bx[k[i]];
                     y_k  = _y[k[i]];
-                    cov_t o = covariates(f,g,Bok.row(i).data(),ybo,bx_k,ybx[j],d[i],b_k,m);
+                    Bo_k = Bo.row(k[i]).cast<float>();
+                    cov_t o = covariates(f,g,Bo_k.data(),ybo,bx_k,ybx[j],d[i],b_k,m);
 
                     k0 = fma(d[i]*d[i],b2,k0);
                     k1 = fma(d[i]*2,bd,k1);
