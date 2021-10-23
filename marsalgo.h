@@ -89,6 +89,7 @@ void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXd
 
 /*
  *  Sort columns in-place
+ *  TODO - this is not longer used, remove from code
  */
 void sort_columns(Ref<MatrixXd> X, const ArrayXi32 &k)
 {
@@ -332,12 +333,9 @@ public:
             // Sort all rows of y, Bo, Bx and take the deltas of x
             //-----------------------------------------------------------------
             MatrixXfC Bok(n,m); // TODO - put in thread-local storage?
-            VectorXd yk(n);
             for (int i = 0; i < n; ++i) {
-                yk[i] = _y[k[i]];
                 Bok.row(i) = Bo.row(k[i]).cast<float>();
             }
-            sort_columns(Bx, k); // TODO - we could sort this in the inner loop
 
             ArrayXd _d(n-1);
             double *d = _d.data()-1; // note minus-one hack
@@ -351,22 +349,26 @@ public:
             for (int j = 0; j < p; ++j) {
                 ArrayXd f = ArrayXd::Zero(m+1);
                 ArrayXd g = ArrayXd::Zero(m+1);
-                const Ref<VectorXf> b  = _B.col(bcols[j]);
-                const Ref<VectorXd> bx = Bx.col(j); // TODO - why not sort this here? see note (a) above
+                const float  *b  = _B.col(bcols[j]).data();
+                const double *bx = _Bx.col(j).data();
 
-                double b_k = b[k[0]]; // sort and upcast to double
-                covariates(f,g,Bok.row(0),ybo,bx[0],ybx[0],0,b_k);
+                double b_k  = b[k[0]]; // sort and upcast to double
+                double bx_k = bx[k[0]];
+                double y_k  = _y[k[0]];
+                covariates(f,g,Bok.row(0),ybo,bx_k,ybx[0],0,b_k);
 
                 double k0 = 0;
                 double k1 = 0;
                 double w  = 0;
                 double bd = 0;
-                double vb = b_k*yk[0];
+                double vb = b_k*y_k;
                 double b2 = b_k*b_k;
 
                 for (int i = 1; i < tail; ++i) {
-                    b_k = b[k[i]]; // sort and upcast to double
-                    cov_t o = covariates(f,g,Bok.row(i),ybo,bx[i],ybx[j],d[i],b_k);
+                    b_k  = b[k[i]]; // sort and upcast to double
+                    bx_k = bx[k[i]];
+                    y_k  = _y[k[i]];
+                    cov_t o = covariates(f,g,Bok.row(i),ybo,bx_k,ybx[j],d[i],b_k);
 
                     // TODO - is the use of the [] operator slow?
                     //        run with godbolt to understand this issue
@@ -375,7 +377,7 @@ public:
                     w  = fma(d[i],vb,w);
                     bd = fma(d[i],b2,bd);
                     b2 = fma(b_k,b_k,b2);
-                    vb = fma(yk[i],b_k,vb);
+                    vb = fma(y_k,b_k,vb);
 
                     const double uw  = o.fy - w;
                     const double den = (k0+k1) - o.ff;
