@@ -196,7 +196,7 @@ TEST(MarsTest, Covariates)
     MatrixXf  k  = MatrixXf::Random(n,4);
 
     for (int i = 0; i < X.rows(); ++i) {
-        cov_t o0 = covariates(f0, g0, X.row(i), y, k(i,0), k(i,1), k(i,2), k(i,3));
+        cov_t o0 = covariates(f0, g0, X.row(i).data(), y, k(i,0), k(i,1), k(i,2), k(i,3), m);
         cov_t o1 = covariates_slow(f1, g1, X.row(i), y, k(i,0), k(i,1), k(i,2), k(i,3));
 
         ASSERT_NEAR((f0-f1).matrix().norm(), 0, 1e-9);

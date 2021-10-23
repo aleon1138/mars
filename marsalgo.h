@@ -114,8 +114,9 @@ struct cov_t {
  *
  *  g_ : double(m+1)
  *
- *  Bok_row : float(m)
- *      a row of ortho-normalized and pre-sorted existing basis.
+ *  x : float(m)
+ *      a row from the matrix of ortho-normalized and pre-sorted existing basis,
+ *      elsewhere in the code this is referred to as `Bo[k]`.
  *
  *  yb : double(m)
  *      the result of `dot(Bo.T,y)`
@@ -124,10 +125,9 @@ struct cov_t {
  *
  *  k1 :
  */
-cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &Bok_row,
-                 const ArrayXd &yb, double xm, double ym, double k0, float k1)
+cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const ArrayXd &yb,
+                 double xm, double ym, double k0, float k1, int m)
 {
-    const int m = Bok_row.rows();
     assert(f_.rows()==m+1);
     assert(g_.rows()==m+1);
     assert(yb.rows()==m);
@@ -135,7 +135,6 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const Ref<VectorXf> &Bok_row,
     // Cast to raw pointers, as the the `[]` operator is surprisingly expensive!
     double *f = f_.data();
     double *g = g_.data();
-    const float  *x = Bok_row.data();
     const double *y = yb.data();
 
 #ifndef __AVX__
@@ -352,10 +351,10 @@ public:
                 const float  *b  = _B.col(bcols[j]).data();
                 const double *bx = _Bx.col(j).data();
 
-                double b_k  = b[k[0]]; // sort and upcast to double
+                double b_k  = b [k[0]]; // sort and upcast to double
                 double bx_k = bx[k[0]];
                 double y_k  = _y[k[0]];
-                covariates(f,g,Bok.row(0),ybo,bx_k,ybx[0],0,b_k);
+                covariates(f,g,Bok.row(0).data(),ybo,bx_k,ybx[0],0,b_k,m);
 
                 double k0 = 0;
                 double k1 = 0;
@@ -365,10 +364,10 @@ public:
                 double b2 = b_k*b_k;
 
                 for (int i = 1; i < tail; ++i) {
-                    b_k  = b[k[i]]; // sort and upcast to double
+                    b_k  = b [k[i]]; // sort and upcast to double
                     bx_k = bx[k[i]];
                     y_k  = _y[k[i]];
-                    cov_t o = covariates(f,g,Bok.row(i),ybo,bx_k,ybx[j],d[i],b_k);
+                    cov_t o = covariates(f,g,Bok.row(i).data(),ybo,bx_k,ybx[j],d[i],b_k,m);
 
                     // TODO - is the use of the [] operator slow?
                     //        run with godbolt to understand this issue
