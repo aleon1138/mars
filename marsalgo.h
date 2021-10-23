@@ -315,19 +315,16 @@ public:
             linear_dsse[bcols[j]] = ybx[j]*ybx[j];
         }
 
-        //---------------------------------------------------------------------
         // Evaluate the delta SSE on all hinge locations
-        //---------------------------------------------------------------------
         if (linear_only == false) {
             const VectorXd &ybo = _ybo; // dot(Bo.T,_y);
             ArrayXi hinge_idx = ArrayXi::Constant(p,-1);
             ArrayXd hinge_sse = ArrayXd::Constant(p,0);
             ArrayXd hinge_cut = ArrayXd::Constant(p,NAN);
 
-            //-----------------------------------------------------------------
-            // Get sort indexes
-            // TODO - this needs to be cached ?
-            //-----------------------------------------------------------------
+            // Get sort indexes.
+            // TODO - we should keep a LRU cache as we usually pick from the
+            //        same pool of regressors in Fast-MARS.
             ArrayXi32 k(n);
             argsort(k.data(), _X.col(xcol).data(), n);
 
@@ -352,23 +349,24 @@ public:
             const int tail = n-endspan;
 
             for (int j = 0; j < p; ++j) {
+                ArrayXd f = ArrayXd::Zero(m+1);
+                ArrayXd g = ArrayXd::Zero(m+1);
                 const Ref<VectorXf> b  = _B.col(bcols[j]);
                 const Ref<VectorXd> bx = Bx.col(j); // TODO - why not sort this here? see note (a) above
 
-                double b_i = b[k[0]]; // sort and upcast to double
+                double b_k = b[k[0]]; // sort and upcast to double
+                covariates(f,g,Bok.row(0),ybo,bx[0],ybx[0],0,b_k);
+
                 double k0 = 0;
                 double k1 = 0;
                 double w  = 0;
                 double bd = 0;
-                double vb = b_i*yk[0];
-                double b2 = b_i*b_i;
-                ArrayXd f = ArrayXd::Zero(m+1);
-                ArrayXd g = ArrayXd::Zero(m+1);
-                covariates(f,g,Bok.row(0),ybo,bx[0],ybx[0],0,b_i);
+                double vb = b_k*yk[0];
+                double b2 = b_k*b_k;
 
                 for (int i = 1; i < tail; ++i) {
-                    b_i = b[k[i]]; // sort and upcast to double
-                    cov_t o = covariates(f,g,Bok.row(i),ybo,bx[i],ybx[j],d[i],b_i);
+                    b_k = b[k[i]]; // sort and upcast to double
+                    cov_t o = covariates(f,g,Bok.row(i),ybo,bx[i],ybx[j],d[i],b_k);
 
                     // TODO - is the use of the [] operator slow?
                     //        run with godbolt to understand this issue
@@ -376,8 +374,8 @@ public:
                     k1 = fma(d[i]*2,bd,k1);
                     w  = fma(d[i],vb,w);
                     bd = fma(d[i],b2,bd);
-                    b2 = fma(b_i,b_i,b2);
-                    vb = fma(yk[i],b_i,vb);
+                    b2 = fma(b_k,b_k,b2);
+                    vb = fma(yk[i],b_k,vb);
 
                     const double uw  = o.fy - w;
                     const double den = (k0+k1) - o.ff;
@@ -389,9 +387,7 @@ public:
                 }
             }
 
-            //-----------------------------------------------------------------
             // Map the results to the output arrays
-            //-----------------------------------------------------------------
             Map<ArrayXd>(hinge_dsse,_m) = ArrayXd::Zero(_m);
             Map<ArrayXd>(hinge_cuts,_m) = ArrayXd::Constant(_m,NAN);
             for (int j = 0; j < p; ++j) {
