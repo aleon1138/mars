@@ -118,24 +118,28 @@ struct cov_t {
  *      a row from the matrix of ortho-normalized and pre-sorted existing basis,
  *      elsewhere in the code this is referred to as `Bo[k]`.
  *
- *  yb : double(m)
+ *  y : double(m)
  *      the result of `dot(Bo.T,y)`
+ *
+ *  xm: float
+ *      the value at `x[m]` which holds the new candidate regressor.
+ *
+ *  ym: double
+ *      the value at `y[m]` which holds the new candidate regressor.
  *
  *  k0 :
  *
  *  k1 :
  */
-cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const ArrayXd &yb,
+cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
                  double xm, double ym, double k0, float k1, int m)
 {
     assert(f_.rows()==m+1);
     assert(g_.rows()==m+1);
-    assert(yb.rows()==m);
 
     // Cast to raw pointers, as the the `[]` operator is surprisingly expensive!
     double *f = f_.data();
     double *g = g_.data();
-    const double *y = yb.data();
 
 #ifndef __AVX__
     int m0 = 0;
@@ -308,7 +312,7 @@ public:
         // Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo`
         orthonormalize(Bx, _B.leftCols(m), Bo, x, bcols, _tol);
 
-        // Calculate the linear delta SSE and map to the output buffer.
+        // Calculate the linear delta SSE and map to the output buffer
         const VectorXd ybx = Bx.transpose() * _y.matrix();
         Map<ArrayXd>(linear_dsse,_m) = ArrayXd::Zero(_m);
         for (int j = 0; j < p; ++j) {
@@ -317,25 +321,24 @@ public:
 
         // Evaluate the delta SSE on all hinge locations
         if (linear_only == false) {
-            const VectorXd &ybo = _ybo; // dot(Bo.T,_y);
+            const double *ybo = _ybo.data(); // dot(Bo.T,_y);
             ArrayXi hinge_idx = ArrayXi::Constant(p,-1);
             ArrayXd hinge_sse = ArrayXd::Constant(p,0);
             ArrayXd hinge_cut = ArrayXd::Constant(p,NAN);
 
-            // Get sort indexes.
+            // Get sort indexes
             // TODO - we should keep a LRU cache as we usually pick from the
             //        same pool of regressors in Fast-MARS.
             ArrayXi32 k(n);
             argsort(k.data(), _X.col(xcol).data(), n);
 
-            //-----------------------------------------------------------------
-            // Sort all rows of y, Bo, Bx and take the deltas of x
-            //-----------------------------------------------------------------
-            MatrixXfC Bok(n,m); // TODO - put in thread-local storage?
+            // Sort the rows of `Bo`
+            MatrixXfC Bok(n,m); // TODO - put in thread-local storage
             for (int i = 0; i < n; ++i) {
                 Bok.row(i) = Bo.row(k[i]).cast<float>();
             }
 
+            // Take the deltas of `x`
             ArrayXd _d(n-1);
             double *d = _d.data()-1; // note minus-one hack
             for (int i = 1; i < n; ++i) {
