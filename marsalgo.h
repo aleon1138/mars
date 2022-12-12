@@ -87,23 +87,6 @@ void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXd
     Bx *= (s > tol).select(1/(s+tol).sqrt(), 0).matrix().asDiagonal();
 }
 
-/*
- *  Sort columns in-place
- *  TODO - this is not longer used, remove from code
- */
-void sort_columns(Ref<MatrixXd> X, const ArrayXi32 &k)
-{
-    VectorXd tmp;
-    for (int j = 0; j < X.cols(); ++j) {
-        tmp = X.col(j); // make a copy
-        Ref<VectorXd> x = X.col(j); // keep a reference
-        for (int i = 0; i < x.rows(); ++i) {
-            tmp[i] = x[k[i]];
-        }
-        X.col(j) = tmp;
-    }
-}
-
 struct cov_t {
     double ff;
     double fy;
@@ -197,7 +180,7 @@ class MarsAlgo {
     MatrixXdC   _Bo;        // all basis, ortho-normalized
     MatrixXd    _Bx;        // B[k,mask]*x[k,None] (scratch buffer)
     VectorXd    _ybo;       // dot product of basis Bo with Y target
-    ArrayXf     _s;         // scale of columns of 'X'
+    ArrayXf     _s;         // normalization constant for columns of 'X'
     int         _m    = 1;  // number of basis found
     double      _yvar = 0;  // variance of 'y'
     double      _tol  = 0;  // numerical error tolerance

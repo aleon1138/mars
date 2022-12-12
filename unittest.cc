@@ -129,6 +129,19 @@ TEST(MarsTest, Orthonormalize)
 
 ///////////////////////////////////////////////////////////////////////////////
 
+void sort_columns(Ref<MatrixXd> X, const ArrayXi32 &k)
+{
+    VectorXd tmp;
+    for (int j = 0; j < X.cols(); ++j) {
+        tmp = X.col(j); // make a copy
+        Ref<VectorXd> x = X.col(j); // keep a reference
+        for (int i = 0; i < x.rows(); ++i) {
+            tmp[i] = x[k[i]];
+        }
+        X.col(j) = tmp;
+    }
+}
+
 TEST(MarsTest, SortColumns)
 {
     const int n = 89;  // number of rows
