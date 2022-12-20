@@ -23,5 +23,8 @@ format:
 unittest: unittest.cc marsalgo.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $< -lgtest -lpthread
 
+benchmark: benchmark.cc marsalgo.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $<
+
 clean:
 	rm -rf __pycache__ unittest marslib.so
