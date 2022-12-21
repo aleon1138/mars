@@ -115,7 +115,7 @@ struct cov_t {
  *
  *  k1 :
  */
-cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
+cov_t covariates(ArrayXd &f_, ArrayXd &g_, const double *x, const double *y,
                  double xm, double ym, double k0, float k1, int m)
 {
     assert(f_.rows()==m+1);
@@ -139,7 +139,7 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
         __m256d f0 = _mm256_load_pd(f+i);
         __m256d g0 = _mm256_load_pd(g+i);
         __m256d y0 = _mm256_load_pd(y+i);
-        __m256d x0 = _mm256_cvtps_pd(_mm_load_ps(x+i));
+        __m256d x0 = _mm256_load_pd(x+i);
 
         f0 = _mm256_fmadd_pd(K0,g0,f0);
         g0 = _mm256_fmadd_pd(K1,x0,g0);
@@ -318,7 +318,6 @@ public:
             ArrayXi32 k(n);
             argsort(k.data(), _X.col(xcol).data(), n);
 
-            ArrayXf Bo_k(m);
             ArrayXd _d(n-1);
             double *d = _d.data()-1; // note minus-one hack
             for (int i = 1; i < n; ++i) {
@@ -337,8 +336,7 @@ public:
                 double b_k  = b [k[0]]; // sort and upcast to double
                 double bx_k = bx[k[0]];
                 double y_k  = _y[k[0]];
-                Bo_k = Bo.row(k[0]).cast<float>();
-                covariates(f,g,Bo_k.data(),ybo,bx_k,ybx[0],0,b_k,m);
+                covariates(f,g,Bo.row(k[0]).data(),ybo,bx_k,ybx[0],0,b_k,m);
 
                 double k0 = 0;
                 double k1 = 0;
@@ -348,11 +346,11 @@ public:
                 double b2 = b_k*b_k;
 
                 for (int i = 1; i < tail; ++i) {
+                    __builtin_prefetch(Bo.row(k[i+1]).data());
                     b_k  = b [k[i]]; // sort and upcast to double
                     bx_k = bx[k[i]];
                     y_k  = _y[k[i]];
-                    Bo_k = Bo.row(k[i]).cast<float>();
-                    cov_t o = covariates(f,g,Bo_k.data(),ybo,bx_k,ybx[j],d[i],b_k,m);
+                    cov_t o = covariates(f,g,Bo.row(k[i]).data(),ybo,bx_k,ybx[j],d[i],b_k,m);
 
                     k0 = fma(d[i]*d[i],b2,k0);
                     k1 = fma(d[i]*2,bd,k1);
