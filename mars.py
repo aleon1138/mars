@@ -122,7 +122,7 @@ def fit(X, y, w=None, **kwargs):
         Used to increase visibility of features not used in a while. See Eq 27
         in the Fast-MARS paper.
 
-    xlabels : list-like (default=None)
+    labels : list-like (default=None)
         A list of column labels. This is only used for console output.
 
     xfilter : function (default=lambda x: True)

@@ -355,8 +355,6 @@ public:
                     y_k  = _y[k[i]];
                     cov_t o = covariates(f,g,Bok.row(i).data(),ybo,bx_k,ybx[j],d[i],b_k,m);
 
-                    // TODO - is the use of the [] operator slow?
-                    //        run with godbolt to understand this issue
                     k0 = fma(d[i]*d[i],b2,k0);
                     k1 = fma(d[i]*2,bd,k1);
                     w  = fma(d[i],vb,w);
