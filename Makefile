@@ -11,7 +11,7 @@ CPPFLAGS += $(shell python3 -m pybind11 --includes)
 CPPFLAGS += $(shell python3-config --includes)
 CPPFLAGS += -DNDEBUG -DEIGEN_DONT_PARALLELIZE
 
-marslib.so: marslib.cc marsalgo.h
+marslib.so: marslib.cc marsalgo.h array.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -shared -fPIC -o $@ $<
 
 test: unittest
@@ -20,7 +20,7 @@ test: unittest
 format:
 	astyle -A4 -S -z2 -n -j *.h *.cc
 
-unittest: unittest.cc marsalgo.h
+unittest: unittest.cc marsalgo.h array.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $< -lgtest -lpthread
 
 clean:

@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <vector>
 constexpr double EPS = 1e-14;
+typedef Array<int32_t,Dynamic,1> ArrayXi32;
 
 double invnorm(VectorXd x)
 {
@@ -16,13 +17,15 @@ int argmax(const ArrayXd &x)
     return i;
 }
 
-ArrayXi create_mask(int m, int p)
+array_t<int> create_mask(int m, int p)
 {
-    std::vector<int> idx(m);
-    std::iota(idx.begin(), idx.end(), 0);
-    std::random_shuffle(idx.begin(), idx.end());
-    std::sort(idx.begin(), idx.begin()+p);
-    return Map<ArrayXi>(idx.data(),p);
+    array_t<int> idx(m);
+    int *ptr = idx;
+    std::iota(ptr, ptr+m, 0);
+    std::random_shuffle(ptr, ptr+m);
+    std::sort(ptr, ptr+p);
+    idx.trim(p);
+    return idx;
 }
 
 //
@@ -94,7 +97,7 @@ TEST(MarsTest, Orthonormalize)
     MatrixXf  B(MatrixXf::Random(n,m));
     ArrayXf   x(ArrayXf::Random(n)*10);
     ArrayXd   y(ArrayXd::Random(n)+1);
-    ArrayXi   mask = create_mask(m,p);
+    array_t<int> mask = create_mask(m,p);
     B.col(BAD_COL) = B.col(1); // add a co-linear column
 
     //-------------------------------------------------------------------------
@@ -168,8 +171,8 @@ TEST(MarsTest, NonZero)
     mask[0] = false;
     mask[3] = false;
 
-    ArrayXi idx = nonzero(mask);
-    ASSERT_EQ(idx.rows(),3);
+    array_t<int> idx = nonzero(mask.data(), mask.rows());
+    ASSERT_EQ(idx.len(),3);
     ASSERT_EQ(idx[0],1);
     ASSERT_EQ(idx[1],2);
     ASSERT_EQ(idx[2],4);
@@ -209,7 +212,7 @@ TEST(MarsTest, Covariates)
     MatrixXf  k  = MatrixXf::Random(n,4);
 
     for (int i = 0; i < X.rows(); ++i) {
-        cov_t o0 = covariates(f0, g0, X.row(i).data(), y.data(), k(i,0), k(i,1), k(i,2), k(i,3), m);
+        cov_t o0 = covariates(f0.data(), g0.data(), X.row(i).data(), y.data(), k(i,0), k(i,1), k(i,2), k(i,3), m);
         cov_t o1 = covariates_slow(f1, g1, X.row(i), y, k(i,0), k(i,1), k(i,2), k(i,3));
 
         ASSERT_NEAR((f0-f1).matrix().norm(), 0, 1e-9);
