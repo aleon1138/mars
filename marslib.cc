@@ -2,6 +2,7 @@
 #include <pybind11/eigen.h>
 #include <pybind11/pybind11.h>
 namespace py = pybind11;
+typedef Matrix<bool,Dynamic,Dynamic,RowMajor> MatrixXbC;
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -20,27 +21,24 @@ MarsAlgo * new_algo(
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void eval(MarsAlgo &algo,
-          Ref<ArrayXd> &linear_dsse,
-          Ref<ArrayXd> &hinge_dsse,
-          Ref<ArrayXd> &hinge_cuts,
-          const Ref<const ArrayXb> &mask,
-          int xcol,
+py::tuple all_dsse(MarsAlgo &algo,
+          const Ref<const MatrixXbC> &mask,
           int endspan,
           bool linear_only)
 {
-    if (mask.rows() != algo.nbasis()) {
-        throw std::runtime_error("invalid basis mask length");
-    }
+    typedef Array<double,Dynamic,Dynamic,RowMajor> ArrayXXdC;
+    ArrayXXdC dsse1 = ArrayXXdC::Zero(mask.rows(), mask.cols());
+    ArrayXXdC dsse2 = ArrayXXdC::Zero(mask.rows(), mask.cols());
+    ArrayXXdC h_cut = ArrayXXdC::Constant(mask.rows(), mask.cols(), NAN);
 
-    if (linear_dsse.rows() != algo.nbasis() ||
-        hinge_dsse.rows()  != algo.nbasis() ||
-        hinge_cuts.rows()  != algo.nbasis()) {
-        throw std::runtime_error("invalid dataset lengths");
+    for (int i = 0; i < mask.rows(); ++i) {
+        if (mask.row(i).any()) {
+            algo.eval(
+                dsse1.row(i).data(), dsse2.row(i).data(), h_cut.row(i).data(),
+                i, mask.row(i).data(), endspan, linear_only);
+        }
     }
-
-    algo.eval(linear_dsse.data(), hinge_dsse.data(), hinge_cuts.data(),
-              xcol, mask.data(), endspan, linear_only);
+    return py::make_tuple(algo.dsse(), dsse1, dsse2, h_cut);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -60,8 +58,11 @@ PYBIND11_MODULE(marslib, m)
          , py::arg("w").noconvert()
          , py::arg("max_terms")
         )
-    .def("eval",   &eval)
-    .def("dsse",   &MarsAlgo::dsse)
+    .def("all_dsse",&all_dsse
+         , py::arg("mask").noconvert()
+         , py::arg("endspan")
+         , py::arg("linear_only")
+        )
     .def("nbasis", &MarsAlgo::nbasis)
     .def("yvar",   &MarsAlgo::yvar)
     .def("append", &MarsAlgo::append)

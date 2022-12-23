@@ -47,21 +47,6 @@ def _dump_row(logger, epoch, nbasis, dt, row, labels):
         logger.write("\n")
 
 
-def _all_dsse(algo, bmask, tail, linear):
-    """
-    TODO - The idea is to put this in the C++ code and parallelize it.
-    """
-    dsse1 = np.zeros(bmask.shape)
-    dsse2 = np.zeros(bmask.shape)
-    h_cut = np.full(bmask.shape, np.nan)
-
-    ybby = algo.dsse()
-    for i in range(len(bmask)):  # pylint: disable=consider-using-enumerate
-        if bmask[i].any():
-            algo.eval(dsse1[i], dsse2[i], h_cut[i], bmask[i], i, tail, linear)
-    return ybby, dsse1, dsse2, h_cut
-
-
 # -----------------------------------------------------------------------------
 
 
@@ -242,7 +227,7 @@ def fit(X, y, w=None, **kwargs):
         # Find the delta-SSE for the entire block
         # 'sse1' is the improvement by adding a linear term
         # 'sse2' is the improvement by adding two disjoint hinges
-        sse0, sse1, sse2, cut = _all_dsse(algo, bmask, tail, linear_only)
+        sse0, sse1, sse2, cut = algo.all_dsse(bmask, tail, linear_only)
 
         # Update the delta-SSE cache
         # TODO - should we really be using GCV adjusted SSE instead?
