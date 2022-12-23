@@ -6,6 +6,10 @@ import time
 import numpy as np
 import marslib
 
+# pylint: disable=too-many-arguments
+# pylint: disable=unnecessary-lambda-assignment
+# pylint: disable=consider-using-f-string
+
 # -----------------------------------------------------------------------------
 
 
@@ -32,7 +36,7 @@ def _dump_row(logger, epoch, nbasis, dt, row, labels):
         )
 
         if labels is not None:
-            fmt = "%%-%ds" % max([len(_) for _ in labels])
+            fmt = "%%-%ds" % max(len(_) for _ in labels)
             if row["type"] == b"l":
                 logger.write(("  l " + fmt) % labels[row["input"]])
             else:
@@ -52,7 +56,7 @@ def _all_dsse(algo, bmask, tail, linear):
     h_cut = np.full(bmask.shape, np.nan)
 
     ybby = algo.dsse()
-    for i in range(len(bmask)):
+    for i in range(len(bmask)):  # pylint: disable=consider-using-enumerate
         if bmask[i].any():
             algo.eval(dsse1[i], dsse2[i], h_cut[i], bmask[i], i, tail, linear)
     return ybby, dsse1, dsse2, h_cut
@@ -180,7 +184,7 @@ def fit(X, y, w=None, **kwargs):
     max_terms = i[get_dof(i) < n_true].max()
 
     n = len(X)
-    basis = [list()]  # list of lists of used basis
+    basis = [[]]  # list of lists of used basis
     tail = max(int(n * tail_span), 1)
     algo = marslib.MarsAlgo(X, y, w, max_terms)
     var_y = algo.yvar()
@@ -269,6 +273,7 @@ def fit(X, y, w=None, **kwargs):
 
             # If 'y' is noise-free then MSE might be 0.0; handle this edge case.
             if mse >= 0:
+                # fmt:off
                 basis.append(basis[bcol] + [xcol])
                 model[m] = (
                     htype,                              # type
@@ -282,6 +287,7 @@ def fit(X, y, w=None, **kwargs):
                 )
                 basis_sse = np.append(basis_sse, [0.0])
                 m += 1
+                # fmt:on
         assert algo.nbasis() == len(basis) == m
 
         _dump_row(logger, epoch, len(basis), dt, model[algo.nbasis() - 1], labels)
@@ -382,19 +388,24 @@ def prune(XX, XY, YY, n_true, penalty=3, ridge=0, mask=None):
 # -----------------------------------------------------------------------------
 
 
-def pprint(model, beta):
+def pprint(model, beta, labels=None):
     """
     Pretty-print the model. Useful for debugging.
     """
 
+    def xcol(i):
+        if labels is not None:
+            return labels[i]
+        return "X[%d]" % i
+
     def get_inputs(i: int):
         row = model[i]
         if row["type"] == b"+":
-            node = "MAX(X[%d]-%g,0)" % (row["input"], row["hinge"])
+            node = "MAX(%s-%g,0)" % (xcol(row["input"]), row["hinge"])
         elif row["type"] == b"-":
-            node = "MAX(%g-X[%d],0)" % (row["hinge"], row["input"])
+            node = "MAX(%g-%s,0)" % (row["hinge"], xcol(row["input"]))
         else:
-            node = "X[%d]" % row["input"]
+            node = xcol(row["input"])
 
         if row["basis"] > 0:
             return [node] + get_inputs(row["basis"])
