@@ -227,7 +227,7 @@ def fit(X, y, w=None, **kwargs):
         # Find the delta-SSE for the entire block
         # 'sse1' is the improvement by adding a linear term
         # 'sse2' is the improvement by adding two disjoint hinges
-        sse0, sse1, sse2, cut = algo.all_dsse(bmask, tail, linear_only)
+        sse0, sse1, sse2, cut = algo.eval(bmask, tail, linear_only)
 
         # Update the delta-SSE cache
         # TODO - should we really be using GCV adjusted SSE instead?

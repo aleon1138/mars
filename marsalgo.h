@@ -278,15 +278,18 @@ public:
             throw std::runtime_error("invalid X column index");
         }
 
-#       ifdef __SSE__
-        const unsigned csr = _mm_getcsr();
-        _mm_setcsr(csr | 0x8040); // enable FTZ and DAZ
-#       endif
-
         ArrayXi bcols = nonzero(Map<const ArrayXb>(bmask,_m));
         const int n = _X.rows();
         const int m = _m;           // number of all basis
         const int p = bcols.rows(); // number of non-ignored basis
+        if (p == 0) {
+            return;
+        }
+
+#       ifdef __SSE__
+        const unsigned csr = _mm_getcsr();
+        _mm_setcsr(csr | 0x8040); // enable FTZ and DAZ
+#       endif
 
         ArrayXf        x   = _X.col(xcol) * _s[xcol]; // copy and normalize 'X' column
         Ref<MatrixXdC> Bo  = _Bo.leftCols(m);
