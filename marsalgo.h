@@ -178,7 +178,6 @@ class MarsAlgo {
     ArrayXd     _y;         // target vector
     MatrixXf    _B;         // all basis
     MatrixXdC   _Bo;        // all basis, ortho-normalized
-    MatrixXd    _Bx;        // B[k,mask]*x[k,None] (scratch buffer)
     VectorXd    _ybo;       // dot product of basis Bo with Y target
     ArrayXf     _s;         // normalization constant for columns of 'X'
     int         _m    = 1;  // number of basis found
@@ -190,7 +189,6 @@ public:
         : _X  (x,n,m,Stride<Dynamic,1>(ldx,1))
         , _B  (MatrixXf ::Zero(n,p))
         , _Bo (MatrixXdC::Zero(n,p))
-        , _Bx (MatrixXdC::Zero(n,p))
         , _tol((n*0.02)*DBL_EPSILON) // rough guess
     {
         if (std::isfinite(NAN)) {
@@ -291,11 +289,11 @@ public:
         _mm_setcsr(csr | 0x8040); // enable FTZ and DAZ
 #       endif
 
-        ArrayXf        x   = _X.col(xcol) * _s[xcol]; // copy and normalize 'X' column
-        Ref<MatrixXdC> Bo  = _Bo.leftCols(m);
-        Ref<MatrixXd>  Bx  = _Bx.leftCols(p);
+        const ArrayXf        x  = _X.col(xcol) * _s[xcol]; // copy and normalize 'X' column
+        const Ref<MatrixXdC> Bo = _Bo.leftCols(m);
 
         // Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo`
+        MatrixXd Bx(n, p); // TODO - put in thread-local storage
         orthonormalize(Bx, _B.leftCols(m), Bo, x, bcols, _tol);
 
         // Calculate the linear delta SSE and map to the output buffer
@@ -338,7 +336,7 @@ public:
                 ArrayXd f = ArrayXd::Zero(m+1);
                 ArrayXd g = ArrayXd::Zero(m+1);
                 const float  *b  = _B.col(bcols[j]).data();
-                const double *bx = _Bx.col(j).data();
+                const double *bx = Bx.col(j).data();
 
                 double b_k  = b [k[0]]; // sort and upcast to double
                 double bx_k = bx[k[0]];

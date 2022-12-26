@@ -1,4 +1,5 @@
 #include "marsalgo.h"
+#include <omp.h>
 #include <pybind11/eigen.h>
 #include <pybind11/pybind11.h>
 namespace py = pybind11;
@@ -31,6 +32,7 @@ py::tuple eval(MarsAlgo &algo,
     ArrayXXdC dsse2 = ArrayXXdC::Zero(mask.rows(), mask.cols());
     ArrayXXdC h_cut = ArrayXXdC::Constant(mask.rows(), mask.cols(), NAN);
 
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < mask.rows(); ++i) {
         algo.eval(
             dsse1.row(i).data(), dsse2.row(i).data(), h_cut.row(i).data(),
