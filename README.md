@@ -11,10 +11,24 @@ Some references:
 * Stephen Milborrow maintains an excellent resource [here](http://www.milbo.users.sonic.net/earth).
 * Additionally there is an module for to scikit-learn [here](https://contrib.scikit-learn.org/py-earth).
 
+## Performance
+
+We use [OpenMP](https://www.openmp.org) to achieve nearly linear speed-up per core used. Note that
+there is additional memory overhead for each core used, which might constraint the total number
+of cores available. As always, one can control the number of threads used via the `OMP_NUM_THREADS`
+environment variable.
+
+| Threads | Speed-Up |
+|:-------:|:--------:|
+|    1    |   1.0 x  |
+|    2    |   2.0 x  |
+|    3    |   2.8 x  |
+|    4    |   3.4 x  |
+
 ## Supported Platforms
 
-These instructions have been verfied to work on the following platforms:
-* Ubuntu 18
+These instructions have been verified to work on the following platforms:
+* Ubuntu 18.04 and 20.04
 * Raspbian 10
 * macOS 10.13 (WIP)
 
@@ -23,40 +37,40 @@ These instructions have been verfied to work on the following platforms:
 [Eigen](http://eigen.tuxfamily.org/) - The code has been tested with version 3.3.4.
 
 ```bash
-    sudo apt install -y libeigen3-dev
+sudo apt install -y libeigen3-dev
 ```
 ... on macOS:
 ```bash
-    brew install pkg-config eigen
+brew install pkg-config eigen
 ```
 
 [GoogleTest](https://github.com/google/googletest) - Unfortunately, the library is [no longer
 available pre-compiled](https://bit.ly/2vNUBWN) on Ubuntu.
 
 ```bash
-    sudo apt install -y libgtest-dev cmake
-    cd /usr/src/gtest
-    sudo cmake CMakeLists.txt && sudo make
-    sudo cp *.a /usr/lib
+sudo apt install -y libgtest-dev cmake
+cd /usr/src/gtest
+sudo cmake CMakeLists.txt && sudo make
+sudo cp *.a /usr/lib
 ```
 
 [pybind11](https://github.com/pybind/pybind11) - Install using your python package manager of choice:
 
 ```bash
-    pip3 install pybind11
+pip3 install pybind11
 ```
 ... or ...
 ```bash
-    conda install -y pybind11
+conda install -y pybind11
 ```
 
 ## Build Instructions
 For now the package simply uses a Makefile:
 
 ```bash
-    cd mars
-    make
-    make test # optional - build and run the unit tests
+cd mars
+make
+make test # optional - build and run the unit tests
 ```
 
 Eventually the plan is to provide a full installer with `setup.py` or similar.
@@ -88,8 +102,8 @@ mars.pprint(model, beta)
 Depending on the random seed, the result should look similar to this:
 
 ```
-    -0.003
-    +1.972 * X[0]
-    +3.001 * X[1]
-    +1.048 * X[0] * X[1]
+  -0.003
+  +1.972 * X[0]
+  +3.001 * X[1]
+  +1.048 * X[0] * X[1]
 ```
