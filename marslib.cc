@@ -23,9 +23,9 @@ MarsAlgo * new_algo(
 ///////////////////////////////////////////////////////////////////////////////
 
 py::tuple eval(MarsAlgo &algo,
-    const Ref<const MatrixXbC> &mask,
-    int endspan,
-    bool linear_only)
+               const Ref<const MatrixXbC> &mask,
+               int endspan,
+               bool linear_only)
 {
     typedef Array<double,Dynamic,Dynamic,RowMajor> ArrayXXdC;
     ArrayXXdC dsse1 = ArrayXXdC::Zero(mask.rows(), mask.cols());
