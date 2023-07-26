@@ -65,7 +65,7 @@ conda install -y pybind11
 ```
 
 ## Build Instructions
-For now the package simply uses a Makefile:
+You can either use the Makefile:
 
 ```bash
 cd mars
@@ -73,7 +73,12 @@ make
 make test # optional - build and run the unit tests
 ```
 
-Eventually the plan is to provide a full installer with `setup.py` or similar.
+Or the `setup.py` script provided:
+
+```bash
+cd mars
+pip install .
+```
 
 ## An Example
 Here we train a linear model with a categorical interaction.

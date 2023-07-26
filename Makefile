@@ -24,4 +24,4 @@ unittest: unittest.cc marsalgo.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $< -lgtest -lpthread
 
 clean:
-	rm -rf __pycache__ unittest marslib.so
+	rm -rf __pycache__/ build/ marslib.egg-info/ unittest marslib.so
