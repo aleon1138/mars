@@ -54,16 +54,6 @@ sudo cmake CMakeLists.txt && sudo make
 sudo cp *.a /usr/lib
 ```
 
-[pybind11](https://github.com/pybind/pybind11) - Install using your python package manager of choice:
-
-```bash
-pip3 install pybind11
-```
-... or ...
-```bash
-conda install -y pybind11
-```
-
 ## Build Instructions
 You can either use the Makefile:
 

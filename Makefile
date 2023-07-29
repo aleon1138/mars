@@ -7,7 +7,7 @@ ifeq ($(shell uname), Darwin)
 endif
 
 CPPFLAGS += $(shell pkg-config --cflags eigen3)
-CPPFLAGS += $(shell python3 -m pybind11 --includes)
+CPPFLAGS += $(shell python3 -c "import numpy; print('-I'+numpy.get_include())")
 CPPFLAGS += $(shell python3-config --includes)
 CPPFLAGS += -DNDEBUG -DEIGEN_DONT_PARALLELIZE
 
