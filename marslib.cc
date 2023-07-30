@@ -1,46 +1,6 @@
+#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include "marsalgo.h"
 #include <omp.h>
-
-#if 0
-py::tuple eval(MarsAlgo &algo,
-               const Ref<const MatrixXbC> &mask,
-               int endspan,
-               bool linear_only)
-{
-    typedef Array<double,Dynamic,Dynamic,RowMajor> ArrayXXdC;
-    ArrayXXdC dsse1 = ArrayXXdC::Zero(mask.rows(), mask.cols());
-    ArrayXXdC dsse2 = ArrayXXdC::Zero(mask.rows(), mask.cols());
-    ArrayXXdC h_cut = ArrayXXdC::Constant(mask.rows(), mask.cols(), NAN);
-
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < mask.rows(); ++i) {
-        algo.eval(
-            dsse1.row(i).data(), dsse2.row(i).data(), h_cut.row(i).data(),
-            i, mask.row(i).data(), endspan, linear_only);
-    }
-    return py::make_tuple(algo.dsse(), dsse1, dsse2, h_cut);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-
-PYBIND11_MODULE(marslib, m)
-{
-    py::class_<MarsAlgo>(m, "MarsAlgo")
-    .def("eval",&eval
-         , py::arg("mask").noconvert()
-         , py::arg("endspan")
-         , py::arg("linear_only")
-        )
-    .def("append", &MarsAlgo::append)
-    ;
-}
-#endif
-
-
-
-#define PY_SSIZE_T_CLEAN
-#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
-#include <cstddef>
 #include <Python.h>
 #include <numpy/arrayobject.h>
 #include <structmember.h>
@@ -72,9 +32,9 @@ struct MarsAlgoObject {
     PyArrayObject *X_obj;
     PyArrayObject *y_obj;
     PyArrayObject *w_obj;
-    MarsAlgo *algo;
-    int nbasis;
-    double yvar;
+    MarsAlgo      *algo;
+    int            nbasis;
+    double         yvar;
 };
 
 static int mars_init(MarsAlgoObject *self, PyObject *args, PyObject *kwds)
@@ -130,20 +90,54 @@ static void mars_dealloc(MarsAlgoObject *self)
     Py_TYPE(self)->tp_free((PyObject *) self);
 }
 
-static PyObject *mars_eval(MarsAlgoObject *self, PyObject *Py_UNUSED(ignored))
+static PyObject *mars_eval(MarsAlgoObject *self, PyObject *args)
 {
+#if 0
+py::tuple eval(MarsAlgo &algo,
+               const Ref<const MatrixXbC> &mask,
+               int endspan,
+               bool linear_only)
+{
+    typedef Array<double,Dynamic,Dynamic,RowMajor> ArrayXXdC;
+    ArrayXXdC dsse1 = ArrayXXdC::Zero(mask.rows(), mask.cols());
+    ArrayXXdC dsse2 = ArrayXXdC::Zero(mask.rows(), mask.cols());
+    ArrayXXdC h_cut = ArrayXXdC::Constant(mask.rows(), mask.cols(), NAN);
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < mask.rows(); ++i) {
+        algo.eval(
+            dsse1.row(i).data(), dsse2.row(i).data(), h_cut.row(i).data(),
+            i, mask.row(i).data(), endspan, linear_only);
+    }
+    return py::make_tuple(algo.dsse(), dsse1, dsse2, h_cut);
+}
+#endif
     return PyUnicode_FromFormat("hello world");
 }
 
-static PyObject *mars_append(MarsAlgoObject *self, PyObject *Py_UNUSED(ignored))
+static PyObject *mars_append(MarsAlgoObject *self, PyObject *args)
 {
-    self->nbasis += 1;
-    return PyUnicode_FromFormat("hello world");
+    float h;
+    const char *type;
+    int xcol, bcol;
+    if (!PyArg_ParseTuple(args, "siif", &type, &xcol, &bcol, &h)) {
+        return NULL;
+    }
+
+    try {
+        double mse = self->algo->append(type[0], xcol, bcol, h);
+        self->nbasis = self->algo->nbasis();
+        return Py_BuildValue("d", mse);
+    }
+    catch(std::runtime_error& e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return NULL;
+    }
 }
 
 static PyMethodDef methods[] = {
-    {"eval",   (PyCFunction)mars_eval,   METH_NOARGS, "Evaluate an iteration"},
-    {"append", (PyCFunction)mars_append, METH_NOARGS, "Append a basis to the model"},
+    {"eval",   (PyCFunction)mars_eval,   METH_VARARGS, "Evaluate an iteration"},
+    {"append", (PyCFunction)mars_append, METH_VARARGS, "Append a basis to the model"},
     {NULL}
 };
 
