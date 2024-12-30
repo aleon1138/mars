@@ -1,6 +1,7 @@
 #include <Eigen/Dense>
 #include <numeric>      // for std::iota
 #include <cfloat>       // for DBL_EPSILON
+#include <cassert>
 #ifdef __SSE__
 #   include <immintrin.h>  // for _mm_getcsr
 #endif

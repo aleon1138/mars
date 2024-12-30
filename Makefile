@@ -1,4 +1,4 @@
-CXXFLAGS += -O3 -Wall -std=c++11 -fopenmp
+CXXFLAGS += -O3 -Wall -std=c++14 -fopenmp
 CXXFLAGS += -march=native -fvisibility=hidden
 ifeq ($(shell uname), Darwin)
 	CXXFLAGS += -mfma # strange, but this is not default under arch=native
