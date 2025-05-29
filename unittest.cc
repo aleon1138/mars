@@ -252,7 +252,10 @@ TEST(MarsTest, DeltaSSE)
     ArrayXb mask = ArrayXb::Zero(M);
     mask[0] = true;
     MarsAlgo algo(X32.data(), y32.data(), w32.data(), X.rows(), X.cols(), X.cols()/2, X.rows());
-    MatrixXd ALL_B(MatrixXd::Zero(N,M));
+
+    MatrixXd ALL_B_full = MatrixXd::Zero(N,16);
+    auto     ALL_B      = ALL_B_full.leftCols(M);
+
     ALL_B.col(0).array() = 1;
     int b_cols = 1; // number of valid columns in B
 

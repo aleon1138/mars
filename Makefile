@@ -1,3 +1,5 @@
+# for memchecks use -O0 -g -fsanitize=address
+
 CXXFLAGS += -O3 -Wall -std=c++14 -fopenmp
 CXXFLAGS += -march=native -fvisibility=hidden
 ifeq ($(shell uname), Darwin)

@@ -140,7 +140,7 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
         __m256d f0 = _mm256_load_pd(f+i);
         __m256d g0 = _mm256_load_pd(g+i);
         __m256d y0 = _mm256_load_pd(y+i);
-        __m256d x0 = _mm256_cvtps_pd(_mm_load_ps(x+i));
+        __m256d x0 = _mm256_cvtps_pd(_mm_loadu_ps(x+i));
 
         f0 = _mm256_fmadd_pd(K0,g0,f0);
         g0 = _mm256_fmadd_pd(K1,x0,g0);
