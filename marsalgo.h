@@ -126,6 +126,11 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
     double *f = f_.data();
     double *g = g_.data();
 
+    assert(long(f) % 16 == 0);
+    assert(long(g) % 16 == 0);
+    //assert(long(x) % 16 == 0); // NOTE - this memory is coming in un-aligned
+    assert(long(y) % 16 == 0);
+
 #ifndef __AVX__
     int m0 = 0;
     cov_t o = {0};
@@ -140,7 +145,7 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
         __m256d f0 = _mm256_load_pd(f+i);
         __m256d g0 = _mm256_load_pd(g+i);
         __m256d y0 = _mm256_load_pd(y+i);
-        __m256d x0 = _mm256_cvtps_pd(_mm_loadu_ps(x+i)); // we have no control if X is aligned
+        __m256d x0 = _mm256_cvtps_pd(_mm_loadu_ps(x+i)); // see note above
 
         f0 = _mm256_fmadd_pd(K0,g0,f0);
         g0 = _mm256_fmadd_pd(K1,x0,g0);

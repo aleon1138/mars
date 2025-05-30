@@ -22,22 +22,36 @@ MarsAlgo * new_algo(
 
 ///////////////////////////////////////////////////////////////////////////////
 
-py::tuple eval(MarsAlgo &algo,
-               const Ref<const MatrixXbC> &mask,
-               int endspan,
-               bool linear_only)
+py::tuple eval(MarsAlgo &algo, const Ref<const MatrixXbC> &mask,
+               int endspan, bool linear_only, int threads)
 {
     typedef Array<double,Dynamic,Dynamic,RowMajor> ArrayXXdC;
     ArrayXXdC dsse1 = ArrayXXdC::Zero(mask.rows(), mask.cols());
     ArrayXXdC dsse2 = ArrayXXdC::Zero(mask.rows(), mask.cols());
     ArrayXXdC h_cut = ArrayXXdC::Constant(mask.rows(), mask.cols(), NAN);
+    threads = std::min(threads, omp_get_num_procs());
 
-    #pragma omp parallel for schedule(static)
+    bool ok = true;
+    Py_BEGIN_ALLOW_THREADS
+    #pragma omp parallel for schedule(static) num_threads(threads)
     for (int i = 0; i < mask.rows(); ++i) {
-        algo.eval(
-            dsse1.row(i).data(), dsse2.row(i).data(), h_cut.row(i).data(),
-            i, mask.row(i).data(), endspan, linear_only);
+        {
+            py::gil_scoped_acquire gil;
+            ok &= (PyErr_CheckSignals() == 0);
+        }
+
+        if (ok) {
+            algo.eval(
+                dsse1.row(i).data(), dsse2.row(i).data(), h_cut.row(i).data(),
+                i, mask.row(i).data(), endspan, linear_only);
+        }
     }
+    Py_END_ALLOW_THREADS
+
+    if (!ok) {
+        throw py::error_already_set();
+    }
+
     return py::make_tuple(algo.dsse(), dsse1, dsse2, h_cut);
 }
 
@@ -62,6 +76,7 @@ PYBIND11_MODULE(marslib, m)
          , py::arg("mask").noconvert()
          , py::arg("endspan")
          , py::arg("linear_only")
+         , py::arg("threads")
         )
     .def("nbasis", &MarsAlgo::nbasis)
     .def("yvar",   &MarsAlgo::yvar)
