@@ -47,7 +47,7 @@ py::tuple eval(MarsAlgo &algo, const Ref<const MatrixXbC> &mask,
         py::gil_scoped_release gil_r;
         #pragma omp parallel for schedule(static) num_threads(threads)
         for (int i = 0; i < mask.rows(); ++i) {
-            {
+            if (i % 8 == 0) { // hacky optimization
                 py::gil_scoped_acquire gil_a;
                 ok &= (PyErr_CheckSignals() == 0);
             }
