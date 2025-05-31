@@ -5,8 +5,8 @@ Multivariate Adaptive Regression Splines
 import time
 import numpy as np
 import marslib
-import multiprocessing
 
+# pylint: disable=invalid-name
 # pylint: disable=too-many-arguments
 # pylint: disable=unnecessary-lambda-assignment
 # pylint: disable=consider-using-f-string
@@ -118,8 +118,8 @@ def fit(X, y, w=None, **kwargs):
     xfilter : function (default=lambda x,b: True)
         Allows custom filtering of inputs.
 
-    threads : int (default=cpu_count())
-        Number of cores to use.
+    threads : int (default=-1)
+        Number of cores to use. A negative number implies usage of all cores.
     """
 
     X = np.asarray(X)  # do not make a copy of this data!
@@ -148,7 +148,7 @@ def fit(X, y, w=None, **kwargs):
     max_basis     = kwargs.pop('max_basis', max_epochs*2) # for "Fast MARS"
     max_inputs    = kwargs.pop('max_inputs', X.shape[1])  # for "Faster MARS v2"
     aging_factor  = kwargs.pop('aging_factor', 1.0)
-    threads       = kwargs.pop('threads', multiprocessing.cpu_count())
+    threads       = kwargs.pop('threads', -1)
     # fmt: on
 
     if kwargs:

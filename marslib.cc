@@ -23,30 +23,41 @@ MarsAlgo * new_algo(
 ///////////////////////////////////////////////////////////////////////////////
 
 py::tuple eval(MarsAlgo &algo, const Ref<const MatrixXbC> &mask,
-               int endspan, bool linear_only, int threads)
+               int endspan, bool linear, int threads)
 {
     typedef Array<double,Dynamic,Dynamic,RowMajor> ArrayXXdC;
     ArrayXXdC dsse1 = ArrayXXdC::Zero(mask.rows(), mask.cols());
     ArrayXXdC dsse2 = ArrayXXdC::Zero(mask.rows(), mask.cols());
     ArrayXXdC h_cut = ArrayXXdC::Constant(mask.rows(), mask.cols(), NAN);
-    threads = std::min(threads, omp_get_num_procs());
+
+    if (threads <= 0) {
+        threads = omp_get_num_procs();
+    }
+    else {
+        threads = std::min(threads, omp_get_num_procs());
+    }
+    threads = std::min<int>(threads, mask.rows());
+
+    // `mask` is a (r,c) boolean matrix where `r` is the number of columns of
+    // the design matrix `X` and `c` is the number of basis already chosen by
+    // the algorithm.
 
     bool ok = true;
-    Py_BEGIN_ALLOW_THREADS
-    #pragma omp parallel for schedule(static) num_threads(threads)
-    for (int i = 0; i < mask.rows(); ++i) {
-        {
-            py::gil_scoped_acquire gil;
-            ok &= (PyErr_CheckSignals() == 0);
-        }
+    {
+        py::gil_scoped_release gil_r;
+        #pragma omp parallel for schedule(static) num_threads(threads)
+        for (int i = 0; i < mask.rows(); ++i) {
+            {
+                py::gil_scoped_acquire gil_a;
+                ok &= (PyErr_CheckSignals() == 0);
+            }
 
-        if (ok) {
-            algo.eval(
-                dsse1.row(i).data(), dsse2.row(i).data(), h_cut.row(i).data(),
-                i, mask.row(i).data(), endspan, linear_only);
+            if (ok) {
+                algo.eval(dsse1.row(i).data(), dsse2.row(i).data(),
+                          h_cut.row(i).data(), i, mask.row(i).data(), endspan, linear);
+            }
         }
     }
-    Py_END_ALLOW_THREADS
 
     if (!ok) {
         throw py::error_already_set();
