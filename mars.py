@@ -8,6 +8,7 @@ import marslib
 
 # pylint: disable=invalid-name
 # pylint: disable=too-many-arguments
+# pylint: disable=too-many-positional-arguments
 # pylint: disable=unnecessary-lambda-assignment
 # pylint: disable=consider-using-f-string
 
@@ -176,7 +177,7 @@ def fit(X, y, w=None, **kwargs):
     n = len(X)
     basis = [[]]  # list of lists of used basis
     tail = max(int(n * tail_span), 1)
-    algo = marslib.MarsAlgo(X, y, w, max_terms)
+    algo = marslib.MarsAlgo(X, y, w, max_terms)  # pylint: disable=c-extension-no-member
     var_y = algo.yvar()
 
     # Set up the SSE caches. Note that for inputs, we initialize to +inf, so that
@@ -378,7 +379,7 @@ def prune(XX, XY, YY, n_true, penalty=3, ridge=0, mask=None):
 # -----------------------------------------------------------------------------
 
 
-def pprint(model, beta, labels=None):
+def pprint(model, beta=None, labels=None):
     """
     Pretty-print the model. Useful for debugging.
     """
@@ -401,8 +402,10 @@ def pprint(model, beta, labels=None):
             return [node] + get_inputs(row["basis"])
         return [node]
 
-    for i in range(len(model)):
-        if model[i]["type"] == b"i":
-            print("  %+8.4g" % beta[i])
-        else:
-            print("  %+8.4g * " % beta[i] + " * ".join(get_inputs(i)))
+    for i in range(len(model)):  # pylint: disable=consider-using-enumerate
+        bstr = "  "
+        if beta is not None and hasattr(beta, "__getitem__"):
+            bstr += "%+9.4g" % beta[i]
+        if model[i]["type"] != b"i":
+            bstr += " * " + " * ".join(get_inputs(i))
+        print(bstr)
