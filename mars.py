@@ -22,31 +22,30 @@ def _dump_header(logger):
 
 
 def _dump_row(logger, epoch, nbasis, dt, row, labels):
-    if logger:
-        logger.write("%02d:%02d:%04.1f " % (dt // 3600, (dt // 60) % 60, dt % 60))
-        logger.write(
-            "%3d %3d %4d %4d %2d  %6.4f %7.4f"
-            % (
-                epoch,
-                nbasis - 1,
-                row["basis"],
-                row["input"],
-                row["order"],
-                row["r2"],
-                row["r2_cv"],
-            )
+    logger.write("%02d:%02d:%04.1f " % (dt // 3600, (dt // 60) % 60, dt % 60))
+    logger.write(
+        "%3d %3d %4d %4d %2d  %6.4f %7.4f"
+        % (
+            epoch,
+            nbasis - 1,
+            row["basis"],
+            row["input"],
+            row["order"],
+            row["r2"],
+            row["r2_cv"],
         )
+    )
 
-        if labels is not None:
-            fmt = "%%-%ds" % max(len(_) for _ in labels)
-            if row["type"] == b"l":
-                logger.write(("  l " + fmt) % labels[row["input"]])
-            else:
-                logger.write(
-                    ("  h " + fmt + " %.4g") % (labels[row["input"]], row["hinge"])
-                )
+    if labels is not None:
+        fmt = "%%-%ds" % max(len(_) for _ in labels)
+        if row["type"] == b"l":
+            logger.write(("  l " + fmt) % labels[row["input"]])
+        else:
+            logger.write(
+                ("  h " + fmt + " %.4g") % (labels[row["input"]], row["hinge"])
+            )
 
-        logger.write("\n")
+    logger.write("\n")
 
 
 # -----------------------------------------------------------------------------
@@ -101,6 +100,13 @@ def fit(X, y, w=None, **kwargs):
     logger : file-like (default=None)
         A file-like object which can be used to log runtime messages.
 
+    callback : callable (default=None)
+        Can be used to get progress updates on the following:
+          * current epoch
+          * number of basis found
+          * total max epochs to run
+          * a dict with information about the last basis found
+
     r2_window : int (default=16)
         Length of the rolling window in which a smoothed delta R² is measured.
         This is used a stopping criteria.
@@ -142,6 +148,7 @@ def fit(X, y, w=None, **kwargs):
     linear_only   = kwargs.pop('linear_only', False)
     n_true        = kwargs.pop('n_true', len(X))
     logger        = kwargs.pop('logger', None)
+    callback      = kwargs.pop("callback", None)
     r2_window     = kwargs.pop('r2_window', 16) # window over which to measure R2
     r2_thresh     = kwargs.pop('r2_thresh', 3e-5)
     labels        = kwargs.pop('labels', None)
@@ -281,7 +288,10 @@ def fit(X, y, w=None, **kwargs):
                 # fmt:on
         assert algo.nbasis() == len(basis) == m
 
-        _dump_row(logger, epoch, len(basis), dt, model[algo.nbasis() - 1], labels)
+        if logger:
+            _dump_row(logger, epoch, len(basis), dt, model[m - 1], labels)
+        if callback:
+            callback(epoch, len(basis), max_epochs, model[m - 1])
 
         # Stopping conditions
         model_tail = model[max(algo.nbasis() - r2_window - 1, 0) : algo.nbasis()]
