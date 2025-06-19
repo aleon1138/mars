@@ -3,14 +3,15 @@
 Multivariate Adaptive Regression Splines
 """
 import time
+import numba
 import numpy as np
 import marslib
 
+# pylint: disable=consider-using-f-string
 # pylint: disable=invalid-name
 # pylint: disable=too-many-arguments
 # pylint: disable=too-many-positional-arguments
 # pylint: disable=unnecessary-lambda-assignment
-# pylint: disable=consider-using-f-string
 
 # -----------------------------------------------------------------------------
 
@@ -310,13 +311,19 @@ def fit(X, y, w=None, **kwargs):
 # -----------------------------------------------------------------------------
 
 
+@numba.njit(parallel=True)
+def _expand_linear_basis(y, b, x):
+    for i in numba.prange(len(y)):  # pylint: disable=E1133
+        y[i] = b[i] * x[i]
+
+
 def expand(X, model):
     """
     Expand a feature set X into the bases of a MARS model.
     """
-    decode = lambda s: s.decode("utf8") if isinstance(s, bytes) else s
     X = np.asarray(X)
     B = np.empty((len(X), len(model)), dtype=X.dtype, order="F")
+    decode = lambda s: s.decode("utf8") if isinstance(s, bytes) else s
 
     for i, node in enumerate(model):
         t = decode(node["type"])
@@ -328,14 +335,13 @@ def expand(X, model):
             B[:, i] = 1.0
         else:
             assert 0 <= x < X.shape[1]
-            assert (b == -1) or (0 <= b < i)
-            parent = B[:, b] if b >= 0 else 1.0
+            assert 0 <= b < i
             if t == "l":
-                B[:, i] = parent * X[:, x]
+                _expand_linear_basis(B[:, i], B[:, b], X[:, x])
             elif t == "+":
-                B[:, i] = parent * np.maximum(X[:, x] - h, 0)
+                B[:, i] = B[:, b] * np.maximum(X[:, x] - h, 0)
             elif t == "-":
-                B[:, i] = parent * np.maximum(h - X[:, x], 0)
+                B[:, i] = B[:, b] * np.maximum(h - X[:, x], 0)
             else:
                 assert False
     return B
