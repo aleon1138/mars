@@ -1,0 +1,9 @@
+[build-system]
+requires = [
+    "setuptools>=64",
+    "wheel",
+    "pybind11",
+    "numpy",
+    "numba",
+]
+build-backend = "setuptools.build_meta"

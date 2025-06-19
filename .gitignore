@@ -2,4 +2,4 @@ unittest
 marslib.so
 __pycache__/
 build/
-marslib.egg-info/
+mars.egg-info/
