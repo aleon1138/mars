@@ -283,6 +283,10 @@ public:
             throw std::runtime_error("invalid X column index");
         }
 
+        Map<ArrayXd>(linear_dsse,_m) = ArrayXd::Zero(_m);
+        Map<ArrayXd>(hinge_dsse, _m) = ArrayXd::Zero(_m);
+        Map<ArrayXd>(hinge_cuts, _m) = ArrayXd::Constant(_m,NAN);
+
         ArrayXi bcols = nonzero(Map<const ArrayXb>(bmask,_m));
         if (bcols.rows() == 0) {
             return;
@@ -306,7 +310,6 @@ public:
 
         // Calculate the linear delta SSE and map to the output buffer
         const VectorXd ybx = Bx.transpose() * _y.matrix();
-        Map<ArrayXd>(linear_dsse,m) = ArrayXd::Zero(m);
         for (int j = 0; j < p; ++j) {
             linear_dsse[bcols[j]] = ybx[j]*ybx[j];
         }
@@ -382,8 +385,6 @@ public:
             }
 
             // Map the results to the output arrays
-            Map<ArrayXd>(hinge_dsse,m) = ArrayXd::Zero(m);
-            Map<ArrayXd>(hinge_cuts,m) = ArrayXd::Constant(m,NAN);
             for (int j = 0; j < p; ++j) {
                 if (hinge_idx[j] >= 0) {
                     hinge_dsse[bcols[j]] = linear_dsse[bcols[j]] + hinge_sse[j];
@@ -428,9 +429,7 @@ public:
                 throw std::runtime_error("invalid basis type");
         }
 
-        //---------------------------------------------------------------------
         // Use Gram-Schmidt orthogonalization.
-        //---------------------------------------------------------------------
         VectorXd v = _B.col(_m).cast<double>(); // make a copy
         _B.col(_m) /= v.norm();
 

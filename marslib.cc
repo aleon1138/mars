@@ -25,10 +25,12 @@ MarsAlgo * new_algo(
 py::tuple eval(MarsAlgo &algo, const Ref<const MatrixXbC> &mask,
                int endspan, bool linear, int threads)
 {
-    typedef Array<double,Dynamic,Dynamic,RowMajor> ArrayXXdC;
-    ArrayXXdC dsse1 = ArrayXXdC::Zero(mask.rows(), mask.cols());
-    ArrayXXdC dsse2 = ArrayXXdC::Zero(mask.rows(), mask.cols());
-    ArrayXXdC h_cut = ArrayXXdC::Constant(mask.rows(), mask.cols(), NAN);
+    typedef Array<double,Dynamic,Dynamic,RowMajor> matrix_t;
+    typedef Array<double, 1, Dynamic> vector_t;
+
+    matrix_t dsse1 = matrix_t::Zero(mask.rows(), mask.cols());
+    matrix_t dsse2 = matrix_t::Zero(mask.rows(), mask.cols());
+    matrix_t h_cut = matrix_t::Zero(mask.rows(), mask.cols());
 
     if (threads <= 0) {
         threads = omp_get_num_procs();
@@ -47,21 +49,25 @@ py::tuple eval(MarsAlgo &algo, const Ref<const MatrixXbC> &mask,
         py::gil_scoped_release gil_r;
         #pragma omp parallel num_threads(threads)
         {
-            char name[16]; // Give this thread a name so that it's visible on `htop`
-            snprintf(name, sizeof(name), "mars-%02d", omp_get_thread_num());
-            pthread_setname_np(pthread_self(), name);
-
             #pragma omp for schedule(static)
             for (int i = 0; i < mask.rows(); ++i) {
-                {
-                    py::gil_scoped_acquire gil_a;
-                    ok &= (PyErr_CheckSignals() == 0); // check for CRTL-C
-                }
+                vector_t dsse1_i = vector_t::Zero(mask.cols());
+                vector_t dsse2_i = vector_t::Zero(mask.cols());
+                vector_t h_cut_i = vector_t::Zero(mask.cols());
 
                 if (ok) {
-                    algo.eval(dsse1.row(i).data(), dsse2.row(i).data(),
-                              h_cut.row(i).data(), i, mask.row(i).data(),
-                              endspan, linear);
+                    algo.eval(dsse1_i.data(), dsse2_i.data(), h_cut_i.data(),
+                              i, mask.row(i).data(), endspan, linear);
+                }
+
+                #pragma omp critical
+                {
+                    dsse1.row(i) = dsse1_i;
+                    dsse2.row(i) = dsse2_i;
+                    h_cut.row(i) = h_cut_i;
+
+                    py::gil_scoped_acquire gil_a;
+                    ok &= (PyErr_CheckSignals() == 0); // check for CRTL-C
                 }
             }
         }
