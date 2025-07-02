@@ -49,6 +49,10 @@ py::tuple eval(MarsAlgo &algo, const Ref<const MatrixXbC> &mask,
         py::gil_scoped_release gil_r;
         #pragma omp parallel num_threads(threads)
         {
+            char name[16]; // Give this thread a name
+            snprintf(name, sizeof(name), "mars-%02d", omp_get_thread_num());
+            pthread_setname_np(pthread_self(), name);
+
             #pragma omp for schedule(static)
             for (int i = 0; i < mask.rows(); ++i) {
                 vector_t dsse1_i = vector_t::Zero(mask.cols());
