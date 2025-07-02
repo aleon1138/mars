@@ -13,17 +13,19 @@ Some references:
 
 ## Performance
 
-We use [OpenMP](https://www.openmp.org) to achieve nearly linear speed-up per core used. Note that
-there is additional memory overhead for each core used, which might constraint the total number
-of cores available. As always, one can control the number of threads used via the `OMP_NUM_THREADS`
-environment variable.
+We use [OpenMP](https://www.openmp.org) to achieve pretty decent speed-up per
+core used. There is some memory overhead for each thread launched, which might
+constraint the total number of cores available. One can control the number of
+threads used via the `OMP_NUM_THREADS` environment variable or via the
+`threads` argument.
 
-| Threads | Speed-Up |
-|:-------:|:--------:|
-|    1    |   1.0 x  |
-|    2    |   2.0 x  |
-|    3    |   2.8 x  |
-|    4    |   3.4 x  |
+The following timings were obtained from a AMD EPYC 9654 96-Core Processor with
+192 logical CPUs. Note that multi-threaded performance is nearly ideal up to 30
+cores or so.
+
+<center>
+<img src="timings.png">
+</center>
 
 ## Supported Platforms
 
