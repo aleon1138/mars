@@ -45,16 +45,24 @@ py::tuple eval(MarsAlgo &algo, const Ref<const MatrixXbC> &mask,
     bool ok = true;
     {
         py::gil_scoped_release gil_r;
-        #pragma omp parallel for schedule(static) num_threads(threads)
-        for (int i = 0; i < mask.rows(); ++i) {
-            {
-                py::gil_scoped_acquire gil_a;
-                ok &= (PyErr_CheckSignals() == 0);
-            }
+        #pragma omp parallel num_threads(threads)
+        {
+            char name[16]; // Give this thread a name so that it's visible on `htop`
+            snprintf(name, sizeof(name), "mars-%02d", omp_get_thread_num());
+            pthread_setname_np(pthread_self(), name);
 
-            if (ok) {
-                algo.eval(dsse1.row(i).data(), dsse2.row(i).data(),
-                          h_cut.row(i).data(), i, mask.row(i).data(), endspan, linear);
+            #pragma omp for schedule(static)
+            for (int i = 0; i < mask.rows(); ++i) {
+                {
+                    py::gil_scoped_acquire gil_a;
+                    ok &= (PyErr_CheckSignals() == 0); // check for CRTL-C
+                }
+
+                if (ok) {
+                    algo.eval(dsse1.row(i).data(), dsse2.row(i).data(),
+                              h_cut.row(i).data(), i, mask.row(i).data(),
+                              endspan, linear);
+                }
             }
         }
     }
@@ -74,7 +82,7 @@ PYBIND11_MODULE(marslib, m)
     options.disable_function_signatures();
 
     m.doc() = "Multivariate Adaptive Regression Splines";
-    m.attr("__version__") = "dev";
+    m.attr("__version__") = "0.2";
 
     py::class_<MarsAlgo>(m, "MarsAlgo")
     .def(py::init(&new_algo)
