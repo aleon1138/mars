@@ -234,6 +234,9 @@ public:
         // Calculate the column norm of 'X'.
         //---------------------------------------------------------------------
         _s = (_X.colwise().squaredNorm()/_X.rows()).cwiseSqrt();
+        if (!_s.isFinite().all()) {
+            throw std::runtime_error("not all columns in X are finite");
+        }
         _s = (_s > 0.f).select(1.f/_s, 1.f);
     }
 
