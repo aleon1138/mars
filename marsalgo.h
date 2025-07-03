@@ -411,8 +411,8 @@ public:
             throw std::runtime_error(msg);
         }
 
-        const float  s = _s[xcol];
-        Ref<ArrayXf> b = _B.col(bcol).array();
+        const float        s = _s[xcol];
+        Ref<ArrayXf>       b = _B.col(bcol).array();
         Ref<const ArrayXf> x = _X.col(xcol).array();
 
         switch(type) {
