@@ -53,22 +53,22 @@ py::tuple eval(MarsAlgo &algo, const Ref<const MatrixXbC> &mask,
             snprintf(name, sizeof(name), "mars-%02d", omp_get_thread_num());
             pthread_setname_np(pthread_self(), name);
 
+            vector_t dsse1_local = vector_t::Zero(mask.cols());
+            vector_t dsse2_local = vector_t::Zero(mask.cols());
+            vector_t h_cut_local = vector_t::Zero(mask.cols());
+
             #pragma omp for schedule(static)
             for (int i = 0; i < mask.rows(); ++i) {
-                vector_t dsse1_i = vector_t::Zero(mask.cols());
-                vector_t dsse2_i = vector_t::Zero(mask.cols());
-                vector_t h_cut_i = vector_t::Zero(mask.cols());
-
                 if (ok) {
-                    algo.eval(dsse1_i.data(), dsse2_i.data(), h_cut_i.data(),
+                    algo.eval(dsse1_local.data(), dsse2_local.data(), h_cut_local.data(),
                               i, mask.row(i).data(), endspan, linear);
                 }
 
                 #pragma omp critical
                 {
-                    dsse1.row(i) = dsse1_i;
-                    dsse2.row(i) = dsse2_i;
-                    h_cut.row(i) = h_cut_i;
+                    dsse1.row(i) = dsse1_local;
+                    dsse2.row(i) = dsse2_local;
+                    h_cut.row(i) = h_cut_local;
 
                     py::gil_scoped_acquire gil_a;
                     ok &= (PyErr_CheckSignals() == 0); // check for CRTL-C
