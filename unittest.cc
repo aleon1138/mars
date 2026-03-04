@@ -1,6 +1,7 @@
 #include "marsalgo.h"
 #include <gtest/gtest.h>
 #include <vector>
+#include <random>
 constexpr double EPS = 1e-14;
 
 double invnorm(VectorXd x)
@@ -18,9 +19,12 @@ int argmax(const ArrayXd &x)
 
 ArrayXi create_mask(int m, int p)
 {
+    std::random_device rd;
+    std::mt19937 g(rd());
+
     std::vector<int> idx(m);
     std::iota(idx.begin(), idx.end(), 0);
-    std::random_shuffle(idx.begin(), idx.end());
+    std::shuffle(idx.begin(), idx.end(), g);
     std::sort(idx.begin(), idx.begin()+p);
     return Map<ArrayXi>(idx.data(),p);
 }
@@ -144,6 +148,9 @@ void sort_columns(Ref<MatrixXd> X, const ArrayXi32 &k)
 
 TEST(MarsTest, SortColumns)
 {
+    std::random_device rd;
+    std::mt19937 g(rd());
+
     const int n = 89;  // number of rows
     const int m = 13;  // number of basis
     MatrixXd X(MatrixXd::Random(n,m));
@@ -151,7 +158,7 @@ TEST(MarsTest, SortColumns)
 
     std::vector<int32_t> idx(n);
     std::iota(idx.begin(), idx.end(), 0);
-    std::random_shuffle(idx.begin(), idx.end());
+    std::shuffle(idx.begin(), idx.end(), g);
     ArrayXi32 k = Map<ArrayXi32>(idx.data(),idx.size());
 
     sort_columns(X,k);

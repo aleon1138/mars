@@ -13,10 +13,10 @@
  */
 #ifndef FP_FAST_FMA
 #   undef fma
-    inline double fma(double x, double y, double z)
-    {
-        return x * y + z;
-    }
+inline double fma(double x, double y, double z)
+{
+    return x * y + z;
+}
 #endif
 
 using namespace Eigen;
