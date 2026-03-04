@@ -46,8 +46,8 @@ sudo apt install -y libeigen3-dev
 brew install pkg-config eigen
 ```
 
-[GoogleTest](https://github.com/google/googletest) - [Not available](https://bit.ly/2vNUBWN)
-pre-compiled on Ubuntu; build from source:
+[GoogleTest](https://github.com/google/googletest) - Not available
+pre-compiled on Ubuntu (see [here](https://bit.ly/2vNUBWN)); build from source:
 
 ```bash
 sudo apt install -y libgtest-dev cmake
