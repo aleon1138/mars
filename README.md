@@ -1,35 +1,35 @@
 # MARS
 
-A C++ implementation of [Multivariate Adaptive Regression Splines](https://bit.ly/3cAc7xp). This is
-a semi-brute force search for interactions and non-linearities. It will give almost as good
-performance as a neural network, but with much faster model evaluation run-times.
+A C++ implementation of [Multivariate Adaptive Regression Splines](https://w.wiki/GVPL).
+This is a semi-brute force search for interactions and non-linearities. It will
+provide competitive regression performance compared to neural network for, but
+with much faster model evaluation runtimes.
 
-Some references:
-* There is a nice write-up [here](https://uc-r.github.io/mars) describing the method.
-* There is also a commercial package [here](https://www.salford-systems.com/products/mars).
-* The documentation for the R "earth" package is [here](https://cran.r-project.org/web/packages/earth/earth.pdf).
-* Stephen Milborrow maintains an excellent resource [here](http://www.milbo.users.sonic.net/earth).
-* Additionally there is an module for to scikit-learn [here](https://contrib.scikit-learn.org/py-earth).
+References:
+
+* [Write-up describing the method](https://uc-r.github.io/mars)
+* [Commercial MARS package](https://www.salford-systems.com/products/mars) by Salford Systems
+* [R "earth" package documentation](https://cran.r-project.org/web/packages/earth/earth.pdf)
+* [Stephen Milborrow's resource page](http://www.milbo.users.sonic.net/earth)
+* Additionally, there is a scikit-learn module [here](https://contrib.scikit-learn.org/py-earth)
 
 ## Performance
 
-We use [OpenMP](https://www.openmp.org) to achieve pretty decent speed-up per
-core used. There is some memory overhead for each thread launched, which might
-constraint the total number of cores available. One can control the number of
-threads used via the `OMP_NUM_THREADS` environment variable or via the
-`threads` argument.
+We use [OpenMP](https://www.openmp.org) to achieve good speed-up per core. There
+is some memory overhead for each thread launched, which might constrain the total
+number of cores available. You can control the number of threads via the
+`OMP_NUM_THREADS` environment variable or the `threads` argument.
 
-The following timings were obtained from a AMD EPYC 9654 96-Core Processor with
+The following timings were obtained on an AMD EPYC 9654 96-Core Processor with
 192 logical CPUs. Note that multi-threaded performance is nearly ideal up to 30
 cores or so.
 
-<center>
-<img src="timings.png">
-</center>
+![Performance timings of MARS](timings.png)
 
 ## Supported Platforms
 
 These instructions have been verified to work on the following platforms:
+
 * Ubuntu 18.04 and 20.04
 * Raspbian 10
 * macOS 10.13 (WIP)
@@ -46,28 +46,31 @@ sudo apt install -y libeigen3-dev
 brew install pkg-config eigen
 ```
 
-[GoogleTest](https://github.com/google/googletest) - Unfortunately, the library is [no longer
-available pre-compiled](https://bit.ly/2vNUBWN) on Ubuntu.
+[GoogleTest](https://github.com/google/googletest) - [Not available](https://bit.ly/2vNUBWN)
+pre-compiled on Ubuntu; build from source:
 
 ```bash
 sudo apt install -y libgtest-dev cmake
 cd /usr/src/gtest
 sudo cmake CMakeLists.txt && sudo make
-sudo cp *.a /usr/lib
+sudo cp lib/*.a /usr/lib
 ```
 
-[pybind11](https://github.com/pybind/pybind11) - Install using your python package manager of choice:
+[pybind11](https://github.com/pybind/pybind11) - Install via pip:
 
 ```bash
 pip3 install pybind11
 ```
-... or ...
+
+Or with conda:
+
 ```bash
 conda install -y pybind11
 ```
 
 ## Build Instructions
-You can either use the Makefile:
+
+Use the Makefile:
 
 ```bash
 cd mars
@@ -75,7 +78,7 @@ make
 make test # optional - build and run the unit tests
 ```
 
-Or the `setup.py` script provided:
+Or install directly via pip:
 
 ```bash
 cd mars
@@ -83,6 +86,7 @@ pip install .
 ```
 
 ## An Example
+
 Here we train a linear model with a categorical interaction.
 
 ```python
