@@ -3,7 +3,14 @@ requires = [
     "setuptools>=64",
     "wheel",
     "pybind11",
-    "numpy",
-    "numba",
 ]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "mars"
+version = "0.3"
+description = "Multivariate Adaptive Regression Splines"
+authors = [{name = "Arnaldo Leon"}]
+
+[tool.setuptools]
+py-modules = ["mars"]
