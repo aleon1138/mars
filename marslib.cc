@@ -5,19 +5,40 @@
 namespace py = pybind11;
 typedef Matrix<bool,Dynamic,Dynamic,RowMajor> MatrixXbC;
 
+void verify(bool check, const char *msg)
+{
+    if (!check) {
+        throw std::runtime_error(msg);
+    }
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 MarsAlgo * new_algo(
-    const Ref<const MatrixXf> &X,
-    const Ref<const VectorXf> &y,
-    const Ref<const VectorXf> &w,
+    py::array_t<float> X_array,
+    py::array_t<float> y_array,
+    py::array_t<float> w_array,
     int max_terms)
 {
-    if (X.rows() != y.rows() || y.rows() != w.rows()) {
-        throw std::runtime_error("invalid dataset lengths");
-    }
-    return new MarsAlgo(X.data(), y.data(), w.data(),
-                        X.rows(), X.cols(), max_terms, X.outerStride());
+    auto X = X_array.request();
+    auto y = y_array.request();
+    auto w = w_array.request();
+
+    verify(X.ndim == 2, "expected 2D array for X");
+    verify(y.ndim == 1, "expected 1D array for y");
+    verify(w.ndim == 1, "expected 1D array for w");
+    verify(X.strides[0] == sizeof(float), "X must be column-major");
+    verify(y.strides[0] == sizeof(float), "y must be column-major");
+    verify(w.strides[0] == sizeof(float), "w must be column-major");
+    verify(X.shape[0] == y.shape[0], "invalid dimension for y");
+    verify(X.shape[0] == w.shape[0], "invalid dimension for w");
+
+    ssize_t outer_stride = X.strides[1] / sizeof(float);
+    return new MarsAlgo(static_cast<const float*>(X.ptr),
+                        static_cast<const float*>(y.ptr),
+                        static_cast<const float*>(w.ptr),
+                        X.shape[0], X.shape[1],
+                        max_terms, outer_stride);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -87,7 +108,7 @@ PYBIND11_MODULE(marslib, m)
     options.disable_function_signatures();
 
     m.doc() = "Multivariate Adaptive Regression Splines";
-    m.attr("__version__") = "0.2";
+    m.attr("__version__") = "0.3";
 
     py::class_<MarsAlgo>(m, "MarsAlgo")
     .def(py::init(&new_algo)
@@ -95,6 +116,7 @@ PYBIND11_MODULE(marslib, m)
          , py::arg("y").noconvert()
          , py::arg("w").noconvert()
          , py::arg("max_terms")
+         , py::keep_alive<1, 2>()   // X
         )
     .def("eval",&eval
          , py::arg("mask").noconvert()

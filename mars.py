@@ -2,6 +2,7 @@
 """
 Multivariate Adaptive Regression Splines
 """
+
 import time
 import numba
 import numpy as np
@@ -130,9 +131,13 @@ def fit(X, y, w=None, **kwargs):
         Number of cores to use. A negative number implies usage of all cores.
     """
 
-    X = np.asarray(X)  # do not make a copy of this data!
-    y = np.asarray(y, dtype="f")
-    w = np.asarray(w, dtype="f") if w is not None else np.ones(len(X), dtype="f")
+    if w is None:
+        w = np.ones(len(X), dtype="f")
+
+    X = np.asarray(X, copy=False)  # do not make a copy of this data!
+    y = np.asarray(y.squeeze(), dtype="f")
+    w = np.asarray(w.squeeze(), dtype="f")
+
     assert X.dtype == "f", "X data must be 32-bit float"
     assert X.strides[0] == X.itemsize, "X data must be column-major"
     assert y.strides[0] == y.itemsize, "y data must be column-major"

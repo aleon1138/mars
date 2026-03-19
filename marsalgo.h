@@ -73,7 +73,7 @@ ArrayXi nonzero(const ArrayXb &x)
  *      which columns of `B` to use.
  *
  *  tol : double
- *      a small epsilpon used to truncate small values to zero.
+ *      a small epsilon used to truncate small values to zero.
  */
 void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXdC> &Bo,
                     const ArrayXf &x, const ArrayXi &mask, double tol)

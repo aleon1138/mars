@@ -26,7 +26,7 @@ module = Extension(
 
 setup(
     name="mars",
-    version="0.2",
+    version="0.3",
     author="Arnaldo Leon",
     description="Multivariate Adaptive Regression Splines",
     py_modules=["mars"],
