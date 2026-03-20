@@ -19,7 +19,7 @@ inline double fma(double x, double y, double z)
 }
 #endif
 
-using namespace Eigen;
+using namespace Eigen; // TODO: get rid of this, refactor this into a *.cc and *.h
 typedef Matrix<double,Dynamic,Dynamic,RowMajor> MatrixXdC;
 typedef Matrix<float, Dynamic,Dynamic,RowMajor> MatrixXfC;
 typedef Array<int32_t,Dynamic,1> ArrayXi32;
