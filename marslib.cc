@@ -1,7 +1,6 @@
 #include "marsalgo.h"
 #include <omp.h>
 #include <pybind11/pybind11.h>
-#include <pybind11/eigen.h> // somehow needed for bool matrices
 #include <pybind11/numpy.h>
 namespace py = pybind11;
 
@@ -54,20 +53,21 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
     ssize_t mask_rows = mask.shape(0);
     ssize_t mask_cols = mask.shape(1);
 
-    typedef Array<double,Dynamic,Dynamic,RowMajor> matrix_t;
-    typedef Array<double,1,Dynamic> vector_t;
-
-    matrix_t dsse1 = matrix_t::Zero(mask_rows, mask_cols);
-    matrix_t dsse2 = matrix_t::Zero(mask_rows, mask_cols);
-    matrix_t h_cut = matrix_t::Zero(mask_rows, mask_cols);
+    py::array_t<double> dsse1({mask_rows, mask_cols});
+    py::array_t<double> dsse2({mask_rows, mask_cols});
+    py::array_t<double> h_cut({mask_rows, mask_cols});
+    auto dsse1_ptr = dsse1.mutable_unchecked<2>();
+    auto dsse2_ptr = dsse2.mutable_unchecked<2>();
+    auto h_cut_ptr = h_cut.mutable_unchecked<2>();
 
     threads = threads <= 0? omp_get_num_procs() : std::min(threads, omp_get_num_procs());
     threads = std::min<int>(threads, mask_rows);
 
-    // `mask` is a (r,c) boolean matrix where `r` is the number of columns of
-    // the design matrix `X` and `c` is the number of basis already chosen by
-    // the algorithm.
-
+    /*
+     * `mask` is a (r,c) boolean matrix where `r` is the number of columns of
+     * the design matrix `X` and `c` is the number of basis already chosen by
+     * the algorithm.
+     */
     bool ok = true;
     {
         py::gil_scoped_release gil_r;
@@ -77,23 +77,15 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
             snprintf(name, sizeof(name), "mars-%02d", omp_get_thread_num());
             pthread_setname_np(pthread_self(), name);
 
-            vector_t dsse1_row = vector_t::Zero(mask_cols);
-            vector_t dsse2_row = vector_t::Zero(mask_cols);
-            vector_t h_cut_row = vector_t::Zero(mask_cols);
-
             #pragma omp for schedule(static)
             for (int i = 0; i < mask_rows; ++i) {
                 if (ok) {
-                    algo.eval(dsse1_row.data(), dsse2_row.data(), h_cut_row.data(),
+                    algo.eval(&dsse1_ptr(i,0), &dsse2_ptr(i,0), &h_cut_ptr(i,0),
                               i, &mask(i,0), endspan, linear);
                 }
 
                 #pragma omp critical
                 {
-                    dsse1.row(i) = dsse1_row;
-                    dsse2.row(i) = dsse2_row;
-                    h_cut.row(i) = h_cut_row;
-
                     py::gil_scoped_acquire gil_a;
                     ok &= (PyErr_CheckSignals() == 0); // check for CRTL-C
                 }
@@ -124,7 +116,7 @@ PYBIND11_MODULE(marslib, m)
          , py::arg("y").noconvert()
          , py::arg("w").noconvert()
          , py::arg("max_terms")
-         , py::keep_alive<1, 2>()   // X
+         , py::keep_alive<1, 2>()   // keep `X` in scope
         )
     .def("eval",&eval
          , py::arg("mask").noconvert()
