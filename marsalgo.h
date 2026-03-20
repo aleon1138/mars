@@ -380,7 +380,7 @@ public:
                     const double uw  = o.fy - w;
                     const double den = (k0+k1) - o.ff;
                     const double sse = den > _tol? (uw*uw)/(den+_tol) : 0;
-                    if ((i > head) and (sse > hinge_sse[j])) {
+                    if ((i > head) && (sse > hinge_sse[j])) {
                         hinge_sse[j] = sse;
                         hinge_idx[j] = i;
                     }
@@ -410,7 +410,7 @@ public:
         }
         if (bcol < 0 || bcol >= _m) {
             char msg[80];
-            sprintf(msg, "invalid basis column number: %d", bcol);
+            snprintf(msg, sizeof(msg), "invalid basis column number: %d", bcol);
             throw std::runtime_error(msg);
         }
 

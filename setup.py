@@ -4,7 +4,7 @@ import pybind11
 extra_compile_args = [
     "-O3",
     "-Wall",
-    "-std=c++14",
+    "-std=c++17",
     "-march=native",
     "-fopenmp",
 ]
