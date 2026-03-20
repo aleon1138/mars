@@ -13,6 +13,7 @@ import marslib
 # pylint: disable=too-many-arguments
 # pylint: disable=too-many-positional-arguments
 # pylint: disable=unnecessary-lambda-assignment
+# ruff: noqa: E731
 
 # -----------------------------------------------------------------------------
 
@@ -178,8 +179,8 @@ def fit(X, y, w=None, **kwargs):
     # Set up a basic filter which caps the polynomial degree of basis and optionally
     # prevents features from interacting with themselves. Here 'i' is the index of the
     # feature to be added and 'b' is a list of features that exist in the parent basis.
-    basic_filter = lambda i, b: (len(b) < max_degree) and (
-        self_interact or (i not in b)
+    basic_filter = lambda i, b: (
+        (len(b) < max_degree) and (self_interact or (i not in b))
     )
 
     # Make sure the DOF's never exceed the number of samples

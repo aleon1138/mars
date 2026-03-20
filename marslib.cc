@@ -1,9 +1,9 @@
 #include "marsalgo.h"
 #include <omp.h>
-#include <pybind11/eigen.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/eigen.h> // somehow needed for bool matrices
+#include <pybind11/numpy.h>
 namespace py = pybind11;
-typedef Matrix<bool,Dynamic,Dynamic,RowMajor> MatrixXbC;
 
 void verify(bool check, const char *msg)
 {
@@ -20,9 +20,9 @@ MarsAlgo * new_algo(
     py::array_t<float> w_array,
     int max_terms)
 {
-    auto X = X_array.request();
-    auto y = y_array.request();
-    auto w = w_array.request();
+    py::buffer_info X = X_array.request();
+    py::buffer_info y = y_array.request();
+    py::buffer_info w = w_array.request();
 
     verify(X.ndim == 2, "expected 2D array for X");
     verify(y.ndim == 1, "expected 1D array for y");
@@ -43,18 +43,26 @@ MarsAlgo * new_algo(
 
 ///////////////////////////////////////////////////////////////////////////////
 
-py::tuple eval(MarsAlgo &algo, const Ref<const MatrixXbC> &mask,
+py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
                int endspan, bool linear, int threads)
 {
+    py::buffer_info mask_info = mask_array.request();
+    verify(mask_info.ndim == 2, "expected 2D array for mask");
+    verify(mask_info.strides[1] == sizeof(bool), "mask must be row-major");
+
+    auto mask = mask_array.unchecked<2>();
+    ssize_t mask_rows = mask.shape(0);
+    ssize_t mask_cols = mask.shape(1);
+
     typedef Array<double,Dynamic,Dynamic,RowMajor> matrix_t;
     typedef Array<double,1,Dynamic> vector_t;
 
-    matrix_t dsse1 = matrix_t::Zero(mask.rows(), mask.cols());
-    matrix_t dsse2 = matrix_t::Zero(mask.rows(), mask.cols());
-    matrix_t h_cut = matrix_t::Zero(mask.rows(), mask.cols());
+    matrix_t dsse1 = matrix_t::Zero(mask_rows, mask_cols);
+    matrix_t dsse2 = matrix_t::Zero(mask_rows, mask_cols);
+    matrix_t h_cut = matrix_t::Zero(mask_rows, mask_cols);
 
     threads = threads <= 0? omp_get_num_procs() : std::min(threads, omp_get_num_procs());
-    threads = std::min<int>(threads, mask.rows());
+    threads = std::min<int>(threads, mask_rows);
 
     // `mask` is a (r,c) boolean matrix where `r` is the number of columns of
     // the design matrix `X` and `c` is the number of basis already chosen by
@@ -69,15 +77,15 @@ py::tuple eval(MarsAlgo &algo, const Ref<const MatrixXbC> &mask,
             snprintf(name, sizeof(name), "mars-%02d", omp_get_thread_num());
             pthread_setname_np(pthread_self(), name);
 
-            vector_t dsse1_row = vector_t::Zero(mask.cols());
-            vector_t dsse2_row = vector_t::Zero(mask.cols());
-            vector_t h_cut_row = vector_t::Zero(mask.cols());
+            vector_t dsse1_row = vector_t::Zero(mask_cols);
+            vector_t dsse2_row = vector_t::Zero(mask_cols);
+            vector_t h_cut_row = vector_t::Zero(mask_cols);
 
             #pragma omp for schedule(static)
-            for (int i = 0; i < mask.rows(); ++i) {
+            for (int i = 0; i < mask_rows; ++i) {
                 if (ok) {
                     algo.eval(dsse1_row.data(), dsse2_row.data(), h_cut_row.data(),
-                              i, mask.row(i).data(), endspan, linear);
+                              i, &mask(i,0), endspan, linear);
                 }
 
                 #pragma omp critical
