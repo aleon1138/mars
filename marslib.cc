@@ -48,6 +48,7 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
     py::buffer_info mask_info = mask_array.request();
     verify(mask_info.ndim == 2, "expected 2D array for mask");
     verify(mask_info.strides[1] == sizeof(bool), "mask must be row-major");
+    verify(mask_info.shape[1] == algo.nbasis(), "invalid dimension for mask");
 
     auto mask = mask_array.unchecked<2>();
     ssize_t mask_rows = mask.shape(0);
@@ -73,7 +74,7 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
         py::gil_scoped_release gil_r;
         #pragma omp parallel num_threads(threads)
         {
-            char name[16]; // Give this thread a name
+            char name[16]; // Give this thread a name so it shows up in `htop`
             snprintf(name, sizeof(name), "mars-%02d", omp_get_thread_num());
             pthread_setname_np(pthread_self(), name);
 
