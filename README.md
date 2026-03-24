@@ -46,26 +46,25 @@ sudo apt install -y libeigen3-dev
 brew install pkg-config eigen
 ```
 
-[GoogleTest](https://github.com/google/googletest) - Not available
-pre-compiled on Ubuntu (see [here](https://bit.ly/2vNUBWN)); build from source:
+[GoogleTest](https://github.com/google/googletest):
+
+```bash
+sudo apt install -y libgtest-dev
+```
+
+On older Ubuntu versions (before 22.04) you'll need to [build from source](https://bit.ly/2vNUBWN):
 
 ```bash
 sudo apt install -y libgtest-dev cmake
 cd /usr/src/gtest
-sudo cmake CMakeLists.txt && sudo make
+sudo cmake . && sudo make
 sudo cp lib/*.a /usr/lib
 ```
 
-[pybind11](https://github.com/pybind/pybind11) - Install via pip:
+[pybind11](https://github.com/pybind/pybind11):
 
 ```bash
 pip3 install pybind11
-```
-
-Or with conda:
-
-```bash
-conda install -y pybind11
 ```
 
 ## Build Instructions
