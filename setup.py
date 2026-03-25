@@ -48,7 +48,7 @@ def find_eigen_include():
 ext_modules = [
     Pybind11Extension(
         "marslib",
-        sources=["marslib.cc"],
+        sources=["marslib.cc", "marsalgo.cc"],
         include_dirs=[find_eigen_include()],
         extra_compile_args=[
             "-O3",

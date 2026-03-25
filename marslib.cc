@@ -4,13 +4,6 @@
 #include <pybind11/numpy.h>
 namespace py = pybind11;
 
-void verify(bool check, const char *msg)
-{
-    if (!check) {
-        throw std::runtime_error(msg);
-    }
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 MarsAlgo * new_algo(
@@ -69,7 +62,7 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
      * the design matrix `X` and `c` is the number of basis already chosen by
      * the algorithm.
      */
-    bool ok = true;
+    std::atomic<bool> ok{true};
     {
         py::gil_scoped_release gil_r;
         #pragma omp parallel num_threads(threads)
@@ -80,15 +73,16 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
 
             #pragma omp for schedule(static)
             for (int i = 0; i < mask_rows; ++i) {
-                if (ok) {
+                if (ok.load(std::memory_order_relaxed)) {
                     algo.eval(&dsse1_ptr(i,0), &dsse2_ptr(i,0), &h_cut_ptr(i,0),
                               i, &mask(i,0), endspan, linear);
                 }
 
-                #pragma omp critical
-                {
+                if (i % 32 == 0) {
                     py::gil_scoped_acquire gil_a;
-                    ok &= (PyErr_CheckSignals() == 0); // check for CRTL-C
+                    if (PyErr_CheckSignals() != 0) { // check for CRTL-C
+                        ok.store(false, std::memory_order_relaxed);
+                    }
                 }
             }
         }

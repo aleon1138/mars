@@ -1,8 +1,30 @@
 #include "marsalgo.h"
+#include <Eigen/Dense>
 #include <gtest/gtest.h>
 #include <vector>
 #include <random>
 constexpr double EPS = 1e-14;
+
+
+using namespace Eigen;
+typedef Matrix<double,Dynamic,Dynamic,RowMajor> MatrixXdC;
+typedef Matrix<float, Dynamic,Dynamic,RowMajor> MatrixXfC;
+typedef Array<int32_t,Dynamic,1> ArrayXi32;
+typedef Array<int64_t,Dynamic,1> ArrayXi64;
+typedef Array<bool,Dynamic,1> ArrayXb;
+
+struct cov_t {
+    double ff;
+    double fy;
+};
+
+void argsort(int32_t *idx, const float *v, int n);
+ArrayXi nonzero(const ArrayXb &x);
+void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXdC> &Bo,
+                    const ArrayXf &x, const ArrayXi &mask, double tol);
+cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
+                 double xm, double ym, double k0, float k1, int m);
+
 
 double invnorm(VectorXd x)
 {
