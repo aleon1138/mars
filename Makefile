@@ -28,4 +28,4 @@ unittest: unittest.cc marsalgo.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $< -lgtest -lpthread
 
 clean:
-	rm -rf __pycache__/ build/ mars.egg-info/ unittest $(TARGET)
+	rm -rf __pycache__/ build/ mars.egg-info/ unittest $(TARGET) dist
