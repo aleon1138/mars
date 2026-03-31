@@ -154,7 +154,7 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
         __m256d f0 = _mm256_load_pd(f+i);
         __m256d g0 = _mm256_load_pd(g+i);
         __m256d y0 = _mm256_load_pd(y+i);
-        __m256d x0 = _mm256_cvtps_pd(_mm_loadu_ps(x+i)); // see note above
+        __m256d x0 = _mm256_cvtps_pd(_mm_loadu_ps(x+i)); // `x` might be unaligned!
 
         f0 = _mm256_fmadd_pd(K0,g0,f0);
         g0 = _mm256_fmadd_pd(K1,x0,g0);
@@ -342,11 +342,11 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
          *  existing ortho-basis (Bo) AND the linear candidate (Bx[:,j]). The local
          *  accumulators below build up the remaining terms needed for the delta-SSE:
          *
-         *    b2   = sum_{j<i} b[k[j]]^2             (squared norm of b above cut)
-         *    vb   = sum_{j<i} b[k[j]] * y[k[j]]     (dot product <b,y> above cut)
+         *    b2   = sum_{j<i} b[k[j]]^2                  (squared norm of b above cut)
+         *    vb   = sum_{j<i} b[k[j]] * y[k[j]]          (dot product <b,y> above cut)
          *    bd   = sum_{j<i} b[k[j]]^2 * (x[k[j]] - h)  (helper for k0/k1 update)
-         *    k0+k1 = ||h_plus||^2                    (squared norm of positive hinge)
-         *    w    = h_plus^T * y                     (dot product of hinge with target)
+         *    k0+k1 = ||h_plus||^2                        (squared norm of positive hinge)
+         *    w    = h_plus^T * y                         (dot product of hinge with target)
          *
          *  Note: b2, vb, bd are updated AFTER computing the SSE for cut i, so they
          *  always reflect the i samples above the current cut (0..i-1), not 0..i.
@@ -383,7 +383,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
                 y_k  = y [k[i]];
                 cov_t o = covariates(f,g,Bok.row(i).data(),ybo,bx_k,ybx[j],d[i],b_k,m);
 
-                k0 = fma(d[i]*d[i],b2,k0); // build up ||h_plus||^2 incrementally
+                k0 = fma(d[i]*d[i],b2,k0);  // build up ||h_plus||^2 incrementally
                 k1 = fma(d[i]*2,bd,k1);
                 w  = fma(d[i],vb,w);        // w = h_plus^T * y
                 bd = fma(d[i],b2,bd);
