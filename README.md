@@ -98,7 +98,7 @@ y      = 2*X[:,0] + 3*X[:,1] + X[:,0]*X[:,1] + np.random.randn(len(X))
 X = np.array(X, order='F', dtype='f')
 y = np.array(y, dtype='f')
 
-# Fit the earth model
+# Fit the model
 import mars
 model = mars.fit(X, y, max_epochs=8, tail_span=0, linear_only=True)
 B     = mars.expand(X, model) # expand the basis
