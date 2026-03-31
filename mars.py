@@ -73,7 +73,7 @@ def fit(X, y, w=None, **kwargs):
         For Fast-MARS, the number of bases to keep in cache.
 
     max_inputs : int (default=p), where X is (n x p)
-        For Fast-MARS, the number of input features to keep in cache.
+        For Fast-MARS v2, the number of input features to keep in cache.
 
     penalty : float (default=3.0)
         A smoothing parameter used to calculate GCV R².
@@ -358,7 +358,35 @@ def expand(X, model):
 
 def prune(XX, XY, YY, n_true, penalty=3, ridge=0, mask=None):
     """
-    Solve for the linear coefficients, with pruning.
+    Solve for the linear coefficients using backward stepwise selection (GCV pruning).
+
+    Parameters
+    ----------
+    XX : array (M, M)
+        Gram matrix B.T @ B, where B is the basis matrix from `expand()`.
+
+    XY : array (M,)
+        Cross-product vector B.T @ y.
+
+    YY : float
+        Sum of squares y.T @ y.
+
+    n_true : int
+        Number of truly independent samples, used for GCV degrees-of-freedom adjustment.
+
+    penalty : float (default=3)
+        GCV smoothing penalty. See `fit()` parameter of the same name.
+
+    ridge : float (default=0)
+        L2 regularization added to the diagonal of XX before solving.
+
+    mask : bool array (M,) or None
+        Initial mask of which basis terms to consider. None means all terms.
+
+    Returns
+    -------
+    beta : array (M,)
+        Coefficient vector; pruned terms have coefficient 0.
     """
 
     def _solve(xx, xy, mask):
@@ -384,7 +412,7 @@ def prune(XX, XY, YY, n_true, penalty=3, ridge=0, mask=None):
         sse = np.ones(M) * np.inf
         for i in np.where(mask)[0]:
             k = mask & (np.arange(len(mask)) != i)
-            dof = sum(k) + penalty * (M - 1)
+            dof = sum(k) + penalty * (sum(k) - 1)
             sse[i] = _gcv_sse(XX, XY, YY, k, dof, n_true)
         if sse.min() >= min_sse:
             break

@@ -31,7 +31,7 @@ public:
      *
      *  hinge_cuts : [out]
      *
-     *  xol : int
+     \*  xcol : int
      *      which column of the training `X` data to use.
      *
      *  bmask : bool(m)

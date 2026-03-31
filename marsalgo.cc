@@ -59,7 +59,7 @@ ArrayXi nonzero(const ArrayXb &x)
  *  of normalized basis `Bo`.
  *
  *  Bx : double(n,p) [out]
- *      returns `B * x`, ortho-normalized against `Bo`
+ *      returns `B[:,mask] .* x` (element-wise), ortho-normalized against `Bo`
  *
  *  B : float(n,m)
  *      the existing set of basis.
@@ -96,26 +96,34 @@ struct cov_t {
 };
 
 /*
- *  f_ : double(m+1)
+ *  Incrementally updates running accumulators `f_` and `g_` and returns their
+ *  inner products. Called once per sorted data point while sweeping through
+ *  candidate hinge cut locations.
  *
- *  g_ : double(m+1)
+ *  f_ : double(m+1) [in/out]
+ *      running accumulator for the hinge projection; f[i] += k0*g[i]
+ *
+ *  g_ : double(m+1) [in/out]
+ *      running accumulator for the basis-weighted ortho-basis; g[i] += k1*x[i]
  *
  *  x : float(m)
- *      a row from the matrix of ortho-normalized and pre-sorted existing basis,
- *      elsewhere in the code this is referred to as `Bo[k]`.
+ *      a row from the ortho-normalized and pre-sorted existing basis matrix
+ *      (referred to as `Bok` in the calling code).
  *
  *  y : double(m)
- *      the result of `dot(Bo.T,y)`
+ *      the result of `dot(Bo.T, y)`, i.e. projection of existing basis onto target.
  *
- *  xm: float
- *      the value at `x[m]` which holds the new candidate regressor.
+ *  xm : float
+ *      the ortho-normalized candidate basis value at this sorted position (index m).
  *
- *  ym: double
- *      the value at `y[m]` which holds the new candidate regressor.
+ *  ym : double
+ *      the projection of the candidate basis column onto the target (index m).
  *
- *  k0 :
+ *  k0 : double
+ *      spacing between the previous and current sorted x values: `x[k[i-1]] - x[k[i]]`.
  *
- *  k1 :
+ *  k1 : float
+ *      basis value at the current sorted position: `B[k[i], bcol]`.
  */
 cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
                  double xm, double ym, double k0, float k1, int m)
@@ -123,7 +131,7 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
     assert(f_.rows()==m+1);
     assert(g_.rows()==m+1);
 
-    // Cast to raw pointers, as the the `[]` operator is surprisingly expensive!
+    // Cast to raw pointers, as the `[]` operator is surprisingly expensive!
     double *f = f_.data();
     double *g = g_.data();
 
@@ -324,6 +332,33 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         const MatrixXf &B = _data->B;
         const ArrayXd  &y = _data->y;
 
+        /*
+         *  For each parent basis column b = B[:,bcols[j]], sweep potential hinge
+         *  cut locations from largest to smallest x (descending sort order). At
+         *  each cut h = x[k[i]] we evaluate the positive hinge h_plus = b*max(x-h,0),
+         *  which is nonzero only for the i samples above the cut.
+         *
+         *  `covariates()` maintains f/g to track the projection of h_plus onto the
+         *  existing ortho-basis (Bo) AND the linear candidate (Bx[:,j]). The local
+         *  accumulators below build up the remaining terms needed for the delta-SSE:
+         *
+         *    b2   = sum_{j<i} b[k[j]]^2             (squared norm of b above cut)
+         *    vb   = sum_{j<i} b[k[j]] * y[k[j]]     (dot product <b,y> above cut)
+         *    bd   = sum_{j<i} b[k[j]]^2 * (x[k[j]] - h)  (helper for k0/k1 update)
+         *    k0+k1 = ||h_plus||^2                    (squared norm of positive hinge)
+         *    w    = h_plus^T * y                     (dot product of hinge with target)
+         *
+         *  Note: b2, vb, bd are updated AFTER computing the SSE for cut i, so they
+         *  always reflect the i samples above the current cut (0..i-1), not 0..i.
+         *
+         *  Final SSE formula at each cut:
+         *    den = ||h_plus||^2 - ||proj_{Bo,Bx}(h_plus)||^2  = ||h_plus_perp||^2
+         *    uw  = h_plus^T * proj_{Bo,Bx}(y) - h_plus^T * y  = -(h_plus_perp^T * y_perp)
+         *    sse = uw^2 / den  (extra gain from the hinge beyond the linear candidate)
+         *
+         *  The final hinge_dsse = linear_dsse + hinge_sse captures the combined gain
+         *  from the full hinge pair (h_plus and h_minus together).
+         */
         for (int j = 0; j < p; ++j) {
             ArrayXd f = ArrayXd::Zero(m+1);
             ArrayXd g = ArrayXd::Zero(m+1);
@@ -348,9 +383,9 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
                 y_k  = y [k[i]];
                 cov_t o = covariates(f,g,Bok.row(i).data(),ybo,bx_k,ybx[j],d[i],b_k,m);
 
-                k0 = fma(d[i]*d[i],b2,k0);
+                k0 = fma(d[i]*d[i],b2,k0); // build up ||h_plus||^2 incrementally
                 k1 = fma(d[i]*2,bd,k1);
-                w  = fma(d[i],vb,w);
+                w  = fma(d[i],vb,w);        // w = h_plus^T * y
                 bd = fma(d[i],b2,bd);
                 b2 = fma(b_k,b_k,b2);
                 vb = fma(y_k,b_k,vb);
