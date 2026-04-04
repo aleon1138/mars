@@ -25,7 +25,7 @@ format:
 	astyle -A4 -S -z2 -n -j *.h *.cc
 
 unittest: unittest.cc marsalgo.cc marsalgo.h
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) unittest.cc marsalgo.cc -lgtest -lpthread -o $@
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) unittest.cc marsalgo.cc -lgtest -lgtest_main -lpthread -o $@
 
 clean:
 	rm -rf __pycache__/ build/ mars.egg-info/ unittest $(TARGET) dist

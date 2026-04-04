@@ -447,11 +447,3 @@ TEST(MarsTest, DeltaSSE)
         ASSERT_TRUE(res.hinge_cut.isApprox(foo.hinge_cut));
     }
 }
-
-///////////////////////////////////////////////////////////////////////////////
-
-int main(int argc, char *argv[])
-{
-    ::testing::InitGoogleTest(&argc,argv);
-    return RUN_ALL_TESTS();
-}
