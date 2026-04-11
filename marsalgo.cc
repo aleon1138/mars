@@ -59,13 +59,13 @@ ArrayXi nonzero(const ArrayXb &x)
  *  of normalized basis `Bo`.
  *
  *  Bx : double(n,p) [out]
- *      returns `B[:,mask] .* x` (element-wise), ortho-normalized against `Bo`
+ *      returns `B[:,mask] .* x` (element-wise), orthonormalized against `Bo`
  *
  *  B : float(n,m)
  *      the existing set of basis.
  *
  *  Bo : double(n,m)
- *      the existing set of ortho-normalized basis.
+ *      the existing set of orthonormalized basis.
  *
  *  x : float(n)
  *      the candidate regressor.
@@ -107,14 +107,14 @@ struct cov_t {
  *      running accumulator for the basis-weighted ortho-basis; g[i] += k1*x[i]
  *
  *  x : float(m)
- *      a row from the ortho-normalized and pre-sorted existing basis matrix
+ *      a row from the orthonormalized and pre-sorted existing basis matrix
  *      (referred to as `Bok` in the calling code).
  *
  *  y : double(m)
  *      the result of `dot(Bo.T, y)`, i.e. projection of existing basis onto target.
  *
  *  xm : float
- *      the ortho-normalized candidate basis value at this sorted position (index m).
+ *      the orthonormalized candidate basis value at this sorted position (index m).
  *
  *  ym : double
  *      the projection of the candidate basis column onto the target (index m).
@@ -137,7 +137,7 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
 
     verify(reinterpret_cast<uintptr_t>(f) % 16 == 0, "f is not aligned");
     verify(reinterpret_cast<uintptr_t>(g) % 16 == 0, "g is not aligned");
-    //verify(reinterpret_cast<uintptr_t>(x) % 16 == 0); // NOTE - this memory is coming in un-aligned
+    //verify(reinterpret_cast<uintptr_t>(x) % 16 == 0); // NOTE - this memory is coming in unaligned
     verify(reinterpret_cast<uintptr_t>(y) % 16 == 0, "y is not aligned");
 
 #ifndef __AVX__
@@ -196,7 +196,7 @@ struct MarsData {
     Map<const MatrixXf,Aligned,Stride<Dynamic,1>>  X;   // read-only view of the regressors
     ArrayXd     y;      // target vector
     MatrixXf    B;      // all basis
-    MatrixXdC   Bo;     // all basis, ortho-normalized
+    MatrixXdC   Bo;     // all basis, orthonormalized
     VectorXd    ybo;    // dot product of basis Bo with Y target
     ArrayXf     s;      // normalization constant for columns of 'X'
 };
