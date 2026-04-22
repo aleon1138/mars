@@ -356,32 +356,72 @@ def expand(X, model):
 # -----------------------------------------------------------------------------
 
 
-def prune(XX, XY, YY, n_true, penalty=3, ridge=0, mask=None):
+def gram(A, B=None, chunk_size=128):
+    """
+    Compute A.T @ B (or A.T @ A if B is None) with float64 accumulation.
+
+    Processes `chunk_size` rows at a time in the input dtype, upcasts each
+    chunk's product to float64, and accumulates. This preserves precision
+    for large n when A/B are float32, without the memory cost of a full
+    float64 matmul.
+
+    1D arrays are treated as column vectors. The result is squeezed to
+    match numpy's `@` conventions: scalar if both inputs are 1D, 1D if
+    exactly one is 1D, otherwise 2D.
+    """
+    if B is None:
+        B = A
+    assert len(A) == len(B)
+
+    A2 = A[:, np.newaxis] if A.ndim == 1 else A
+    B2 = B[:, np.newaxis] if B.ndim == 1 else B
+
+    out = np.zeros((A2.shape[1], B2.shape[1]), dtype="d")
+    for i in range(0, len(A), chunk_size):
+        out += (A2[i : i + chunk_size].T @ B2[i : i + chunk_size]).astype("d")
+
+    if A.ndim == 1 and B.ndim == 1:
+        return float(out[0, 0])
+    if A.ndim == 1:
+        return out[0]
+    if B.ndim == 1:
+        return out[:, 0]
+    return out
+
+
+# -----------------------------------------------------------------------------
+
+
+def prune(B, y, w=None, n_true=None, penalty=3, ridge=0, mask=None):
     """
     Solve for the linear coefficients using backward stepwise selection (GCV pruning).
 
+    Columns of B are internally standardized (unit diagonal of the Gram
+    matrix) so that `ridge` has a consistent effect across features. The
+    returned coefficients are in the original (un-standardized) scale.
+
     Parameters
     ----------
-    XX : array (M, M)
-        Gram matrix B.T @ B, where B is the basis matrix from `expand()`.
+    B : array (n, M)
+        Basis matrix from `expand()`.
 
-    XY : array (M,)
-        Cross-product vector B.T @ y.
+    y : array (n,)
+        Target vector.
 
-    YY : float
-        Sum of squares y.T @ y.
+    w : array (n,) or None
+        Observation weights for WLS. None means uniform.
 
-    n_true : int
-        Number of truly independent samples, used for GCV degrees-of-freedom adjustment.
+    n_true : int or None
+        Number of truly independent samples for GCV. None means len(B).
 
     penalty : float (default=3)
         GCV smoothing penalty. See `fit()` parameter of the same name.
 
     ridge : float (default=0)
-        L2 regularization added to the diagonal of XX before solving.
+        L2 regularization applied on the standardized scale.
 
     mask : bool array (M,) or None
-        Initial mask of which basis terms to consider. None means all terms.
+        Initial mask of which basis terms to consider. None means all.
 
     Returns
     -------
@@ -402,15 +442,36 @@ def prune(XX, XY, YY, n_true, penalty=3, ridge=0, mask=None):
         sse = yy - np.dot(xy, _solve(xx, xy, mask))
         return sse / (1.0 - dof / n_true) ** 2
 
+    n, M = B.shape
+    if n_true is None:
+        n_true = n
+
+    # Fold weights into B and y via sqrt(w) so WLS becomes plain OLS
+    if w is not None:
+        sw = np.sqrt(np.asarray(w, dtype=B.dtype))
+        B = B * sw[:, np.newaxis]
+        y = y * sw
+
+    # Compute Gram matrices with float64 accumulation
+    XX = gram(B)
+    XY = gram(B, y)
+    YY = gram(y, y)
+
+    # Standardize columns so diag(XX) == 1 on active columns
+    d = np.sqrt(np.diag(XX))
+    active = d > 0
+    d_safe = np.where(active, d, 1.0)
+    XX = XX / d_safe / d_safe[:, np.newaxis]
+    XY = XY / d_safe
+
     # Differs from Friedman (1991) Section 3.4 in two ways:
     # 1. We minimize GCV directly at each elimination step rather than
     #    removing the term with the smallest RSS increase and selecting
     #    the best GCV subset post-hoc.
     # 2. The intercept is not protected and may be removed if doing so
     #    improves GCV.
-    M = len(XX)
     mask = np.array(mask) if mask is not None else np.ones(M, dtype="bool")
-    mask = mask & (np.diag(XX) > 0)
+    mask = mask & active
     m = mask.sum()
     dof = m + penalty * (m - 1)
     best_sse = _gcv_sse(XX, XY, YY, mask, dof, n_true)
@@ -433,9 +494,8 @@ def prune(XX, XY, YY, n_true, penalty=3, ridge=0, mask=None):
     mask = best_mask
 
     if ridge > 0:
-        assert np.allclose(np.diag(XX)[mask], np.ones(mask.sum()))
         XX = XX + np.eye(len(XX)) * ridge
-    return _solve(XX, XY, mask)
+    return _solve(XX, XY, mask) / d_safe
 
 
 # -----------------------------------------------------------------------------
