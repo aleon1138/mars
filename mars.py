@@ -441,6 +441,62 @@ def prune(XX, XY, YY, n_true, penalty=3, ridge=0, mask=None):
 # -----------------------------------------------------------------------------
 
 
+def compact(model, beta):
+    """
+    Remove pruned basis nodes and return a smaller model and beta.
+
+    Nodes with nonzero beta are kept, along with any ancestors required
+    to maintain parent-child relationships. Ancestors added back purely
+    for structural reasons get a beta of zero.
+
+    Parameters
+    ----------
+    model : structured array
+        Model array as returned by `fit()`.
+
+    beta : array (M,)
+        Coefficient vector as returned by `prune()`.
+
+    Returns
+    -------
+    model : structured array
+        Compacted model with pruned nodes removed.
+
+    beta : array
+        Corresponding coefficient vector.
+    """
+    M = len(model)
+    keep = np.zeros(M, dtype="bool")
+
+    # Mark nodes with nonzero beta
+    for i in range(M):
+        if beta[i] != 0:
+            keep[i] = True
+
+    # Walk up parent chains to keep all ancestors
+    for i in range(M):
+        j = i
+        while keep[j] and model[j]["type"] != b"i":
+            j = model[j]["basis"]
+            keep[j] = True
+
+    # Build old-to-new index mapping
+    new_idx = np.full(M, -1, dtype="i4")
+    new_idx[keep] = np.arange(keep.sum())
+
+    # Build compacted model and beta
+    new_model = model[keep].copy()
+    new_beta = beta[keep].copy()
+    for i in range(len(new_model)):
+        if new_model[i]["type"] != b"i":
+            new_model[i]["basis"] = new_idx[new_model[i]["basis"]]
+
+    return new_model, new_beta
+
+
+# -----------------------------------------------------------------------------
+
+
 def pprint(model, beta=None, labels=None):
     """
     Pretty-print the model. Useful for debugging.
