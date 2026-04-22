@@ -18,14 +18,15 @@ TARGET = marslib$(shell python3-config --extension-suffix)
 $(TARGET): marslib.cc marsalgo.cc marsalgo.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -shared -fPIC marslib.cc marsalgo.cc -o $@
 
-test: unittest
+test: unittest $(TARGET)
+	python3 -m pytest tests/ -v
 	./unittest
 
 format:
 	astyle -A4 -S -z2 -n -j *.h *.cc
 
-unittest: unittest.cc marsalgo.cc marsalgo.h
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) unittest.cc marsalgo.cc -lgtest -lgtest_main -lpthread -o $@
+unittest: tests/unittest.cc marsalgo.cc marsalgo.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) tests/unittest.cc marsalgo.cc -lgtest -lgtest_main -lpthread -o $@
 
 clean:
 	rm -rf __pycache__/ build/ mars.egg-info/ unittest $(TARGET) dist

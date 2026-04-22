@@ -402,23 +402,35 @@ def prune(XX, XY, YY, n_true, penalty=3, ridge=0, mask=None):
         sse = yy - np.dot(xy, _solve(xx, xy, mask))
         return sse / (1.0 - dof / n_true) ** 2
 
+    # Differs from Friedman (1991) Section 3.4 in two ways:
+    # 1. We minimize GCV directly at each elimination step rather than
+    #    removing the term with the smallest RSS increase and selecting
+    #    the best GCV subset post-hoc.
+    # 2. The intercept is not protected and may be removed if doing so
+    #    improves GCV.
     M = len(XX)
     mask = np.array(mask) if mask is not None else np.ones(M, dtype="bool")
     mask = mask & (np.diag(XX) > 0)
-    dof = M + penalty * (M - 1)
-    min_sse = _gcv_sse(XX, XY, YY, mask, dof, n_true)
+    m = mask.sum()
+    dof = m + penalty * (m - 1)
+    best_sse = _gcv_sse(XX, XY, YY, mask, dof, n_true)
+    best_mask = mask.copy()
 
-    while True:
-        sse = np.ones(M) * np.inf
+    # Eliminate terms one at a time, tracking the globally best GCV.
+    while mask.sum() > 0:
+        sse = np.full(M, np.inf)
         for i in np.where(mask)[0]:
-            k = mask & (np.arange(len(mask)) != i)
-            dof = sum(k) + penalty * (sum(k) - 1)
+            k = mask & (np.arange(M) != i)
+            m = k.sum()
+            dof = m + penalty * (m - 1)
             sse[i] = _gcv_sse(XX, XY, YY, k, dof, n_true)
-        if sse.min() >= min_sse:
-            break
         mask[np.argmin(sse)] = False
-        min_sse = sse.min()
-        assert np.isfinite(min_sse)
+        if sse.min() < best_sse:
+            best_sse = sse.min()
+            best_mask = mask.copy()
+            assert np.isfinite(best_sse)
+
+    mask = best_mask
 
     if ridge > 0:
         assert np.allclose(np.diag(XX)[mask], np.ones(mask.sum()))

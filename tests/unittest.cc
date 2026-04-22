@@ -1,4 +1,4 @@
-#include "marsalgo.h"
+#include "../marsalgo.h"
 #include <Eigen/Dense>
 #include <gtest/gtest.h>
 #include <vector>

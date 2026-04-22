@@ -1,5 +1,5 @@
-unittest
-marslib.so
 __pycache__/
 build/
 mars.egg-info/
+marslib*.so
+unittest
