@@ -135,10 +135,9 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
     double *f = f_.data();
     double *g = g_.data();
 
-    verify(reinterpret_cast<uintptr_t>(f) % 16 == 0, "f is not aligned");
-    verify(reinterpret_cast<uintptr_t>(g) % 16 == 0, "g is not aligned");
-    //verify(reinterpret_cast<uintptr_t>(x) % 16 == 0); // NOTE - this memory is coming in unaligned
-    verify(reinterpret_cast<uintptr_t>(y) % 16 == 0, "y is not aligned");
+    assert(reinterpret_cast<uintptr_t>(f) % 16 == 0);
+    assert(reinterpret_cast<uintptr_t>(g) % 16 == 0);
+    assert(reinterpret_cast<uintptr_t>(y) % 16 == 0);
 
 #ifndef __AVX__
     int m0 = 0;
