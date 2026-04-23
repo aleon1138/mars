@@ -71,6 +71,19 @@ double slow_mse(MatrixXd X, VectorXd y)
     return mse / y.squaredNorm();
 }
 
+// Closed-form WLS: minimizes sum(w * (y - X b)²); returns sum(w*e²)/n / sum(w*y²).
+double slow_mse_w(MatrixXd X, VectorXd y, VectorXd w)
+{
+    ArrayXd  sw = w.array().sqrt();
+    MatrixXd Xw = (X.array().colwise() * sw).matrix();
+    VectorXd yw = (y.array() * sw).matrix();
+    VectorXd b  = Xw.fullPivHouseholderQr().solve(yw);
+    VectorXd e  = X * b - y;
+    double wsse = (w.array() * e.array().square()).sum();
+    double wyy  = (w.array() * y.array().square()).sum();
+    return (wsse / e.rows()) / wyy;
+}
+
 struct Result {
     Result(MarsAlgo &algo, int xcol, const ArrayXb &mask, bool linear)
     {
@@ -446,4 +459,51 @@ TEST(MarsTest, DeltaSSE)
         ASSERT_TRUE(res.hinge_dsse.isApprox(foo.hinge_dsse));
         ASSERT_TRUE(res.hinge_cut.isApprox(foo.hinge_cut));
     }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Verify that MarsAlgo reproduces the closed-form WLS solution under
+// non-uniform observation weights. This exercises the sqrt(w) scaling
+// in the constructor.
+TEST(MarsTest, WeightedLS)
+{
+    srand(0);
+
+    const int N = 1000;
+    const int M = 4;
+
+    MatrixXd X(MatrixXd::Random(N, M));
+    ArrayXd  x1 = X.col(1).array();
+    ArrayXd  x2 = X.col(2).array();
+
+    VectorXd y = (x1 * 0.5 + x2 * 0.3).matrix();
+    y += VectorXd::Random(N) * 0.1;
+
+    // Non-uniform weights spanning ~3 orders of magnitude
+    VectorXd w(N);
+    for (int i = 0; i < N; ++i) {
+        w[i] = 0.01 + 10.0 * std::abs(X(i, 0));
+    }
+
+    MatrixXf X32 = X.cast<float>();
+    VectorXf y32 = y.cast<float>();
+    ArrayXf  w32 = w.cast<float>();
+
+    MarsAlgo algo(X32.data(), y32.data(), w32.data(), N, M, M, N);
+
+    MatrixXd ALL_B(N, 3);
+    ALL_B.col(0) = VectorXd::Ones(N);
+
+    // Add x1 as a linear basis and compare to closed-form WLS
+    double mse1 = algo.append('l', 1, 0, 0);
+    ALL_B.col(1) = x1.matrix();
+    double mse2 = slow_mse_w(ALL_B.leftCols(2), y, w);
+    ASSERT_NEAR(mse1, mse2, 1e-7);
+
+    // Add x2 and re-check
+    mse1 = algo.append('l', 2, 0, 0);
+    ALL_B.col(2) = x2.matrix();
+    mse2 = slow_mse_w(ALL_B.leftCols(3), y, w);
+    ASSERT_NEAR(mse1, mse2, 1e-7);
 }

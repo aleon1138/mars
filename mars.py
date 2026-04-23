@@ -63,6 +63,12 @@ def fit(X, y, w=None, **kwargs):
 
     Parameters
     ----------
+    w : array (n,) (default=None)
+        Observation weights for weighted least squares. None means uniform.
+        The fitted objective is `Σ wᵢ(yᵢ - f(xᵢ))²`, so `w = 1/σ²` for
+        heteroskedastic fitting, or relative importance weights otherwise.
+        This matches R's `lm(weights=)`, statsmodels, and sklearn semantics.
+
     max_epochs : int (default=min(p + n/20, 15)), where X is (n x p)
         The maximum number of epochs in the forward pass.
 
@@ -409,7 +415,8 @@ def prune(B, y, w=None, n_true=None, penalty=3, ridge=0, mask=None):
         Target vector.
 
     w : array (n,) or None
-        Observation weights for WLS. None means uniform.
+        Observation weights for WLS. None means uniform. Objective is
+        `Σ wᵢ(yᵢ - f(xᵢ))²`, so pass `1/σ²` for heteroskedastic fitting.
 
     n_true : int or None
         Number of truly independent samples for GCV. None means len(B).

@@ -208,7 +208,9 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
 
     ArrayXd vv;
     _data->y = Map<const ArrayXf>(y,n).cast<double>();  // copy and upcast
-    vv       = Map<const ArrayXf>(w,n).cast<double>();  // copy and upcast
+    // For WLS we scale rows by sqrt(w), so that the OLS objective on the
+    // transformed problem equals the weighted RSS on the original.
+    vv       = Map<const ArrayXf>(w,n).cast<double>().sqrt();
 
     //---------------------------------------------------------------------
     // Filter out NAN's and apply weight to the target 'y'.
@@ -218,7 +220,7 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
             _data->y[i] = vv[i] = 0;
         }
     }
-    _data->y *= vv; // apply weight to target
+    _data->y *= vv; // apply sqrt(w) to target
 
     double y_norm = _data->y.matrix().norm();
     double w_norm = vv.matrix().norm();

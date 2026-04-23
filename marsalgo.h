@@ -14,6 +14,13 @@ class MarsAlgo {
     double  _tol  = 0;  // numerical error tolerance
 
 public:
+    /*
+     *  Construct a MarsAlgo over training data (x, y) with per-row weights w.
+     *  Weights follow inverse-variance semantics: the fitted objective is
+     *  Sum_i w_i * (y_i - f(x_i))^2, matching R's lm(weights=), statsmodels,
+     *  and sklearn. For heteroskedastic fitting pass w_i = 1/sigma_i^2.
+     *  Uniform weights (w=1) recover ordinary least squares.
+     */
     MarsAlgo(const float *x, const float *y, const float *w, int n, int m, int p, int ldx);
     ~MarsAlgo();
 
