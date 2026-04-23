@@ -87,7 +87,7 @@ def fit(X, y, w=None, **kwargs):
         or linear basis function during the forward pass.
         See the 'd' parameter in equation 32, Friedman, 1991.
 
-    tail_span : float (default=0.05)
+    tail_span : float (default=0.02)
         Fraction of samples at the tails of the training data to ignore.
         Prevents hinge formation at the extreme tails of the input range.
 
@@ -116,13 +116,14 @@ def fit(X, y, w=None, **kwargs):
           * total max epochs to run
           * a dict with information about the last basis found
 
-    r2_window : int (default=16)
-        Length of the rolling window in which a smoothed delta R² is measured.
-        This is used a stopping criteria.
+    r2_window : int (default=32)
+        Early-stopping patience: stop if GCV R² has not set a new (near-)best
+        value in the last `r2_window` epochs.
 
     r2_thresh : float (default=3e-5)
-        Stop the fit if the GCV R² increases less than this. Used in conjunction
-        with 'r2_window'.
+        Tolerance used with `r2_window`: an epoch's GCV R² counts as a new
+        best if it is within `r2_thresh` of the best seen so far. Also used
+        as the "essentially perfect fit" threshold (stop when R² > 1 - r2_thresh).
 
     aging_factor : float (default=1.0)
         Used to increase visibility of features not used in a while. See Eq 27
@@ -155,14 +156,14 @@ def fit(X, y, w=None, **kwargs):
     max_epochs    = kwargs.pop('max_epochs', min(X.shape[1]+len(X)//20, 15))
     max_degree    = kwargs.pop('max_degree', 3)
     penalty       = kwargs.pop('penalty', 3.0)
-    tail_span     = kwargs.pop('tail_span', 0.05)
+    tail_span     = kwargs.pop('tail_span', 0.02)
     max_runtime   = kwargs.pop('max_runtime', 48*3600) # in seconds
     self_interact = kwargs.pop('self_interact', False)
     linear_only   = kwargs.pop('linear_only', False)
     n_true        = kwargs.pop('n_true', len(X))
     logger        = kwargs.pop('logger', None)
     callback      = kwargs.pop("callback", None)
-    r2_window     = kwargs.pop('r2_window', 16) # window over which to measure R2
+    r2_window     = kwargs.pop('r2_window', 32) # window over which to measure R2
     r2_thresh     = kwargs.pop('r2_thresh', 3e-5)
     labels        = kwargs.pop('labels', None)
     aux_filter    = kwargs.pop('xfilter', lambda x,b: True)
@@ -180,7 +181,6 @@ def fit(X, y, w=None, **kwargs):
     # Equation numbers refer to the original MARS paper
     get_dof = lambda m: m + penalty * (m - 1)  # Eq. (31,32)
     gcv_adj = lambda mse, m: mse / (1.0 - get_dof(m) / n_true) ** 2  # Eq. (30)
-    avg_diff = lambda x, n: np.sort(np.diff(x))[1:-1].mean() if len(x) > n else np.nan
 
     # Set up a basic filter which caps the polynomial degree of basis and optionally
     # prevents features from interacting with themselves. Here 'i' is the index of the
@@ -307,15 +307,16 @@ def fit(X, y, w=None, **kwargs):
             callback(epoch, len(basis), max_epochs, model[m - 1])
 
         # Stopping conditions
-        model_tail = model[max(algo.nbasis() - r2_window - 1, 0) : algo.nbasis()]
         if m == m0:
             break  # no progress
-        if model_tail[-1]["r2"] > 1 - r2_thresh:
+        if model[m - 1]["r2"] > 1 - r2_thresh:
             break  # R2 almost reached 100%
         if dt > max_runtime:
             break  # exceed max runtime
-        if avg_diff(model_tail["r2_cv"], r2_window) < r2_thresh:
-            break  # no progress in GCV R2
+        # Patience: stop if no new (near-)best GCV R² in the last r2_window epochs.
+        r2_cvs = model["r2_cv"][: algo.nbasis()]
+        if len(r2_cvs) > r2_window and r2_cvs[-r2_window:].max() < r2_cvs.max() - r2_thresh:
+            break
 
     return model[: algo.nbasis()]
 
