@@ -1,0 +1,418 @@
+# MARS improvements — TODO
+
+Context for future-me: this is a roadmap of four improvements to the
+`aleon1138/mars` codebase, ordered roughly from cheapest to most invasive.
+The first three sit on top of the existing hinge-basis design; the fourth
+(BMARS) replaces the internal linear algebra wholesale. They are independent
+in principle — you can ship (1)–(3) without touching (4) — but (3) and (4)
+compose particularly well.
+
+The underlying motivation across all four is the same observation: stock MARS
+becomes numerically unreliable at interaction order $\geq 3$ on correlated
+features. The Gram matrix loses effective rank, GCV rankings become noisy,
+and the backward pass cannot be trusted to remove redundant terms. Each item
+below addresses some part of that failure chain.
+
+---
+
+## 1. Add `minspan` filter to the forward-pass candidate search
+
+### What it is
+
+`minspan` is a minimum gap, in number of observations along sorted $x_v$,
+between any two candidate knots considered for variable $v$ in a single
+forward step. It is implemented as a **stride through the sorted candidate
+list**, not a post-hoc check against the current model. This is important
+because it makes the implementation trivial and the guarantee global:
+no two candidates anywhere in the search are within `minspan` data points
+of each other, so no two hinges in the final model can be either.
+
+### Why it matters
+
+Two hinges $(x - t_1)_+$ and $(x - t_2)_+$ with $t_2$ adjacent to $t_1$ in
+the sorted data differ by an indicator on a single observation. Their inner
+product is essentially equal to either's self-inner-product, which makes the
+columns of $X^\top X$ near-collinear. This is the smallest-scale instance of
+the conditioning problem that becomes catastrophic at high interaction order.
+`minspan` doesn't fix the fundamental issue (item 4 does), but it eliminates
+the trivial collisions cheaply.
+
+### Friedman's default formula
+
+$$
+\text{minspan} = \left\lfloor \frac{-\log_2\!\left(-\frac{1}{N \alpha} \log(1 - \alpha)\right)}{2.5} \right\rfloor
+$$
+
+with $\alpha = 0.05$ as the default. Order-statistic argument: given $N$
+samples, this is roughly the expected gap below which an apparent kink is
+indistinguishable from a chance fluctuation. For typical $N \in [10^3, 10^6]$
+this gives `minspan` in the range 1–5.
+
+### Implementation
+
+```python
+# pseudocode — pre-sort each variable once at startup
+sorted_x = np.sort(x_v)
+candidates = sorted_x[endspan : N - endspan : minspan]
+```
+
+In C++/Blaze: hold a per-variable sorted-index array; the candidate loop
+becomes a strided iteration. The Gram update machinery is unchanged — you
+just feed it fewer candidates.
+
+### Knobs to expose
+
+- `minspan = -1` → auto, use Friedman's formula.
+- `minspan = 0` → no filter (legacy behavior, useful for unit tests).
+- `minspan = k` for positive `k` → fixed stride.
+
+### Validation
+
+Fit a synthetic dataset with known structure ($k=2$ Friedman benchmark,
+$N=1000$, noise $\sigma=1$), with `minspan = 0` and the formula default.
+Plot the GCV path. With `minspan = 0` you should see jaggedness in the
+late forward steps; with the default it should be smoother. The final
+test-set MSE should be at least as good with the filter on, often better.
+
+---
+
+## 2. Fix `endspan` logic
+
+### What it is
+
+Sibling parameter to `minspan`. Same idea, applied at the **boundaries** of
+the data: minimum gap between the smallest/largest data point and the
+first/last candidate knot for each variable.
+
+### Why a separate parameter
+
+Boundary knots are asymmetrically dangerous. A hinge with knot $t$ near
+$\min(x_v)$ has support $[t, \infty)$ that extends past every data point —
+it will dominate extrapolation at the boundary even though it's supported by
+very few in-sample observations. The cost of a bad boundary knot is therefore
+much higher than the cost of a bad interior knot, which justifies a
+separate (and larger) gap.
+
+### Friedman's default formula
+
+$$
+\text{endspan} = 3 - \log_2(\alpha / d)
+$$
+
+where $d$ is the number of input variables and $\alpha$ is the same small
+probability as in `minspan` (default 0.05). Note this is a fixed constant
+plus a $\log d$ correction — it does not depend on $N$. Typical values are
+in the range 10–30.
+
+### Likely bug in current implementation
+
+Things to audit when you get back to this:
+
+- Check that `endspan` is applied **symmetrically** at both ends of the
+  sorted candidate array. A common bug is to apply it only at the lower end.
+- Check that `endspan` scales with $d$ (number of input variables) per the
+  formula, not just $N$ or constants.
+- Check that `endspan` and `minspan` are **both** applied — the slice should
+  be `sorted_x[endspan : N - endspan : minspan]`, not one or the other.
+- Check the auto/default path actually invokes the formula vs. a hardcoded
+  constant.
+- For tensor-product candidates, `endspan` should be applied per-axis
+  independently, just like `minspan`.
+
+### Validation
+
+Compare against `earth` in R on the same dataset with the same
+`(minspan, endspan)` settings. The forward-pass knot picks should match
+exactly when the random seed is controlled. If they diverge, the bug is in
+the candidate generation, not the GCV.
+
+---
+
+## 3. Knot tuning — 1D refinement after each forward pick
+
+### What it is
+
+After the forward pass picks a knot $t^* \in \{\tau_i\}$ from the discrete
+candidate grid, do a **local 1D line search** to refine $t^*$ to the
+RSS-minimizing position in the open interval $(\tau_{i-1}, \tau_{i+1})$.
+Brent's method or golden-section search both work; bracket is the two
+adjacent grid points.
+
+### Why this is worth doing
+
+Friedman discussed and **rejected** knot tuning in 1991 on cost grounds —
+the line search is $\mathcal{O}(N)$ per step and he wanted forward selection
+cheap. On modern hardware (especially with cached partial residuals from the
+fast-MARS framework already being used), each line search is sub-millisecond
+even for $N = 10^6$. The cost calculus is inverted.
+
+Bakin/Hegland/Osborne (2000) re-investigated this in the BMARS paper and
+reported it improves the forward-pass quality. They have a figure
+"Results of experiment with knot tuning procedure" in the published version.
+
+### Mechanics
+
+After the discrete pick, you have:
+
+- The chosen variable $v$ and the chosen grid knot $\tau_i$.
+- The current basis $\{B_1, \ldots, B_M\}$ and the residual vector $r$ from
+  the previous step.
+- Cached $\langle B_j, B_{M+1}(t)\rangle$ for the candidate basis function
+  $B_{M+1}(t) = (\text{parent}) \cdot (x_v - t)_+$.
+
+Define $\rho(t) = \text{RSS}$ when $B_{M+1}(t)$ is added to the model with
+its optimal least-squares coefficient. This is a smooth function of $t$ on
+$(\tau_{i-1}, \tau_{i+1})$ (the breakpoint at $\tau_i$ is removed when you
+allow $t$ to move continuously). Run Brent on $\rho(t)$ in that interval.
+
+Cost analysis: each evaluation of $\rho(t)$ at a new $t$ requires recomputing
+the inner products $\langle B_j, B_{M+1}(t)\rangle$ for $j = 1, \ldots, M$
+and $\langle y, B_{M+1}(t)\rangle$. That's $\mathcal{O}(MN)$ if done naively,
+but only the data points in the support of $B_{M+1}(t)$ contribute and the
+support changes incrementally with $t$ — so with sorted indexing you can
+update incrementally in $\mathcal{O}(M)$ per Brent step. Brent typically
+converges in 5–10 steps. Total added cost per forward step:
+$\mathcal{O}(M)$ in the best case, $\mathcal{O}(MN/K)$ if you're lazy where
+$K$ is the candidate grid size.
+
+### Implementation order
+
+Do this **after** (1) and (2) are working — knot tuning amplifies the
+quality of the discrete pick, which itself depends on a clean candidate
+filter. Wire in the line search as a refinement step that runs after the
+discrete forward pass and before committing the basis function.
+
+### Validation
+
+Same Friedman-benchmark setup as before. With knot tuning on, the test-set
+MSE should improve at fixed $M$ (model size). Equivalently, you should reach
+the same MSE with fewer basis functions. The improvement is largest when
+the underlying signal has knot-like discontinuities at non-grid positions
+(easy to construct synthetically: $f(x) = \mathbb{1}[x > 0.4137]$ and let
+the grid be aligned to quantiles that don't include 0.4137).
+
+### Composition with item 4
+
+Knot tuning composes well with the BMARS reformulation: the B-spline
+representation gives you sub-grid resolution via the basis, and tuning gives
+you sub-grid resolution at the *individual knot* level. Together you get
+something strictly better than either alone.
+
+---
+
+## 4. BMARS basis reformulation
+
+### What it is
+
+A change of basis that's **purely internal to the linear algebra**. The user
+still sees a hinge-basis MARS model, the API and serialization are
+unchanged, but the matrices you actually factor and update are formed in a
+compactly-supported B-spline basis where the Gram is banded and well-
+conditioned.
+
+### Why this is the real fix
+
+Items (1)–(3) reduce the *frequency* of conditioning failures. They don't
+fix the underlying problem, which is that truncated power basis functions
+$(x - t)_+$ have **unbounded support** — they grow without bound for
+$x > t$. Every pair of such basis functions has substantial overlap in
+their tails, and at high interaction order the joint support is enormous.
+
+B-splines have **compact support** — they are exactly zero outside a bounded
+interval. Two B-splines have non-zero inner product only if their supports
+physically overlap. The Gram matrix becomes banded (1D) or sparse with
+structured nonzero pattern (tensor product). Sparse Cholesky on the B-spline
+Gram is numerically much better-behaved than dense Cholesky on the hinge
+Gram, and the gap *widens* with interaction order rather than narrowing.
+
+### The change-of-basis identity (the math)
+
+For each variable $v$, set up an internal linear B-spline basis
+$\{\phi_1^v, \ldots, \phi_{K_v}^v\}$ on a knot grid
+$\tau_1^v < \tau_2^v < \cdots < \tau_{K_v}^v$. Choose the grid once at
+startup as evenly-spaced quantiles of $x_v$. $K_v \in [64, 256]$ is plenty
+for typical financial features.
+
+A linear B-spline $\phi_i^v$ centered at $\tau_i^v$ is the tent function
+
+$$
+\phi_i^v(x) = \begin{cases}
+(x - \tau_{i-1}^v) / (\tau_i^v - \tau_{i-1}^v) & \tau_{i-1}^v \leq x \leq \tau_i^v \\
+(\tau_{i+1}^v - x) / (\tau_{i+1}^v - \tau_i^v) & \tau_i^v \leq x \leq \tau_{i+1}^v \\
+0 & \text{otherwise}
+\end{cases}
+$$
+
+The key identity: any hinge $(x_v - \tau_i^v)_+$ with knot at a grid point
+can be written exactly as a linear combination of two adjacent B-splines
+plus a global linear term:
+
+$$
+(x_v - \tau_i^v)_+ \;=\; \alpha_i \cdot x_v + \beta_i + \sum_{j \geq i} w_j^{(i)} \, \phi_j^v(x_v)
+$$
+
+The weights $w_j^{(i)}, \alpha_i, \beta_i$ are determined by matching values
+at the grid points. Precompute these once at startup. Stack into a
+lower-triangular banded matrix $W^v \in \mathbb{R}^{K_v \times K_v}$.
+
+For tensor-product hinges (interactions), the joint expansion is the tensor
+product of the univariate expansions. The change-of-basis matrix is
+$W^{v_1} \otimes W^{v_2} \otimes \cdots \otimes W^{v_k}$, but you never
+materialize the Kronecker product — apply the factors as a sequence of
+banded matvecs.
+
+### Algorithm
+
+1. **Startup (once)**:
+   - For each variable $v$: compute knot grid $\{\tau_i^v\}$ as quantiles.
+   - Build $\Phi^v \in \mathbb{R}^{N \times K_v}$, the B-spline design matrix.
+     Each row has at most 2 nonzeros; store sparse.
+   - Compute $\Phi^{v\top}\Phi^v \in \mathbb{R}^{K_v \times K_v}$ — banded.
+   - Compute the change-of-basis matrix $W^v$.
+
+2. **Forward pass**:
+   - Each existing hinge basis function $B_j$ is stored *additionally* as a
+     coefficient vector $\beta_j$ in the (tensor) B-spline basis.
+   - To evaluate a candidate hinge $B_{M+1}$: compute its $\beta_{M+1}$ via
+     the change-of-basis identity (cheap, sparse).
+   - Inner products: $\langle B_j, B_{M+1}\rangle = \beta_j^\top G \beta_{M+1}$
+     where $G$ is the (precomputed, banded) B-spline Gram. Banded matvec.
+   - Run the standard fast-MARS rank-1 update for the RSS reduction, but
+     using these Gram entries instead of dense ones.
+   - The internal Cholesky factor is on the B-spline Gram, not the hinge Gram.
+
+3. **Backward pass / GCV**:
+   - Unchanged in structure. The rank-1 downdates now operate on the
+     well-conditioned B-spline Gram, so GCV rankings are trustworthy.
+
+4. **Output**:
+   - Return the model in hinge form for interpretability and API
+     compatibility. The B-spline representation is purely internal.
+
+### Why "minimum viable cut" matters
+
+Don't try to do the full thing in one go. Stage it:
+
+**Stage 4a — univariate, linear B-splines, snap-to-grid knots.**
+~A few hundred lines. Replaces just the inner-product computation in the
+forward pass for univariate (non-interaction) terms. Validate on the
+Friedman benchmark — should match standard MARS to machine precision on
+well-conditioned cases and outperform it on ill-conditioned ones.
+
+**Stage 4b — extend to tensor-product interactions.**
+The Kronecker matvec is the only really new piece. Cost per inner product
+for an order-$k$ interaction is $\mathcal{O}(k \cdot K \cdot \text{nnz})$,
+which beats the hinge version's dense $\mathcal{O}(N)$ for any $K \ll N$.
+
+**Stage 4c — integrate with knot tuning (item 3).**
+Knot tuning in the B-spline basis is a 1D line search over the
+representation coefficients $\beta$, which is even cheaper than in the
+hinge basis because the support is bounded.
+
+**Stage 4d (optional) — quadratic B-splines for $C^1$ continuity.**
+This recovers Friedman's cubic-smoothing benefit (BMARS as published is
+purely $C^0$). A hinge isn't exactly representable in quadratic B-splines
+on a finite grid, but the error is a piecewise-quadratic correction that
+can be absorbed into the basis. Probably not worth doing until 4a–4c are
+solid and you have a concrete need for $C^1$.
+
+### Practical complications
+
+**Knot grid resolution vs. accuracy.** Snapping candidate knots to a grid
+of $K$ points gives up Friedman's continuous knot search. In practice this
+is fine — Friedman's own fast-MARS does subsampling that's morally
+equivalent — and item (3) above (knot tuning) gives you sub-grid resolution
+back where it matters.
+
+**Boundary handling.** Linear B-splines at the edges of the grid are
+half-tents. Add an explicit linear term to the basis to handle extrapolation
+cleanly, otherwise candidates near the boundary look weird.
+
+**The $W^v$ change-of-basis matrices.** Precompute once. Watch for
+off-by-one errors in the Kronecker composition for interactions — write
+unit tests that verify $B_j(x) = \beta_j^\top \Phi(x)$ pointwise on a
+random sample of $x$ values.
+
+**Hinge-basis interpretability.** Don't lose this. Always store the hinge
+representation as the primary; the B-spline coefficients are derived. When
+serializing fitted models, serialize the hinges. When loading, recompute
+the B-spline coefficients from the hinges.
+
+### Stack-specific notes
+
+- Blaze `CompressedMatrix` handles the banded B-spline Gram cleanly. The
+  existing `LLT` factorization works without modification.
+- The Kronecker matvecs for tensor-product interactions are inner-loop
+  AVX-512 candidates. Sort the B-spline support by knot index so memory
+  access is contiguous; this is essentially free cache-friendliness.
+- The f64 accumulation refactor done for the cross-machine (i7-7820X vs
+  EPYC 9845) divergence issue is more useful here than in the original code,
+  because the hinge-basis Gram was throwing away precision before the
+  accumulation step — so f64 accumulation was a partial fix. With B-spline
+  basis the conditioning win compounds with the accumulation precision win.
+- BLIS gives the dense ops for the final QR/Cholesky on the active model;
+  banded structure mostly bypasses BLAS in favor of hand-rolled banded
+  kernels. Worth profiling.
+
+### Validation
+
+Three regimes to test:
+
+1. **Well-conditioned, low-order**: fit standard Friedman benchmark with
+   $k=2$ interactions. B-spline backend should match hinge backend to
+   machine precision on test MSE.
+
+2. **Ill-conditioned, high-order**: construct a synthetic with $k=4$
+   interactions on highly correlated features (e.g., features generated as
+   $x_i = z + \epsilon_i$ for shared $z$). Hinge backend's GCV path should
+   show the characteristic noisy-plateau-then-spike pattern as conditioning
+   fails. B-spline backend's GCV path should be smooth and monotone in the
+   forward phase.
+
+3. **Real data**: pick one of the binance execution-cost surfaces. Compare
+   hinge backend vs B-spline backend on test-set MSE and on the stability
+   of the fitted model under bootstrap resampling. The B-spline backend
+   should produce models that are more stable across bootstrap samples
+   (fewer different basis functions selected), which is the practical
+   manifestation of better conditioning.
+
+---
+
+## Implementation order
+
+1. **Item 1 (`minspan`)** — easiest, biggest first improvement, catches
+   regressions in the candidate-generation code path. Do this first.
+2. **Item 2 (`endspan` audit/fix)** — do alongside item 1 since they share
+   the candidate-slice logic.
+3. **Item 3 (knot tuning)** — depends on (1) and (2) being correct.
+   Independent of item 4.
+4. **Item 4a (univariate BMARS)** — biggest win, but most invasive.
+   Validate against items 1–3 in well-conditioned regime first.
+5. **Item 4b (tensor-product BMARS)** — extension of 4a.
+6. **Item 4c (knot tuning in B-spline basis)** — composition step.
+7. **Item 4d (quadratic B-splines)** — only if needed.
+
+Items 1, 2, 3 can each ship as standalone improvements with their own
+benchmarks. Item 4 is a multi-month project; stage it carefully and keep
+the hinge-basis code path working as the validation oracle.
+
+---
+
+## References
+
+- Friedman, J.H. (1991), "Multivariate Adaptive Regression Splines",
+  *Annals of Statistics* 19(1):1–141. The original paper. `minspan` and
+  `endspan` formulas are in §3. Knot tuning is discussed and rejected
+  in §3.5 on cost grounds.
+
+- Friedman, J.H. (1993), "Fast MARS", Stanford Tech Report LCS110.
+  Cached partial residuals; the rank-1 update framework you're already
+  using.
+
+- Bakin, S., Hegland, M., Osborne, M.R. (2000), "Parallel MARS Algorithm
+  Based on B-splines", *Computational Statistics* 15:463–484. The BMARS
+  paper. Has the knot-tuning experiment for B-spline basis.
+
+- For the change-of-basis identity between truncated powers and B-splines:
+  de Boor, "A Practical Guide to Splines" (revised ed., 2001), §IX.
+  Standard reference; the identity is classical.
