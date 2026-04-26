@@ -155,7 +155,7 @@ def fit(X, y, w=None, **kwargs):
     assert X.dtype == "f", "X data must be 32-bit float"
     assert X.strides[0] == X.itemsize, "X data must be column-major"
     assert y.strides[0] == y.itemsize, "y data must be column-major"
-    assert len(X) == len(y) == len(w)
+    assert len(X) == len(y) == len(w), "input dataset length mismatch"
     assert len(X) > 0, "empty dataset"
 
     # fmt: off
@@ -185,18 +185,19 @@ def fit(X, y, w=None, **kwargs):
 
     start_t = time.time()
 
+    # Equation numbers refer to the original MARS paper
     if min_span is None:
         alpha = 1/X.shape[1]
         min_span = int(-np.log2(-np.log(1-alpha)/(n_true*alpha)) / 2.5)  # Eq. (43)
     min_span = max(min_span, 1)
 
-    # Equation numbers refer to the original MARS paper
     get_dof = lambda m: m + penalty * (m - 1)  # Eq. (31,32)
     gcv_adj = lambda mse, m: mse / (1.0 - get_dof(m) / n_true) ** 2  # Eq. (30)
 
-    # Set up a basic filter which caps the polynomial degree of basis and optionally
-    # prevents features from interacting with themselves. Here 'i' is the index of the
-    # feature to be added and 'b' is a list of features that exist in the parent basis.
+    # Set up a basic filter which caps the polynomial degree of basis and
+    # optionally prevents features from interacting with themselves. Here 'i'
+    # is the index of the feature to be added and 'b' is a list of features
+    # that exist in the parent basis.
     basic_filter = lambda i, b: (
         (len(b) < max_degree) and (self_interact or (i not in b))
     )
@@ -212,9 +213,9 @@ def fit(X, y, w=None, **kwargs):
     algo = marslib.MarsAlgo(X, y, w, max_terms)  # pylint: disable=c-extension-no-member
     var_y = algo.yvar()
 
-    # Set up the SSE caches. Note that for inputs, we initialize to +inf, so that
-    # we cover all inputs, even if they are temporarily masked. We then need to
-    # adjust the 'max_inputs' dynamically to account for these inf values.
+    # Set up the SSE caches. For inputs, we initialize to +inf, so that we cover
+    # all inputs, even if they are temporarily masked. We then need to adjust
+    # the 'max_inputs' dynamically to account for these values.
     epoch = 0
     basis_sse = np.array([0.0])
     input_sse = np.full(X.shape[1], np.inf)
@@ -325,6 +326,7 @@ def fit(X, y, w=None, **kwargs):
             break  # R2 almost reached 100%
         if dt > max_runtime:
             break  # exceed max runtime
+
         # Patience: stop if no new (near-)best GCV R² in the last r2_window epochs.
         r2_cvs = model["r2_cv"][: algo.nbasis()]
         if len(r2_cvs) > r2_window and r2_cvs[-r2_window:].max() < r2_cvs.max() - r2_thresh:
@@ -380,13 +382,13 @@ def gram(A, B=None, chunk_size=128):
     Compute A.T @ B (or A.T @ A if B is None) with float64 accumulation.
 
     Processes `chunk_size` rows at a time in the input dtype, upcasts each
-    chunk's product to float64, and accumulates. This preserves precision
-    for large n when A/B are float32, without the memory cost of a full
-    float64 matmul.
+    chunk's product to float64, and accumulates. This preserves precision for
+    large n when A/B are float32, without the memory cost of a full float64
+    matmul.
 
-    1D arrays are treated as column vectors. The result is squeezed to
-    match numpy's `@` conventions: scalar if both inputs are 1D, 1D if
-    exactly one is 1D, otherwise 2D.
+    1D arrays are treated as column vectors. The result is squeezed to match
+    numpy's `@` conventions: scalar if both inputs are 1D, 1D if exactly one is
+    1D, otherwise 2D.
     """
     if B is None:
         B = A
@@ -413,11 +415,12 @@ def gram(A, B=None, chunk_size=128):
 
 def prune(B, y, w=None, n_true=None, penalty=3, ridge=0, mask=None):
     """
-    Solve for the linear coefficients using backward stepwise selection (GCV pruning).
+    Solve for the linear coefficients using backward stepwise selection
+    (GCV pruning).
 
-    Columns of B are internally standardized (unit diagonal of the Gram
-    matrix) so that `ridge` has a consistent effect across features. The
-    returned coefficients are in the original (un-standardized) scale.
+    Columns of B are internally standardized (unit diagonal of the Gram matrix)
+    so that `ridge` has a consistent effect across features. The returned
+    coefficients are in the original (un-standardized) scale.
 
     Parameters
     ----------
@@ -525,9 +528,9 @@ def compact(model, beta):
     """
     Remove pruned basis nodes and return a smaller model and beta.
 
-    Nodes with nonzero beta are kept, along with any ancestors required
-    to maintain parent-child relationships. Ancestors added back purely
-    for structural reasons get a beta of zero.
+    Nodes with non-zero beta are kept, along with any ancestors required to
+    maintain parent-child relationships. Ancestors added back purely for
+    structural reasons get a beta of zero.
 
     Parameters
     ----------
@@ -548,7 +551,7 @@ def compact(model, beta):
     M = len(model)
     keep = np.zeros(M, dtype="bool")
 
-    # Mark nodes with nonzero beta
+    # Mark nodes with non-zero beta
     for i in range(M):
         if beta[i] != 0:
             keep[i] = True
