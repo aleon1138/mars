@@ -125,8 +125,9 @@ struct cov_t {
  *  k1 : float
  *      basis value at the current sorted position: `B[k[i], bcol]`.
  */
-cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
-                 double xm, double ym, double k0, float k1, int m)
+template <bool need_sse>
+cov_t covariates_impl(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
+                      double xm, double ym, double k0, float k1, int m)
 {
     assert(f_.rows()==m+1);
     assert(g_.rows()==m+1);
@@ -139,9 +140,10 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
     assert(reinterpret_cast<uintptr_t>(g) % 16 == 0);
     assert(reinterpret_cast<uintptr_t>(y) % 16 == 0);
 
+    cov_t o = {0,0};
+
 #ifndef __AVX__
     int m0 = 0;
-    cov_t o = {0,0};
 #else
     __m256d K0 = _mm256_set1_pd(k0);
     __m256d K1 = _mm256_set1_pd(k1);
@@ -152,35 +154,51 @@ cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
     for (int i = 0; i < m0; i+=4) {
         __m256d f0 = _mm256_load_pd(f+i);
         __m256d g0 = _mm256_load_pd(g+i);
-        __m256d y0 = _mm256_load_pd(y+i);
         __m256d x0 = _mm256_cvtps_pd(_mm_loadu_ps(x+i)); // `x` might be unaligned!
 
         f0 = _mm256_fmadd_pd(K0,g0,f0);
         g0 = _mm256_fmadd_pd(K1,x0,g0);
-        S0 = _mm256_fmadd_pd(f0,f0,S0);
-        S1 = _mm256_fmadd_pd(f0,y0,S1);
+
+        if constexpr (need_sse) {
+            __m256d y0 = _mm256_load_pd(y+i);
+            S0 = _mm256_fmadd_pd(f0,f0,S0);
+            S1 = _mm256_fmadd_pd(f0,y0,S1);
+        }
 
         _mm256_store_pd(f+i, f0);
         _mm256_store_pd(g+i, g0);
     }
 
-    cov_t o = {
-        .ff = (S0[0]+S0[1])+(S0[2]+S0[3]),
-        .fy = (S1[0]+S1[1])+(S1[2]+S1[3]),
-    };
+    if constexpr (need_sse) {
+        o.ff = (S0[0]+S0[1])+(S0[2]+S0[3]);
+        o.fy = (S1[0]+S1[1])+(S1[2]+S1[3]);
+    }
 #endif
 
     for (int i = m0; i < m; ++i) {
         f[i] = fma(k0,g[i],f[i]);
         g[i] = fma(k1,x[i],g[i]);
-        o.ff = fma(f[i],f[i],o.ff);
-        o.fy = fma(f[i],y[i],o.fy);
+        if constexpr (need_sse) {
+            o.ff = fma(f[i],f[i],o.ff);
+            o.fy = fma(f[i],y[i],o.fy);
+        }
     }
     f[m] = fma(k0,g[m],f[m]);
     g[m] = fma(k1,xm,  g[m]);
-    o.ff = fma(f[m],f[m],o.ff);
-    o.fy = fma(f[m],ym,  o.fy);
+    if constexpr (need_sse) {
+        o.ff = fma(f[m],f[m],o.ff);
+        o.fy = fma(f[m],ym,  o.fy);
+    }
     return o;
+}
+
+// Non-template wrapper preserving the original symbol used by the unit test
+// link. Internal callers should use `covariates_impl<...>` directly so the
+// SSE-reduction path can be elided.
+cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
+                 double xm, double ym, double k0, float k1, int m)
+{
+    return covariates_impl<true>(f_, g_, x, y, xm, ym, k0, k1, m);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -267,9 +285,10 @@ double MarsAlgo::yvar() const
 }
 
 void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
-                    int xcol, const bool *bmask, int endspan, bool linear_only)
+                    int xcol, const bool *bmask, int min_span, int endspan, bool linear_only)
 {
     verify(xcol >= 0 && xcol < _data->X.cols(), "invalid X column index");
+    verify(min_span >= 1, "min_span must be >= 1");
 
     Map<ArrayXd>(linear_dsse,_m) = ArrayXd::Zero(_m);
     Map<ArrayXd>(hinge_dsse, _m) = ArrayXd::Zero(_m);
@@ -369,7 +388,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
             double b_k  = b [k[0]]; // sort and upcast to double
             double bx_k = bx[k[0]];
             double y_k  = y [k[0]];
-            covariates(f,g,Bok.row(0).data(),ybo,bx_k,ybx[0],0,b_k,m);
+            covariates_impl<true>(f,g,Bok.row(0).data(),ybo,bx_k,ybx[0],0,b_k,m);
 
             double k0 = 0;
             double k1 = 0;
@@ -378,11 +397,21 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
             double vb = b_k*y_k;
             double b2 = b_k*b_k;
 
+            // Cuts are evaluated on a grid spaced by `min_span` along the sorted
+            // index, anchored at `head+1` (the first eligible position). The
+            // f/g/k0/k1/w/b2/vb/bd accumulators are running sums that depend on
+            // every sample, so they must update every iteration regardless of
+            // whether this `i` is on the grid; only the SSE reduction (o.ff,
+            // o.fy) is gated, since it is only consumed at on-grid positions.
             for (int i = 1; i < tail; ++i) {
                 b_k  = b [k[i]]; // sort and upcast to double
                 bx_k = bx[k[i]];
                 y_k  = y [k[i]];
-                cov_t o = covariates(f,g,Bok.row(i).data(),ybo,bx_k,ybx[j],d[i],b_k,m);
+
+                const bool on_grid = (i > head) && ((i - head - 1) % min_span == 0);
+                cov_t o = on_grid
+                    ? covariates_impl<true >(f,g,Bok.row(i).data(),ybo,bx_k,ybx[j],d[i],b_k,m)
+                    : covariates_impl<false>(f,g,Bok.row(i).data(),ybo,bx_k,ybx[j],d[i],b_k,m);
 
                 k0 = fma(d[i]*d[i],b2,k0);  // build up ||h_plus||^2 incrementally
                 k1 = fma(d[i]*2,bd,k1);
@@ -391,12 +420,14 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
                 b2 = fma(b_k,b_k,b2);
                 vb = fma(y_k,b_k,vb);
 
-                const double uw  = o.fy - w;
-                const double den = (k0+k1) - o.ff;
-                const double sse = den > _tol? (uw*uw)/(den+_tol) : 0;
-                if ((i > head) && (sse > hinge_sse[j])) {
-                    hinge_sse[j] = sse;
-                    hinge_idx[j] = i;
+                if (on_grid) {
+                    const double uw  = o.fy - w;
+                    const double den = (k0+k1) - o.ff;
+                    const double sse = den > _tol? (uw*uw)/(den+_tol) : 0;
+                    if (sse > hinge_sse[j]) {
+                        hinge_sse[j] = sse;
+                        hinge_idx[j] = i;
+                    }
                 }
             }
         }

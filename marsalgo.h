@@ -47,6 +47,11 @@ public:
      *  bmask : bool(m)
      *      a boolean mask to filter out which bases to use.
      *
+     *  min_span : int
+     *      minimum gap between candidate hinge cut locations along sorted X.
+     *      Cuts are evaluated on a grid of every `min_span`-th sample in the
+     *      sorted order. Pass 1 to evaluate every sample.
+     *
      *  endspan : int
      *      how many samples to ignore from both the extreme ends of the
      *      training data.
@@ -56,7 +61,7 @@ public:
      *      This will ignore the output values of `hinge_dsse` and `hinge_cuts`.
      */
     void eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
-              int xcol, const bool *bmask, int endspan, bool linear_only);
+              int xcol, const bool *bmask, int min_span, int endspan, bool linear_only);
 
     /*
      *  Append a new basis function and update the ortho-normalized state.

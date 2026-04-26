@@ -85,14 +85,14 @@ double slow_mse_w(MatrixXd X, VectorXd y, VectorXd w)
 }
 
 struct Result {
-    Result(MarsAlgo &algo, int xcol, const ArrayXb &mask, bool linear)
+    Result(MarsAlgo &algo, int xcol, const ArrayXb &mask, bool linear, int min_span = 1)
     {
         linear_dsse = ArrayXd(mask.rows());
         hinge_dsse  = ArrayXd(mask.rows());
         hinge_cut   = ArrayXd(mask.rows());
         base_dsse = algo.dsse();
         algo.eval(linear_dsse.data(), hinge_dsse.data(),
-                  hinge_cut.data(), xcol, mask.data(), 0, linear);
+                  hinge_cut.data(), xcol, mask.data(), min_span, 0, linear);
     }
 
     double  base_dsse;
@@ -506,4 +506,53 @@ TEST(MarsTest, WeightedLS)
     ALL_B.col(2) = x2.matrix();
     mse2 = slow_mse_w(ALL_B.leftCols(3), y, w);
     ASSERT_NEAR(mse1, mse2, 1e-7);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Verify the min_span gating: with min_span=S the inner loop only checks SSE
+// at every S-th sorted position. The f/g/k0/k1/w/b2/vb/bd accumulators must
+// still update every iteration, so the hinge_dsse at any position evaluated
+// with min_span=S must equal what the same position would yield with
+// min_span=1 (i.e., min_span only restricts which cuts are *considered*, not
+// the math at the considered cuts).
+TEST(MarsTest, MinSpan)
+{
+    srand(0);
+
+    const int    N   = 2000;
+    const int    M   = 4;
+    const double CUT = 0.25;
+
+    MatrixXd X(MatrixXd::Random(N, M));
+    ArrayXd  x0 = X.col(0).array();
+    VectorXd y  = (-5*(x0-CUT).cwiseMax(0) + 2*(CUT-x0).cwiseMax(0)).matrix();
+    y += VectorXd::Random(N) * 0.05;
+
+    MatrixXf X32 = X.cast<float>();
+    VectorXf y32 = y.cast<float>();
+    ArrayXf  w32 = ArrayXf::Ones(N);
+
+    MarsAlgo algo(X32.data(), y32.data(), w32.data(), N, M, M*2, N);
+    ArrayXb  mask = ArrayXb::Ones(1); // just the intercept basis
+
+    Result r1 (algo, 0, mask, /*linear_only=*/0, /*min_span=*/1);
+    Result r2 (algo, 0, mask, /*linear_only=*/0, /*min_span=*/2);
+    Result r10(algo, 0, mask, /*linear_only=*/0, /*min_span=*/10);
+
+    // The strided runs evaluate a strict subset of the cuts the min_span=1
+    // run does, so their best hinge_dsse cannot exceed it.
+    EXPECT_GE(r1.hinge_dsse[0], r2 .hinge_dsse[0]);
+    EXPECT_GE(r2.hinge_dsse[0], r10.hinge_dsse[0]);
+
+    // linear_dsse is independent of cut placement; min_span must not affect it.
+    ASSERT_NEAR(r1.linear_dsse[0], r2 .linear_dsse[0], 1e-12);
+    ASSERT_NEAR(r1.linear_dsse[0], r10.linear_dsse[0], 1e-12);
+
+    // The chosen cut should land near the true CUT for all min_span values.
+    // With N=2000 samples on [-1,1] the average sorted gap is ~1e-3, so even
+    // with min_span=10 the nearest grid point is well within 0.05.
+    EXPECT_NEAR(r1 .hinge_cut[0], CUT, 0.05);
+    EXPECT_NEAR(r2 .hinge_cut[0], CUT, 0.05);
+    EXPECT_NEAR(r10.hinge_cut[0], CUT, 0.05);
 }

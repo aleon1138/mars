@@ -36,12 +36,13 @@ MarsAlgo * new_algo(
 ///////////////////////////////////////////////////////////////////////////////
 
 py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
-               int endspan, bool linear, int threads)
+               int min_span, int endspan, bool linear, int threads)
 {
     py::buffer_info mask_info = mask_array.request();
     verify(mask_info.ndim == 2, "expected 2D array for mask");
     verify(mask_info.strides[1] == sizeof(bool), "mask must be row-major");
     verify(mask_info.shape[1] == algo.nbasis(), "invalid dimension for mask");
+    verify(min_span >= 1, "min_span must be >= 1");
 
     auto mask = mask_array.unchecked<2>();
     ssize_t mask_rows = mask.shape(0);
@@ -75,7 +76,7 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
             for (int i = 0; i < mask_rows; ++i) {
                 if (ok.load(std::memory_order_relaxed)) {
                     algo.eval(&dsse1_ptr(i,0), &dsse2_ptr(i,0), &h_cut_ptr(i,0),
-                              i, &mask(i,0), endspan, linear);
+                              i, &mask(i,0), min_span, endspan, linear);
                 }
 
                 if (i % 32 == 0) {
@@ -115,6 +116,7 @@ PYBIND11_MODULE(marslib, m)
         )
     .def("eval",&eval
          , py::arg("mask").noconvert()
+         , py::arg("min_span")
          , py::arg("endspan")
          , py::arg("linear_only")
          , py::arg("threads")

@@ -87,6 +87,12 @@ def fit(X, y, w=None, **kwargs):
         or linear basis function during the forward pass.
         See the 'd' parameter in equation 32, Friedman, 1991.
 
+    min_span: int (default=None)
+        The minimum gap, in number of observations along sorted x, between any
+        two candidate knots considered in a single forward step. This helps
+        with matrix conditioning at higher orders. The default uses Freidman's
+        formula.
+
     tail_span : float (default=0.02)
         Fraction of samples at the tails of the training data to ignore.
         Prevents hinge formation at the extreme tails of the input range.
@@ -156,6 +162,7 @@ def fit(X, y, w=None, **kwargs):
     max_epochs    = kwargs.pop('max_epochs', min(X.shape[1]+len(X)//20, 15))
     max_degree    = kwargs.pop('max_degree', 3)
     penalty       = kwargs.pop('penalty', 3.0)
+    min_span      = kwargs.pop('min_span', None)
     tail_span     = kwargs.pop('tail_span', 0.02)
     max_runtime   = kwargs.pop('max_runtime', 48*3600) # in seconds
     self_interact = kwargs.pop('self_interact', False)
@@ -177,6 +184,11 @@ def fit(X, y, w=None, **kwargs):
         raise TypeError("unknown argument: %s" % kwargs)
 
     start_t = time.time()
+
+    if min_span is None:
+        alpha = 1/X.shape[1]
+        min_span = int(-np.log2(-np.log(1-alpha)/(n_true*alpha)) / 2.5)  # Eq. (43)
+    min_span = max(min_span, 1)
 
     # Equation numbers refer to the original MARS paper
     get_dof = lambda m: m + penalty * (m - 1)  # Eq. (31,32)
@@ -253,7 +265,7 @@ def fit(X, y, w=None, **kwargs):
         # Find the delta-SSE for the entire block
         # 'sse1' is the improvement by adding a linear term
         # 'sse2' is the improvement by adding two disjoint hinges
-        sse0, sse1, sse2, cut = algo.eval(bmask, tail, linear_only, threads)
+        sse0, sse1, sse2, cut = algo.eval(bmask, min_span, tail, linear_only, threads)
 
         # Update the delta-SSE cache
         # TODO - should we really be using GCV adjusted SSE instead?
