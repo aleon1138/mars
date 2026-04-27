@@ -30,26 +30,21 @@ cores or so.
 
 These instructions have been verified to work on the following platforms:
 
-* Ubuntu 18.04 and 20.04
+* Ubuntu 18.04 through 24.04
 * Raspbian 10
-* macOS 10.13 (WIP)
+* macOS High Sierra (10.13) through Tahoe (26.4)
 
 ## Build Requirements
 
-[Eigen](http://eigen.tuxfamily.org/) - The code has been tested with version 3.3.4.
+* [Eigen](http://eigen.tuxfamily.org/) - The code has been tested with version 3.3.4.
+* [GoogleTest](https://github.com/google/googletest)
 
 ```bash
-sudo apt install -y libeigen3-dev
+sudo apt install -y libeigen3-dev libgtest-dev
 ```
 ... on macOS:
 ```bash
-brew install pkg-config eigen
-```
-
-[GoogleTest](https://github.com/google/googletest):
-
-```bash
-sudo apt install -y libgtest-dev
+brew install pkg-config eigen googletest
 ```
 
 On older Ubuntu versions (before 22.04) you'll need to [build from source](https://bit.ly/2vNUBWN):

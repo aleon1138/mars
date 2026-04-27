@@ -1,16 +1,16 @@
 #include "marsalgo.h"
 #include <Eigen/Dense>
-#include <numeric>      // for std::iota
-#include <cfloat>       // for DBL_EPSILON
+#include <numeric>          // for std::iota
+#include <cfloat>           // for DBL_EPSILON
 #include <cassert>
 #ifdef __SSE__
-#   include <immintrin.h>  // for _mm_getcsr
+#   include <immintrin.h>   // for _mm_getcsr
 #endif
 
 /*
- *  The main benefit of using FMA is that you only incur half the error of doing
- *  the add and multiply separately. If the below macro is not available, then
- *  std::fma() is much slower than the underlying implementation. So disable it.
+ *  Fused Multiply-Add (FMA) incurs only half the error of computing them
+ *  separately. If the below macro is not available, then the implementation
+ *  provided by the standard library will be much slower than the macro below.
  */
 #ifndef FP_FAST_FMA
 #   undef fma
@@ -28,13 +28,13 @@ typedef Array<int64_t,Dynamic,1> ArrayXi64;
 typedef Array<bool,Dynamic,1> ArrayXb;
 
 /*
- *  Return sort indexes in descending order.
+ *  Return sort indexes in  stable descending order. Tied X values keep their
+ *  original row order, so the gather of Bo rows downstream is invariant to
+ *  input row permutations.
  */
 void argsort(int32_t *idx, const float *v, int n)
 {
     std::iota(idx, idx+n, 0);
-    // Stable sort: tied X values keep their original row order, so the
-    // gather of Bo rows downstream is invariant to input row permutations.
     std::stable_sort(idx, idx+n, [&v](size_t i, size_t j) {
         return v[i] > v[j];
     });
@@ -57,7 +57,7 @@ ArrayXi nonzero(const ArrayXb &x)
 
 /*
  *  Interact a candidate regressor `x` with all existing basis `B`, and then
- *  ortho-normalize via inverse Cholesky method against the previous set
+ *  orthonormalize via inverse Cholesky method against the previous set
  *  of normalized basis `Bo`.
  *
  *  Bx : double(n,p) [out]
@@ -85,14 +85,8 @@ void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXd
         Bx.col(j) = (B.col(mask[j]).array() * x).cast<double>();
     }
 
-    const MatrixXd h = Bo.transpose() * Bx;
-    Bx -= Bo * h;
-    // Compute the residual norm directly. The Pythagorean form
-    // ||Bx||^2 - ||Bo^T Bx||^2 cancels catastrophically when Bx has a large
-    // projection onto span(Bo); the row-order summation noise in those two
-    // squared norms is the dominant source of run-to-run variability under
-    // input shuffling.
-    const ArrayXd  s = Bx.colwise().squaredNorm().array();
+    Bx -= Bo * (Bo.transpose() * Bx);
+    const ArrayXd s = Bx.colwise().squaredNorm().array();
     Bx *= (s > tol).select(1/(s+tol).sqrt(), 0).matrix().asDiagonal();
 }
 
@@ -198,9 +192,11 @@ cov_t covariates_impl(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
     return o;
 }
 
-// Non-template wrapper preserving the original symbol used by the unit test
-// link. Internal callers should use `covariates_impl<...>` directly so the
-// SSE-reduction path can be elided.
+/*
+ *  Non-template wrapper preserving the original symbol used by the unit test
+ *  link. Internal callers should use `covariates_impl<...>` directly so the
+ *  SSE-reduction path can be elided.
+ */
 cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
                  double xm, double ym, double k0, float k1, int m)
 {
@@ -230,21 +226,20 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
 {
     verify(!std::isfinite(NAN), "NAN check is disabled, recompile without --fast-math");
 
-    ArrayXd vv;
-    _data->y = Map<const ArrayXf>(y,n).cast<double>();  // copy and upcast
+    // Copy and upcast target
+    _data->y = Map<const ArrayXf>(y,n).cast<double>();
+
     // For WLS we scale rows by sqrt(w), so that the OLS objective on the
     // transformed problem equals the weighted RSS on the original.
-    vv       = Map<const ArrayXf>(w,n).cast<double>().sqrt();
+    ArrayXd sqrt_w = Map<const ArrayXf>(w,n).cast<double>().sqrt();
 
-    //---------------------------------------------------------------------
     // Filter out NAN's and apply weight to the target 'y'.
-    //---------------------------------------------------------------------
     for (int i = 0; i < n; ++i) {
         if (!std::isfinite(y[i])) {
-            _data->y[i] = vv[i] = 0;
+            _data->y[i] = sqrt_w[i] = 0;
         }
     }
-    _data->y *= vv; // apply sqrt(w) to target
+    _data->y *= sqrt_w; // apply sqrt(w) to target
 
     // TODO - these row-order reductions (y_norm, w_norm, _yvar below, and
     // the column norms in _data->s) are sensitive to the input row order:
@@ -254,27 +249,21 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     // selections. Switching to compensated/pairwise summation here would make
     // the algorithm row-order-invariant; see tests/repro_shuffle.py.
     double y_norm = _data->y.matrix().norm();
-    double w_norm = vv.matrix().norm();
+    double w_norm = sqrt_w.matrix().norm();
     verify(y_norm > 0.0 && w_norm > 0, "target Y is all zero or NANs");
 
     _data->y /= y_norm;
-    vv /= w_norm;
+    sqrt_w   /= w_norm;
 
-    //---------------------------------------------------------------------
     // Initialize the first column of our basis with the intercept
-    //---------------------------------------------------------------------
-    _data->B .col(0) = vv.cast<float>();
-    _data->Bo.col(0) = vv;
+    _data->B .col(0) = sqrt_w.cast<float>();
+    _data->Bo.col(0) = sqrt_w;
     _data->ybo = _data->Bo.leftCols(1).transpose() * _data->y.matrix();
 
-    //---------------------------------------------------------------------
     // Calculate the sample variance of the target 'y'.
-    //---------------------------------------------------------------------
     _yvar = (_data->y - _data->y.mean()).square().mean();
 
-    //---------------------------------------------------------------------
     // Calculate the column norm of 'X'.
-    //---------------------------------------------------------------------
     _data->s = (_data->X.colwise().squaredNorm()/_data->X.rows()).cwiseSqrt();
     verify(_data->s.isFinite().all(), "not all columns in X are finite");
     _data->s = (_data->s > 0.f).select(1.f/_data->s, 1.f);
@@ -298,7 +287,7 @@ double MarsAlgo::yvar() const
 }
 
 void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
-                    int xcol, const bool *bmask, int min_span, int endspan, bool linear_only)
+                    int xcol, const bool *bmask, int min_span, int end_span, bool linear_only)
 {
     verify(xcol >= 0 && xcol < _data->X.cols(), "invalid X column index");
     verify(min_span >= 1, "min_span must be >= 1");
@@ -360,8 +349,8 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
             d[i] = x[k[i-1]] - x[k[i]];
         }
 
-        const int head = endspan;
-        const int tail = n-endspan;
+        const int head = end_span;
+        const int tail = n-end_span;
         const MatrixXf &B = _data->B;
         const ArrayXd  &y = _data->y;
 

@@ -17,8 +17,10 @@ public:
     /*
      *  Construct a MarsAlgo over training data (x, y) with per-row weights w.
      *  Weights follow inverse-variance semantics: the fitted objective is
-     *  Sum_i w_i * (y_i - f(x_i))^2, matching R's lm(weights=), statsmodels,
-     *  and sklearn. For heteroskedastic fitting pass w_i = 1/sigma_i^2.
+     *  Sum_i w_i * (y_i - f(x_i))^2. For heteroskedastic fitting pass:
+     *
+     *    w_i = 1/sigma_i^2.
+     *
      *  Uniform weights (w=1) recover ordinary least squares.
      */
     MarsAlgo(const float *x, const float *y, const float *w, int n, int m, int p, int ldx);
@@ -52,7 +54,7 @@ public:
      *      Cuts are evaluated on a grid of every `min_span`-th sample in the
      *      sorted order. Pass 1 to evaluate every sample.
      *
-     *  endspan : int
+     *  end_span : int
      *      how many samples to ignore from both the extreme ends of the
      *      training data.
      *
@@ -61,10 +63,10 @@ public:
      *      This will ignore the output values of `hinge_dsse` and `hinge_cuts`.
      */
     void eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
-              int xcol, const bool *bmask, int min_span, int endspan, bool linear_only);
+              int xcol, const bool *bmask, int min_span, int end_span, bool linear_only);
 
     /*
-     *  Append a new basis function and update the ortho-normalized state.
+     *  Append a new basis function and update the orthonormalized state.
      *  Returns the MSE after adding the basis, or -1 if the basis is
      *  numerically degenerate.
      *
