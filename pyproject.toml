@@ -10,15 +10,13 @@ build-backend = "setuptools.build_meta"
 py-modules = ["mars"]
 
 [project]
-name = "mars"
-version = "0.3"
-description = "Multivariate Adaptive Regression Splines"
-readme = "README.md"
-authors = [
-    { name = "Arnaldo Leon", email = "amleon@alum.mit.edu" },
-]
+name            = "mars"
+version         = "0.4"
+description     = "Multivariate Adaptive Regression Splines"
+readme          = "README.md"
+authors         = [{ name = "Arnaldo Leon", email = "amleon@alum.mit.edu" }]
 requires-python = ">=3.10"
-license = "MIT"
+license         = "MIT"
 
 [project.urls]
 Source = "https://github.com/aleon1138/mars"
