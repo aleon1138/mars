@@ -70,7 +70,11 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
         {
             char name[16]; // Give this thread a name so it shows up in `htop`
             snprintf(name, sizeof(name), "mars-%02d", omp_get_thread_num());
+#ifdef __APPLE__
+            pthread_setname_np(name);
+#else
             pthread_setname_np(pthread_self(), name);
+#endif
 
             #pragma omp for schedule(static)
             for (int i = 0; i < mask_rows; ++i) {
