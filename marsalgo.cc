@@ -33,7 +33,9 @@ typedef Array<bool,Dynamic,1> ArrayXb;
 void argsort(int32_t *idx, const float *v, int n)
 {
     std::iota(idx, idx+n, 0);
-    std::sort(idx, idx+n, [&v](size_t i, size_t j) {
+    // Stable sort: tied X values keep their original row order, so the
+    // gather of Bo rows downstream is invariant to input row permutations.
+    std::stable_sort(idx, idx+n, [&v](size_t i, size_t j) {
         return v[i] > v[j];
     });
 }
@@ -84,9 +86,13 @@ void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXd
     }
 
     const MatrixXd h = Bo.transpose() * Bx;
-    const ArrayXd  s = (Bx.colwise().squaredNorm() - h.colwise().squaredNorm()).array();
-
     Bx -= Bo * h;
+    // Compute the residual norm directly. The Pythagorean form
+    // ||Bx||^2 - ||Bo^T Bx||^2 cancels catastrophically when Bx has a large
+    // projection onto span(Bo); the row-order summation noise in those two
+    // squared norms is the dominant source of run-to-run variability under
+    // input shuffling.
+    const ArrayXd  s = Bx.colwise().squaredNorm().array();
     Bx *= (s > tol).select(1/(s+tol).sqrt(), 0).matrix().asDiagonal();
 }
 
@@ -240,6 +246,13 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     }
     _data->y *= vv; // apply sqrt(w) to target
 
+    // TODO - these row-order reductions (y_norm, w_norm, _yvar below, and
+    // the column norms in _data->s) are sensitive to the input row order:
+    // structured inputs (sorted, time-correlated, grouped) accumulate biased
+    // running sums and lose precision vs. shuffled inputs. The downstream
+    // greedy search amplifies these tiny perturbations into different basis
+    // selections. Switching to compensated/pairwise summation here would make
+    // the algorithm row-order-invariant; see tests/repro_shuffle.py.
     double y_norm = _data->y.matrix().norm();
     double w_norm = vv.matrix().norm();
     verify(y_norm > 0.0 && w_norm > 0, "target Y is all zero or NANs");
