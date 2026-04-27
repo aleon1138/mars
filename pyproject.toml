@@ -1,13 +1,6 @@
 [build-system]
-requires = [
-    "pybind11>=2.12",
-    "setuptools>=64",
-    "wheel",
-]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools]
-py-modules = ["mars"]
+requires      = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name            = "mars"
@@ -16,7 +9,11 @@ description     = "Multivariate Adaptive Regression Splines"
 readme          = "README.md"
 authors         = [{ name = "Arnaldo Leon", email = "amleon@alum.mit.edu" }]
 requires-python = ">=3.10"
-license         = "MIT"
 
 [project.urls]
 Source = "https://github.com/aleon1138/mars"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version   = ">=3.20"
+build-dir       = "build/{wheel_tag}"

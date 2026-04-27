@@ -1,45 +1,31 @@
-# for memchecks use -O0 -g -fsanitize=address
+# Thin wrapper around CMake. The python extension is also buildable via
+# `pip install .` which uses the same CMakeLists.txt via scikit-build-core.
+#
+# For a sanitizer build, configure CMake directly (then `make` to build):
+#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+#       -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
+#       -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address \
+#       -DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address \
+#       -DMARS_BUILD_TESTS=ON
 
-UNAME_S := $(shell uname)
-UNAME_M := $(shell uname -m)
+BUILD_DIR  ?= build
+BUILD_TYPE ?= Release
 
-CXXFLAGS += -O3 -fvisibility=hidden
-CXXFLAGS += -Wall -march=native -std=c++17
+.PHONY: all test format clean configure
 
-ifeq ($(UNAME_S), Darwin)
-	ifeq ($(UNAME_M), x86_64)
-		CXXFLAGS += -mfma # strange, but this is not default under arch=native
-	endif
-	CXXFLAGS += -undefined dynamic_lookup # needed for pybind
-	CXXFLAGS += -Wno-unknown-warning-option # needed for eigen
-	# Apple Clang does not ship an OpenMP runtime; use Homebrew libomp.
-	LIBOMP_PREFIX ?= $(shell brew --prefix libomp 2>/dev/null)
-	CXXFLAGS += -Xpreprocessor -fopenmp -I$(LIBOMP_PREFIX)/include
-	LDFLAGS  += -L$(LIBOMP_PREFIX)/lib
-	LDLIBS   += -lomp
-else
-	CXXFLAGS += -fopenmp
-endif
+configure:
+	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DMARS_BUILD_TESTS=ON
 
-CPPFLAGS += $(shell pkg-config --cflags eigen3)
-CPPFLAGS += $(shell python3 -m pybind11 --includes)
-CPPFLAGS += $(shell python3-config --includes)
-CPPFLAGS += -DNDEBUG -DEIGEN_DONT_PARALLELIZE
+all: configure
+	cmake --build $(BUILD_DIR) -j
+	cp $(BUILD_DIR)/marslib*.so .
 
-TARGET = marslib$(shell python3-config --extension-suffix)
-
-$(TARGET): marslib.cc marsalgo.cc marsalgo.h
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -shared -fPIC marslib.cc marsalgo.cc -o $@ $(LDFLAGS) $(LDLIBS)
-
-test: unittest $(TARGET)
+test: all
 	python3 -m pytest tests/ -v
-	./unittest
+	$(BUILD_DIR)/unittest
 
 format:
 	astyle -A4 -S -z2 -n -j *.h *.cc
 
-unittest: tests/unittest.cc marsalgo.cc marsalgo.h
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) tests/unittest.cc marsalgo.cc -lgtest -lgtest_main -lpthread -o $@ $(LDFLAGS) $(LDLIBS)
-
 clean:
-	rm -rf __pycache__/ build/ mars.egg-info/ unittest $(TARGET) dist
+	rm -rf __pycache__/ $(BUILD_DIR)/ mars.egg-info/ marslib*.so dist
