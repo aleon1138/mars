@@ -8,14 +8,7 @@ import numba
 import numpy as np
 import marslib
 
-# pylint: disable=consider-using-f-string
-# pylint: disable=invalid-name
-# pylint: disable=too-many-arguments
-# pylint: disable=too-many-positional-arguments
-# pylint: disable=unnecessary-lambda-assignment
 # ruff: noqa: E731
-
-# -----------------------------------------------------------------------------
 
 
 def _dump_header(logger):
@@ -185,10 +178,10 @@ def fit(X, y, w=None, **kwargs):
 
     start_t = time.time()
 
-    # Equation numbers refer to the original MARS paper
+    # For reference, see Eq. (43) in the original MARS paper
     if min_span is None:
-        alpha = 1/X.shape[1]
-        min_span = int(-np.log2(-np.log(1-alpha)/(n_true*alpha)) / 2.5)  # Eq. (43)
+        alpha = 1 / X.shape[1]
+        min_span = int(-np.log2(-np.log(1 - alpha) / (n_true * alpha)) / 2.5)
     min_span = max(min_span, 1)
 
     get_dof = lambda m: m + penalty * (m - 1)  # Eq. (31,32)
@@ -210,7 +203,7 @@ def fit(X, y, w=None, **kwargs):
     n = len(X)
     basis = [[]]  # list of lists of used basis
     tail = max(int(n * tail_span), 1)
-    algo = marslib.MarsAlgo(X, y, w, max_terms)  # pylint: disable=c-extension-no-member
+    algo = marslib.MarsAlgo(X, y, w, max_terms)
     var_y = algo.yvar()
 
     # Set up the SSE caches. For inputs, we initialize to +inf, so that we cover
@@ -329,7 +322,10 @@ def fit(X, y, w=None, **kwargs):
 
         # Patience: stop if no new (near-)best GCV R² in the last r2_window epochs.
         r2_cvs = model["r2_cv"][: algo.nbasis()]
-        if len(r2_cvs) > r2_window and r2_cvs[-r2_window:].max() < r2_cvs.max() - r2_thresh:
+        if (
+            len(r2_cvs) > r2_window
+            and r2_cvs[-r2_window:].max() < r2_cvs.max() - r2_thresh
+        ):
             break
 
     return model[: algo.nbasis()]
@@ -340,7 +336,7 @@ def fit(X, y, w=None, **kwargs):
 
 @numba.njit(parallel=True)
 def _expand_linear_basis(y, b, x):
-    for i in numba.prange(len(y)):  # pylint: disable=E1133
+    for i in numba.prange(len(y)):
         y[i] = b[i] * x[i]
 
 
@@ -468,6 +464,13 @@ def prune(B, y, w=None, n_true=None, penalty=3, ridge=0, mask=None):
     n, M = B.shape
     if n_true is None:
         n_true = n
+
+    y_valid = np.isfinite(y)
+    if not y_valid.all():
+        if w is None:
+            w = np.ones(len(y), dtype=B.dtype)
+        w = np.where(y_valid, w, 0)
+        y = np.where(y_valid, y, 0)
 
     # Fold weights into B and y via sqrt(w) so WLS becomes plain OLS
     if w is not None:
@@ -603,7 +606,7 @@ def pprint(model, beta=None, labels=None):
             return [node] + get_inputs(row["basis"])
         return [node]
 
-    for i in range(len(model)):  # pylint: disable=consider-using-enumerate
+    for i in range(len(model)):
         bstr = "  "
         if beta is not None and hasattr(beta, "__getitem__"):
             bstr += "%+9.4g" % beta[i]
