@@ -1,5 +1,7 @@
 #include "marsalgo.h"
 #include <omp.h>
+#include <memory>
+#include <vector>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 namespace py = pybind11;
@@ -59,6 +61,19 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
     threads = std::min<int>(threads, mask_rows);
 
     /*
+     * Allocate one scratch buffer per thread BEFORE entering the parallel
+     * region. Doing it in serial here keeps the big mmaps off the kernel's
+     * per-process mmap_lock, which 64 concurrent threads would otherwise
+     * serialize on (stalling in state D). Inside eval() the buffers are reused
+     * across calls -- no allocations happen on the hot path.
+     */
+    std::vector<std::unique_ptr<MarsScratch>> scratches;
+    scratches.reserve(threads);
+    for (int t = 0; t < threads; ++t) {
+        scratches.emplace_back(new MarsScratch(algo.nrows(), algo.max_basis()));
+    }
+
+    /*
      * `mask` is a (r,c) boolean matrix where `r` is the number of columns of
      * the design matrix `X` and `c` is the number of basis already chosen by
      * the algorithm.
@@ -76,11 +91,13 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
             pthread_setname_np(pthread_self(), name);
 #endif
 
+            MarsScratch &scratch = *scratches[omp_get_thread_num()];
+
             #pragma omp for schedule(static)
             for (int i = 0; i < mask_rows; ++i) {
                 if (ok.load(std::memory_order_relaxed)) {
                     algo.eval(&dsse1_ptr(i,0), &dsse2_ptr(i,0), &h_cut_ptr(i,0),
-                              i, &mask(i,0), min_span, endspan, linear);
+                              i, &mask(i,0), min_span, endspan, linear, scratch);
                 }
 
                 if (i % 32 == 0) {

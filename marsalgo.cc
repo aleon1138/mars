@@ -126,7 +126,7 @@ struct cov_t {
  *      basis value at the current sorted position: `B[k[i], bcol]`.
  */
 template <bool need_sse>
-cov_t covariates_impl(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
+cov_t covariates_impl(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const double *y,
                       double xm, double ym, double k0, float k1, int m)
 {
     assert(f_.rows()==m+1);
@@ -197,7 +197,7 @@ cov_t covariates_impl(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
  *  link. Internal callers should use `covariates_impl<...>` directly so the
  *  SSE-reduction path can be elided.
  */
-cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
+cov_t covariates(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const double *y,
                  double xm, double ym, double k0, float k1, int m)
 {
     return covariates_impl<true>(f_, g_, x, y, xm, ym, k0, k1, m);
@@ -211,7 +211,6 @@ struct MarsData {
         , B (MatrixXf ::Zero(n,p))
         , Bo(MatrixXdC::Zero(n,p)) {}
 
-    // TODO - all large scratch buffers should be 32 bit
     Map<const MatrixXf,Aligned,Stride<Dynamic,1>>  X;   // read-only view of the regressors
     ArrayXd     y;      // target vector
     MatrixXf    B;      // all basis
@@ -219,6 +218,48 @@ struct MarsData {
     VectorXd    ybo;    // dot product of basis Bo with Y target
     ArrayXf     s;      // normalization constant for columns of 'X'
 };
+
+/*
+ *  Pre-allocated per-thread scratch. Sized once at construction; eval() only
+ *  uses leading sub-blocks (.head/.leftCols) so no growth happens at call time.
+ *
+ *  TODO - narrow `Bx` and `d` from f64 to f32. They are by far the largest
+ *  buffers (Bx ≈ n*max_terms*8 bytes, d ≈ n*8 bytes) and account for roughly
+ *  half the scratch footprint per thread. NOT done yet because:
+ *    - `Bx` is the output of orthonormalize()'s Gram-Schmidt step
+ *      (Bx -= Bo * Bo^T * Bx, followed by normalization). That's a
+ *      cancellation-heavy reduction; in f32 the columns lose orthogonality
+ *      against Bo as m grows, and the `den > _tol` gate at the hinge SSE
+ *      ratio in eval() is calibrated against `_tol = (n*0.02)*DBL_EPSILON`
+ *      — switching Bx to single precision would silently break that gate.
+ *    - `d` enters a long FMA chain in covariates_impl() that runs the full
+ *      length of n on every hinge sweep. Narrowing the input compounds
+ *      roundoff across ~6M FMAs per call.
+ *  Worth ~500 MB/thread on the n=6M case if done carefully. Should land as
+ *  its own diff with tests/repro_shuffle.py and the GCV pipeline verified.
+ */
+struct MarsScratch::Impl {
+    int       n;
+    int       max_terms;
+    ArrayXf   x;       // normalized candidate column
+    ArrayXi32 k;       // sort permutation of x
+    ArrayXd   d;       // adjacent deltas of x along sort order (size n; d[0] unused, matches old `d = _d.data()-1` hack)
+    MatrixXd  Bx;      // (n, max_terms) column-major — basis interacted with x, ortho-normalized
+    MatrixXfC Bok;     // (n, max_terms) row-major   — Bo with rows permuted by k
+    ArrayXd   f;       // (max_terms+1) hinge projection accumulator
+    ArrayXd   g;       // (max_terms+1) basis-weighted ortho accumulator
+
+    Impl(int n_, int max_terms_)
+        : n(n_), max_terms(max_terms_)
+        , x(n_), k(n_), d(n_)
+        , Bx(n_, max_terms_)
+        , Bok(n_, max_terms_)
+        , f(max_terms_+1), g(max_terms_+1)
+    {}
+};
+
+MarsScratch::MarsScratch(int n, int max_terms) : _impl(new Impl(n, max_terms)) {}
+MarsScratch::~MarsScratch() { delete _impl; }
 
 MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m, int p, int ldx)
     : _data(new MarsData(x, n, m, p, ldx))
@@ -277,6 +318,14 @@ int MarsAlgo::nbasis() const
 {
     return _m;
 }
+int MarsAlgo::nrows() const
+{
+    return _data->X.rows();
+}
+int MarsAlgo::max_basis() const
+{
+    return _data->B.cols();
+}
 double MarsAlgo::dsse() const
 {
     return _data->ybo.squaredNorm();
@@ -287,10 +336,14 @@ double MarsAlgo::yvar() const
 }
 
 void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
-                    int xcol, const bool *bmask, int min_span, int end_span, bool linear_only)
+                    int xcol, const bool *bmask, int min_span, int end_span, bool linear_only,
+                    MarsScratch &scratch)
 {
     verify(xcol >= 0 && xcol < _data->X.cols(), "invalid X column index");
     verify(min_span >= 1, "min_span must be >= 1");
+    verify(scratch._impl != nullptr, "scratch is null");
+    verify(scratch._impl->n == _data->X.rows(), "scratch sized for wrong n");
+    verify(scratch._impl->max_terms >= _m, "scratch too small for current basis count");
 
     Map<ArrayXd>(linear_dsse,_m) = ArrayXd::Zero(_m);
     Map<ArrayXd>(hinge_dsse, _m) = ArrayXd::Zero(_m);
@@ -310,11 +363,13 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     const int m = _m;           // number of all currently existing basis
     const int p = bcols.rows(); // number of non-ignored basis
 
-    const ArrayXf        x  = _data->X.col(xcol) * _data->s[xcol]; // copy and normalize 'X' column
-    const Ref<MatrixXdC> Bo = _data->Bo.leftCols(m);
+    auto &S = *scratch._impl;
+    S.x = _data->X.col(xcol).array() * _data->s[xcol]; // in-place into pre-allocated scratch
+    const Ref<const ArrayXf> x  = S.x;
+    const Ref<MatrixXdC>     Bo = _data->Bo.leftCols(m);
 
-    // Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo`
-    MatrixXd Bx(n, p); // TODO - put in thread-local storage
+    // Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo` (into scratch)
+    Ref<MatrixXd> Bx = S.Bx.leftCols(p);
     orthonormalize(Bx, _data->B.leftCols(m), Bo, x, bcols, _tol);
 
     // Calculate the linear delta SSE and map to the output buffer
@@ -330,21 +385,20 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         ArrayXd hinge_sse = ArrayXd::Constant(p,0);
         ArrayXd hinge_cut = ArrayXd::Constant(p,NAN);
 
-        // Get sort indexes
+        // Get sort indexes (into scratch)
         // TODO - we should keep a LRU cache as we usually pick from the
         //        same pool of regressors in Fast-MARS.
-        ArrayXi32 k(n);
-        argsort(k.data(), _data->X.col(xcol).data(), n);
+        int32_t *k = S.k.data();
+        argsort(k, _data->X.col(xcol).data(), n);
 
-        // Sort the rows of `Bo`
-        MatrixXfC Bok(n,m); // TODO - put in thread-local storage
+        // Sort the rows of `Bo` into scratch.Bok
+        Ref<MatrixXfC> Bok = S.Bok.leftCols(m);
         for (int i = 0; i < n; ++i) {
             Bok.row(i) = Bo.row(k[i]).cast<float>();
         }
 
-        // Take the deltas of `x`
-        ArrayXd _d(n-1);
-        double *d = _d.data()-1; // note minus-one hack
+        // Take the deltas of `x` (into scratch)
+        double *d = S.d.data(); // d[0] unused; valid indices are 1..n-1
         for (int i = 1; i < n; ++i) {
             d[i] = x[k[i-1]] - x[k[i]];
         }
@@ -382,8 +436,8 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
          *  from the full hinge pair (h_plus and h_minus together).
          */
         for (int j = 0; j < p; ++j) {
-            ArrayXd f = ArrayXd::Zero(m+1);
-            ArrayXd g = ArrayXd::Zero(m+1);
+            Ref<ArrayXd> f = S.f.head(m+1); f.setZero();
+            Ref<ArrayXd> g = S.g.head(m+1); g.setZero();
             const float  *b  = B.col(bcols[j]).data();
             const double *bx = Bx.col(j).data();
 

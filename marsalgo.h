@@ -7,6 +7,24 @@ inline void verify(bool check, const char *msg)
     }
 }
 
+/*
+ *  Per-thread scratch buffers for MarsAlgo::eval(). Allocated once and reused
+ *  across calls so the OMP-parallel eval path never hits glibc's mmap-based
+ *  large-allocation route -- 64 threads hammering mmap/munmap on the same
+ *  process serializes on the kernel's mmap_lock and stalls threads in state D.
+ */
+class MarsScratch {
+public:
+    MarsScratch(int n, int max_terms);
+    ~MarsScratch();
+    MarsScratch(const MarsScratch &) = delete;
+    MarsScratch &operator=(const MarsScratch &) = delete;
+private:
+    struct Impl;
+    Impl *_impl;
+    friend class MarsAlgo;
+};
+
 class MarsAlgo {
     struct MarsData *_data = nullptr;
     int     _m    = 1;  // number of basis found
@@ -27,6 +45,8 @@ public:
     ~MarsAlgo();
 
     int nbasis() const;
+    int nrows() const;
+    int max_basis() const;
     double dsse() const;
     double yvar() const;
 
@@ -63,7 +83,8 @@ public:
      *      This will ignore the output values of `hinge_dsse` and `hinge_cuts`.
      */
     void eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
-              int xcol, const bool *bmask, int min_span, int end_span, bool linear_only);
+              int xcol, const bool *bmask, int min_span, int end_span, bool linear_only,
+              MarsScratch &scratch);
 
     /*
      *  Append a new basis function and update the orthonormalized state.

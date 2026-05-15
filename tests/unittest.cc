@@ -22,7 +22,7 @@ void argsort(int32_t *idx, const float *v, int n);
 ArrayXi nonzero(const ArrayXb &x);
 void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXdC> &Bo,
                     const ArrayXf &x, const ArrayXi &mask, double tol);
-cov_t covariates(ArrayXd &f_, ArrayXd &g_, const float *x, const double *y,
+cov_t covariates(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const double *y,
                  double xm, double ym, double k0, float k1, int m);
 
 
@@ -91,8 +91,9 @@ struct Result {
         hinge_dsse  = ArrayXd(mask.rows());
         hinge_cut   = ArrayXd(mask.rows());
         base_dsse = algo.dsse();
+        MarsScratch scratch(algo.nrows(), algo.max_basis());
         algo.eval(linear_dsse.data(), hinge_dsse.data(),
-                  hinge_cut.data(), xcol, mask.data(), min_span, 0, linear);
+                  hinge_cut.data(), xcol, mask.data(), min_span, 0, linear, scratch);
     }
 
     double  base_dsse;
