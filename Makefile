@@ -28,8 +28,8 @@ CPPFLAGS += -DNDEBUG -DEIGEN_DONT_PARALLELIZE
 
 TARGET = marslib$(shell python3-config --extension-suffix)
 
-$(TARGET): marslib.cc marsalgo.cc marsalgo.h
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -shared -fPIC marslib.cc marsalgo.cc -o $@ $(LDFLAGS) $(LDLIBS)
+$(TARGET): marslib.cc marsalgo.cc kernels.cc marsalgo.h kernels.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -shared -fPIC marslib.cc marsalgo.cc kernels.cc -o $@ $(LDFLAGS) $(LDLIBS)
 
 test: unittest $(TARGET)
 	python3 -m pytest tests/ -v
@@ -38,8 +38,8 @@ test: unittest $(TARGET)
 format:
 	astyle -A4 -S -z2 -n -j *.h *.cc
 
-unittest: tests/unittest.cc marsalgo.cc marsalgo.h
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) tests/unittest.cc marsalgo.cc -lgtest -lgtest_main -lpthread -o $@ $(LDFLAGS) $(LDLIBS)
+unittest: tests/unittest.cc tests/test_kernels.cc marsalgo.cc kernels.cc marsalgo.h kernels.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) tests/unittest.cc tests/test_kernels.cc marsalgo.cc kernels.cc -lgtest -lgtest_main -lpthread -o $@ $(LDFLAGS) $(LDLIBS)
 
 clean:
 	rm -rf __pycache__/ build/ mars.egg-info/ unittest $(TARGET) dist

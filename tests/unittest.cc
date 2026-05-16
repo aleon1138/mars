@@ -20,35 +20,15 @@ struct cov_t {
 
 void argsort(int32_t *idx, const float *v, int n);
 ArrayXi nonzero(const ArrayXb &x);
-void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXdC> &Bo,
-                    const ArrayXf &x, const ArrayXi &mask, double tol);
 cov_t covariates(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const double *y,
                  double xm, double ym, double k0, float k1, int m);
 
-
-double invnorm(VectorXd x)
-{
-    const double s = x.norm();
-    return s > EPS? 1.0/s : 0.0;
-}
 
 int argmax(const ArrayXd &x)
 {
     int i;
     x.maxCoeff(&i);
     return i;
-}
-
-ArrayXi create_mask(int m, int p)
-{
-    std::random_device rd;
-    std::mt19937 g(rd());
-
-    std::vector<int> idx(m);
-    std::iota(idx.begin(), idx.end(), 0);
-    std::shuffle(idx.begin(), idx.end(), g);
-    std::sort(idx.begin(), idx.begin()+p);
-    return Map<ArrayXi>(idx.data(),p);
 }
 
 //
@@ -122,51 +102,7 @@ TEST(MarsTest, ArgSort)
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-
-TEST(MarsTest, Orthonormalize)
-{
-    const int n = 89;  // number of rows
-    const int m = 13;  // number of basis
-    const int p = 7;   // basis mask
-    constexpr int BAD_COL = 2;
-
-    MatrixXdC Bo(n,m);
-    MatrixXf  B(MatrixXf::Random(n,m));
-    ArrayXf   x(ArrayXf::Random(n)*10);
-    ArrayXd   y(ArrayXd::Random(n)+1);
-    ArrayXi   mask = create_mask(m,p);
-    B.col(BAD_COL) = B.col(1); // add a co-linear column
-
-    //-------------------------------------------------------------------------
-    // Initialize 'Bo' as the ortho-normal projection of 'B'
-    //-------------------------------------------------------------------------
-    Bo = B.cast<double>();
-    Bo.col(0) *= invnorm(Bo.col(0));
-    for (int j = 1; j < Bo.cols(); ++j) {
-        Bo.col(j) *= invnorm(Bo.col(j));
-        for (int k = 0; k < j; ++k) {
-            Bo.col(j) -= (Bo.col(k).transpose()*Bo.col(j)) * Bo.col(k);
-            Bo.col(j) *= invnorm(Bo.col(j));
-        }
-    }
-
-    //-------------------------------------------------------------------------
-    // Ensure Bo is indeed ortho-normal
-    //-------------------------------------------------------------------------
-    MatrixXd BoBo = MatrixXd::Identity(m,m);
-    BoBo(BAD_COL,BAD_COL) = 0;
-    ASSERT_TRUE((Bo.transpose()*Bo).isApprox(BoBo,EPS));
-
-    //-------------------------------------------------------------------------
-    // Test out ortho-normalize utility.
-    //-------------------------------------------------------------------------
-    MatrixXd Bx(n,p);
-    orthonormalize(Bx, B, Bo, x, mask, EPS);
-
-    ASSERT_TRUE((Bo.transpose()*Bx).isZero(EPS));
-    ASSERT_TRUE(Bx.colwise().norm().isOnes(EPS));
-}
-
+// orthonormalize() moved to kernels.cc — see tests/test_kernels.cc
 ///////////////////////////////////////////////////////////////////////////////
 
 void sort_columns(Ref<MatrixXd> X, const ArrayXi32 &k)

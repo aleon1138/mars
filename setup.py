@@ -99,7 +99,7 @@ else:
 ext_modules = [
     Pybind11Extension(
         "marslib",
-        sources=["marslib.cc", "marsalgo.cc"],
+        sources=["marslib.cc", "marsalgo.cc", "kernels.cc"],
         include_dirs=include_dirs,
         library_dirs=library_dirs,
         extra_compile_args=extra_compile_args,

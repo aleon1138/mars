@@ -1,4 +1,5 @@
 #include "marsalgo.h"
+#include "kernels.h"
 #include <Eigen/Dense>
 #include <numeric>          // for std::iota
 #include <cfloat>           // for DBL_EPSILON
@@ -71,40 +72,9 @@ int nonzero_into(int *out, const bool *mask, int n)
     return count;
 }
 
-/*
- *  Interact a candidate regressor `x` with all existing basis `B`, and then
- *  orthonormalize via inverse Cholesky method against the previous set
- *  of normalized basis `Bo`.
- *
- *  Bx : double(n,p) [out]
- *      returns `B[:,mask] .* x` (element-wise), orthonormalized against `Bo`
- *
- *  B : float(n,m)
- *      the existing set of basis.
- *
- *  Bo : double(n,m)
- *      the existing set of orthonormalized basis.
- *
- *  x : float(n)
- *      the candidate regressor.
- *
- *  mask : int(p)
- *      which columns of `B` to use.
- *
- *  tol : double
- *      a small epsilon used to truncate small values to zero.
- */
-void orthonormalize(Ref<MatrixXd> Bx, const Ref<MatrixXf> &B, const Ref<MatrixXdC> &Bo,
-                    const ArrayXf &x, const ArrayXi &mask, double tol)
-{
-    for (int j = 0; j < mask.rows(); ++j) {
-        Bx.col(j) = (B.col(mask[j]).array() * x).cast<double>();
-    }
-
-    Bx -= Bo * (Bo.transpose() * Bx);
-    const ArrayXd s = Bx.colwise().squaredNorm().array();
-    Bx *= (s > tol).select(1/(s+tol).sqrt(), 0).matrix().asDiagonal();
-}
+// orthonormalize() now lives in kernels.cc as a raw-pointer BLAS-style
+// function. It replaces the Eigen-expression chain that used to be here;
+// see kernels.h for the layout contract.
 
 struct cov_t {
     double ff;
@@ -268,6 +238,7 @@ struct MarsScratch::Impl {
     VectorXd  ybx;     // (max_terms) Bx^T * y, leading p entries used
     ArrayXi   hinge_idx; // (max_terms) best hinge sort position per j (leading p)
     ArrayXd   hinge_sse; // (max_terms) best hinge delta-SSE per j (leading p)
+    MatrixXd  BoTBx;   // (max_terms, max_terms) workspace for Bo^T*Bx in orthonormalize()
 
     Impl(int n_, int max_terms_)
         : n(n_), max_terms(max_terms_)
@@ -279,6 +250,7 @@ struct MarsScratch::Impl {
         , ybx(max_terms_)
         , hinge_idx(max_terms_)
         , hinge_sse(max_terms_)
+        , BoTBx(max_terms_, max_terms_)
     {}
 };
 
@@ -403,9 +375,19 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     const Ref<const ArrayXf> x  = S.x;
     const Ref<MatrixXdC>     Bo = _data->Bo.leftCols(m);
 
-    // Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo` (into scratch)
+    // Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo` (into scratch).
+    // BoTBx is the (m, p) workspace for the Bo^T*Bx intermediate; sized at
+    // (max_terms, max_terms) so the leading m×p block is what the kernel uses.
     Ref<MatrixXd> Bx = S.Bx.leftCols(p);
-    orthonormalize(Bx, _data->B.leftCols(m), Bo, x, bcols, _tol);
+    mars::orthonormalize(
+        n, m, p,
+        _data->B.data(),  (int)_data->B.outerStride(),
+        x.data(),
+        bcols.data(),
+        _data->Bo.data(), (int)_data->Bo.outerStride(),
+        Bx.data(),        (int)Bx.outerStride(),
+        S.BoTBx.data(),   (int)S.BoTBx.outerStride(),
+        _tol);
 
     // Calculate the linear delta SSE and map to the output buffer
     Ref<VectorXd> ybx = S.ybx.head(p);
