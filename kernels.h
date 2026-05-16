@@ -14,8 +14,8 @@ namespace mars {
  *  Interact a candidate regressor `x` with the basis columns selected by
  *  `mask`, orthonormalize against `Bo`, and normalize each column. For each
  *  j in [0, p):
- *      Bx[:,j]  = (double)(B[:, mask[j]] .* x)            // fill (f32 * f32 → f64)
- *      Bx[:,j] -= Bo * (Bo^T * Bx[:,j])                   // project out Bo's span
+ *      Bx[:,j]  = (double)(B[:, mask[j]] .* x)             // fill (f32 * f32 → f64)
+ *      Bx[:,j] -= Bo * (Bo^T * Bx[:,j])                    // project out Bo's span
  *      s        = ||Bx[:,j]||^2
  *      Bx[:,j] *= (s > tol) ? 1/sqrt(s + tol) : 0          // normalize, zero degenerate
  *
