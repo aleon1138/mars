@@ -1,13 +1,9 @@
 [build-system]
 requires = [
+    "scikit-build-core>=0.10",
     "pybind11>=2.12",
-    "setuptools>=64",
-    "wheel",
 ]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools]
-py-modules = ["mars"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name            = "mars"
@@ -20,3 +16,9 @@ license         = "MIT"
 
 [project.urls]
 Source = "https://github.com/aleon1138/mars"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version   = ">=3.18"
+build.verbose   = true
+wheel.packages  = []   # no packages — mars.py and marslib are installed via CMake

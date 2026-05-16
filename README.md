@@ -36,47 +36,38 @@ These instructions have been verified to work on the following platforms:
 
 ## Build Requirements
 
-* [Eigen](http://eigen.tuxfamily.org/) - The code has been tested with version 3.3.4.
-* [GoogleTest](https://github.com/google/googletest)
+* [CMake](https://cmake.org/) ≥ 3.18
+* [Eigen](http://eigen.tuxfamily.org/) ≥ 3.3
+* [GoogleTest](https://github.com/google/googletest) (only needed for `make test`)
+* A C++17 compiler with OpenMP support
 
 ```bash
-sudo apt install -y libeigen3-dev libgtest-dev
+sudo apt install -y cmake libeigen3-dev libgtest-dev
 ```
 ... on macOS:
 ```bash
-brew install pkg-config eigen googletest
+brew install cmake eigen googletest libomp
 ```
 
-On older Ubuntu versions (before 22.04) you'll need to [build from source](https://bit.ly/2vNUBWN):
-
-```bash
-sudo apt install -y libgtest-dev cmake
-cd /usr/src/gtest
-sudo cmake . && sudo make
-sudo cp lib/*.a /usr/lib
-```
-
-[pybind11](https://github.com/pybind/pybind11):
-
-```bash
-pip3 install pybind11
-```
+`pip install .` pulls `pybind11` and `scikit-build-core` automatically as build
+dependencies — no need to install them by hand.
 
 ## Build Instructions
 
-Use the Makefile:
-
-```bash
-cd mars
-make
-make test # optional - build and run the unit tests
-```
-
-Or install directly via pip:
+Install directly via pip (recommended):
 
 ```bash
 cd mars
 pip install .
+```
+
+For local development, the Makefile is a thin wrapper around CMake:
+
+```bash
+cd mars
+make            # configures + builds; drops marslib*.so at the source root
+make test       # runs the C++ unit tests and pytest
+make clean      # removes the build/ directory and built .so
 ```
 
 ## An Example

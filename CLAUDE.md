@@ -5,18 +5,27 @@ code in this repository.
 
 ## Build & Test Commands
 
+The build is driven by `CMakeLists.txt`. The `Makefile` is a thin wrapper.
+
 ```bash
-make              # build the pybind11 extension (marslib*.so)
-make test         # build and run C++ unit tests
-make clean        # remove build artifacts
+make              # configure (build/) + build; drops marslib*.so at the source root
+make test         # build and run C++ unit tests, then pytest
+make clean        # remove build/ and the built .so
 make format       # format all .h/.cc files with astyle
 
-pip install .     # alternative: install via pip (uses pyproject.toml)
+pip install .     # alternative: build a wheel via scikit-build-core
 ```
 
-For memory/sanitizer debugging, replace `-O3` with `-O0 -g -fsanitize=address` in `CXXFLAGS`.
+For memory/sanitizer debugging, reconfigure with sanitizer flags:
+```bash
+rm -rf build
+cmake -S . -B build -DBUILD_TESTING=ON \
+      -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_CXX_FLAGS="-O0 -g -fsanitize=address"
+cmake --build build --parallel
+```
 
-To run a single GoogleTest: `./unittest --gtest_filter=MarsTest.DeltaSSE`
+To run a single GoogleTest: `./build/unittest --gtest_filter=MarsTest.DeltaSSE`
 
 ## Architecture
 

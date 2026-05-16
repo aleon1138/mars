@@ -1,45 +1,25 @@
-# for memchecks use -O0 -g -fsanitize=address
+# Thin wrapper around CMake. For memchecks, configure with:
+#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+#         -DCMAKE_CXX_FLAGS="-O0 -g -fsanitize=address"
 
-UNAME_S := $(shell uname)
-UNAME_M := $(shell uname -m)
+BUILD_DIR ?= build
 
-CXXFLAGS += -O3 -fvisibility=hidden
-CXXFLAGS += -Wall -march=native -std=c++17
+.PHONY: all configure test format clean
 
-ifeq ($(UNAME_S), Darwin)
-	ifeq ($(UNAME_M), x86_64)
-		CXXFLAGS += -mfma # strange, but this is not default under arch=native
-	endif
-	CXXFLAGS += -undefined dynamic_lookup # needed for pybind
-	CXXFLAGS += -Wno-unknown-warning-option # needed for eigen
-	# Apple Clang does not ship an OpenMP runtime; use Homebrew libomp.
-	LIBOMP_PREFIX ?= $(shell brew --prefix libomp 2>/dev/null)
-	CXXFLAGS += -Xpreprocessor -fopenmp -I$(LIBOMP_PREFIX)/include
-	LDFLAGS  += -L$(LIBOMP_PREFIX)/lib
-	LDLIBS   += -lomp
-else
-	CXXFLAGS += -fopenmp
-endif
+all: configure
+	cmake --build $(BUILD_DIR) --parallel
 
-CPPFLAGS += $(shell pkg-config --cflags eigen3)
-CPPFLAGS += $(shell python3 -m pybind11 --includes)
-CPPFLAGS += $(shell python3-config --includes)
-CPPFLAGS += -DNDEBUG -DEIGEN_DONT_PARALLELIZE
+configure: $(BUILD_DIR)/CMakeCache.txt
 
-TARGET = marslib$(shell python3-config --extension-suffix)
+$(BUILD_DIR)/CMakeCache.txt:
+	cmake -S . -B $(BUILD_DIR) -DBUILD_TESTING=ON
 
-$(TARGET): marslib.cc marsalgo.cc kernels.cc marsalgo.h kernels.h
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -shared -fPIC marslib.cc marsalgo.cc kernels.cc -o $@ $(LDFLAGS) $(LDLIBS)
-
-test: unittest $(TARGET)
+test: all
+	$(BUILD_DIR)/unittest
 	python3 -m pytest tests/ -v
-	./unittest
 
 format:
 	astyle -A4 -S -z2 -n -j *.h *.cc
 
-unittest: tests/unittest.cc tests/test_kernels.cc marsalgo.cc kernels.cc marsalgo.h kernels.h
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) tests/unittest.cc tests/test_kernels.cc marsalgo.cc kernels.cc -lgtest -lgtest_main -lpthread -o $@ $(LDFLAGS) $(LDLIBS)
-
 clean:
-	rm -rf __pycache__/ build/ mars.egg-info/ unittest $(TARGET) dist
+	rm -rf $(BUILD_DIR) __pycache__/ mars.egg-info/ dist marslib*.so
