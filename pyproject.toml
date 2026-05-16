@@ -11,7 +11,7 @@ py-modules = ["mars"]
 
 [project]
 name            = "mars"
-version         = "0.5"
+version         = "0.6"
 description     = "Multivariate Adaptive Regression Splines"
 readme          = "README.md"
 authors         = [{ name = "Arnaldo Leon", email = "amleon@alum.mit.edu" }]
