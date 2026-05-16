@@ -139,8 +139,11 @@ def fit(X, y, w=None, **kwargs):
     labels : list-like (default=None)
         A list of column labels. This is only used for console output.
 
-    xfilter : function (default=lambda x,b: True)
-        Allows custom filtering of inputs.
+    xfilter : function (default=None)
+        Allows custom filtering of inputs. Called as `xfilter(i, b)` where
+        `i` is an input column index and `b` is the parent basis (list of
+        input indices); return False to forbid the pair. None means no
+        extra filtering and skips the per-cell Python call entirely.
 
     threads : int (default=-1)
         Number of cores to use. A negative number implies usage of all cores.
@@ -174,7 +177,7 @@ def fit(X, y, w=None, **kwargs):
     r2_window     = kwargs.pop('r2_window', 32) # window over which to measure R2
     r2_thresh     = kwargs.pop('r2_thresh', 3e-5)
     labels        = kwargs.pop('labels', None)
-    aux_filter    = kwargs.pop('xfilter', lambda x,b: True)
+    aux_filter    = kwargs.pop('xfilter', None)
     max_basis     = kwargs.pop('max_basis', max_epochs*2) # for "Fast MARS"
     max_inputs    = kwargs.pop('max_inputs', X.shape[1])  # for "Faster MARS v2"
     aging_factor  = kwargs.pop('aging_factor', 1.0)
@@ -194,14 +197,6 @@ def fit(X, y, w=None, **kwargs):
 
     get_dof = lambda m: m + penalty * (m - 1)  # Eq. (31,32)
     gcv_adj = lambda mse, m: mse / (1.0 - get_dof(m) / n_true) ** 2  # Eq. (30)
-
-    # Set up a basic filter which caps the polynomial degree of basis and
-    # optionally prevents features from interacting with themselves. Here 'i'
-    # is the index of the feature to be added and 'b' is a list of features
-    # that exist in the parent basis.
-    basic_filter = lambda i, b: (
-        (len(b) < max_degree) and (self_interact or (i not in b))
-    )
 
     # Make sure the DOF's never exceed the number of samples
     max_terms = 1 + 2 * max_epochs
@@ -257,12 +252,28 @@ def fit(X, y, w=None, **kwargs):
         input_to_use = input_to_use[::-1][: (max_inputs + np.isinf(input_sse).sum())]
         input_to_use = np.sort(input_to_use)
 
-        # Build up the mask block here
+        # Build up the mask block here. The degree cap and self-interaction
+        # check from `basic_filter` vectorize cleanly; only the user-supplied
+        # `aux_filter` still requires a Python call per surviving (i, b) pair.
         bmask = np.zeros((X.shape[1], len(basis)), dtype="bool")
         bmask[np.ix_(input_to_use, basis_to_use)] = True
-        for i in input_to_use:
-            bmask[i] &= np.array([basic_filter(i, b) for b in basis])
-            bmask[i] &= np.array([aux_filter(i, b) for b in basis])
+
+        degree_ok = np.fromiter(
+            (len(b) < max_degree for b in basis), bool, len(basis)
+        )
+        if self_interact:
+            bmask &= degree_ok
+        else:
+            feature_in_basis = np.zeros(bmask.shape, dtype=bool)
+            for b_idx, b in enumerate(basis):
+                feature_in_basis[b, b_idx] = True
+            bmask &= degree_ok & ~feature_in_basis
+
+        if aux_filter is not None:
+            for i in input_to_use:
+                for b_idx in np.flatnonzero(bmask[i]):
+                    if not aux_filter(i, basis[b_idx]):
+                        bmask[i, b_idx] = False
 
         # Find the delta-SSE for the entire block
         # 'sse1' is the improvement by adding a linear term
