@@ -223,6 +223,26 @@ struct MarsData {
  *      roundoff across ~6M FMAs per call.
  *  Worth ~500 MB/thread on the n=6M case if done carefully. Should land as
  *  its own diff with tests/repro_shuffle.py and the GCV pipeline verified.
+ *
+ *  TODO - eliminate `Bok` (n*max_terms*4 bytes) entirely by random-gathering
+ *  rows of Bo on the fly inside the j-loop in eval(), using software prefetch
+ *  (`_mm_prefetch(Bo + k[i+W]*stride, ...)`) to hide the row-fetch latency.
+ *  The inner kernel does ~m FMAs of work per iteration, plenty to overlap a
+ *  one-row-ahead prefetch.
+ *
+ *  NOT done yet because Bo is stored as f64 (MatrixXdC) while Bok is f32 —
+ *  gathering from Bo directly would double the per-iteration bandwidth on
+ *  the covariates_impl() hot path, which the 2026-05-16 AVX-512 benchmark
+ *  note flags as already L1 load/store-port limited. Software prefetch
+ *  reorders misses but does not reduce total bytes through L1, and the
+ *  current `Bok.row(i)` stream is sequential so the HW prefetcher handles
+ *  it for free; random `k[i]` indexing forfeits that.
+ *
+ *  Prerequisite: narrow Bo to f32 first (same Gram-Schmidt cancellation
+ *  risks as the Bx narrowing above — needs careful validation). Once Bo is
+ *  f32, on-the-fly gather + prefetch should match Bok bandwidth while
+ *  freeing the Bok buffer (savings ≈ half of the Bx narrowing above, since
+ *  Bok is already f32).
  */
 struct MarsScratch::Impl {
     int       n;
