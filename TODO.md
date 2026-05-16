@@ -73,6 +73,48 @@ AVX-512 without bf16 is probably a wash because:
 
 **Effort estimate:** multi-week project, not a weekend.
 
+## Replace Eigen with a custom mini-BLAS
+
+**Goal:** drop Eigen entirely. Smaller binary, ~80% faster builds, no hidden
+  temporaries, full control over allocation.
+
+**Why it's tractable:** the hot loop (`covariates_impl`) is already
+  hand-rolled AVX/FMA — Eigen isn't doing the heavy lifting there. The
+  remaining ~70 Eigen touchpoints in `marsalgo.cc` are mostly book-keeping:
+  views, slices, element-wise scaling, and norm reductions. There is exactly
+  one BLAS-like op in the codebase: `Bx.transpose() * y` at line 387
+  (matrix-vector product, p ≤ 400 columns), plus a couple of
+  `colwise().squaredNorm()` calls at construction. A minimal BLAS providing
+  GEMV, AXPY, dot/norm, and a few cwise kernels is enough.
+
+**Why it's worth doing:**
+- Killed the per-call temporary allocations problem at the source (see
+  2026-05-16 perf investigation): no more reliance on jemalloc as a runtime
+  prerequisite.
+- Eigen's `<Eigen/Dense>` is ~80% of build time. Compiling marsalgo.cc drops
+  from seconds to fractions of a second.
+- All allocation lives in `MarsScratch` (already pooled on `MarsAlgo`),
+  making the algorithm provably allocation-free on the hot path.
+- Easier to reason about and to step through in a debugger.
+
+**Why not Blaze:** same expression-template / hidden-temporary design as
+  Eigen. Would not eliminate the underlying problem. The point of doing this
+  is to *own* the linear algebra, not to swap dependencies.
+
+**Design sketch:**
+- `mars_la.h` — thin header with `Mat<T>`, `Vec<T>`, `View<T>` (non-owning
+  pointer + shape + stride), and the handful of kernels we need.
+- Replace `Map<>`, `Ref<>`, `Block<>` usage with plain pointer+stride views.
+- Keep the column-major / row-major distinction explicit at the type level
+  so we don't lose Eigen's compile-time correctness.
+- One GEMV kernel, vectorized; everything else is straightforward loops.
+
+**Effort estimate:** 2-3 weeks for a clean, tested replacement. Mostly
+  mechanical once the view/kernel surface is settled. The risk is in subtle
+  precision differences vs. Eigen's reductions — needs the
+  `tests/repro_shuffle.py` row-order invariance check + a tight numerical
+  comparison against the current implementation on a saved dataset.
+
 # MARS improvements — TODO
 
 Context for future-me: this is a roadmap of four improvements to the

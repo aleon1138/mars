@@ -56,6 +56,22 @@ ArrayXi nonzero(const ArrayXb &x)
 }
 
 /*
+ *  Fill `out` with the indexes of `true` entries in `mask` (length `n`) and
+ *  return the count. Non-allocating variant of `nonzero` for the hot path.
+ *  `out` must have capacity for at least `n` entries.
+ */
+int nonzero_into(int *out, const bool *mask, int n)
+{
+    int count = 0;
+    for (int i = 0; i < n; ++i) {
+        if (mask[i]) {
+            out[count++] = i;
+        }
+    }
+    return count;
+}
+
+/*
  *  Interact a candidate regressor `x` with all existing basis `B`, and then
  *  orthonormalize via inverse Cholesky method against the previous set
  *  of normalized basis `Bo`.
@@ -248,6 +264,10 @@ struct MarsScratch::Impl {
     MatrixXfC Bok;     // (n, max_terms) row-major   — Bo with rows permuted by k
     ArrayXd   f;       // (max_terms+1) hinge projection accumulator
     ArrayXd   g;       // (max_terms+1) basis-weighted ortho accumulator
+    ArrayXi   bcols;   // (max_terms) indexes of non-ignored basis (output of nonzero_into)
+    VectorXd  ybx;     // (max_terms) Bx^T * y, leading p entries used
+    ArrayXi   hinge_idx; // (max_terms) best hinge sort position per j (leading p)
+    ArrayXd   hinge_sse; // (max_terms) best hinge delta-SSE per j (leading p)
 
     Impl(int n_, int max_terms_)
         : n(n_), max_terms(max_terms_)
@@ -255,6 +275,10 @@ struct MarsScratch::Impl {
         , Bx(n_, max_terms_)
         , Bok(n_, max_terms_)
         , f(max_terms_+1), g(max_terms_+1)
+        , bcols(max_terms_)
+        , ybx(max_terms_)
+        , hinge_idx(max_terms_)
+        , hinge_sse(max_terms_)
     {}
 };
 
@@ -360,10 +384,12 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     Map<ArrayXd>(hinge_dsse, _m) = ArrayXd::Zero(_m);
     Map<ArrayXd>(hinge_cuts, _m) = ArrayXd::Constant(_m,NAN);
 
-    ArrayXi bcols = nonzero(Map<const ArrayXb>(bmask,_m));
-    if (bcols.rows() == 0) {
+    auto &S = *scratch._impl;
+    const int p = nonzero_into(S.bcols.data(), bmask, _m);
+    if (p == 0) {
         return;
     }
+    Ref<ArrayXi> bcols = S.bcols.head(p);
 
 #ifdef __SSE__
     const unsigned csr = _mm_getcsr();
@@ -372,9 +398,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
 
     const int n = _data->X.rows();
     const int m = _m;           // number of all currently existing basis
-    const int p = bcols.rows(); // number of non-ignored basis
 
-    auto &S = *scratch._impl;
     S.x = _data->X.col(xcol).array() * _data->s[xcol]; // in-place into pre-allocated scratch
     const Ref<const ArrayXf> x  = S.x;
     const Ref<MatrixXdC>     Bo = _data->Bo.leftCols(m);
@@ -384,7 +408,8 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     orthonormalize(Bx, _data->B.leftCols(m), Bo, x, bcols, _tol);
 
     // Calculate the linear delta SSE and map to the output buffer
-    const VectorXd ybx = Bx.transpose() * _data->y.matrix();
+    Ref<VectorXd> ybx = S.ybx.head(p);
+    ybx.noalias() = Bx.transpose() * _data->y.matrix();
     for (int j = 0; j < p; ++j) {
         linear_dsse[bcols[j]] = ybx[j]*ybx[j];
     }
@@ -392,9 +417,8 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     // Evaluate the delta SSE on all hinge locations
     if (linear_only == false) {
         const double *ybo = _data->ybo.data(); // dot(Bo.T,_data->y);
-        ArrayXi hinge_idx = ArrayXi::Constant(p,-1);
-        ArrayXd hinge_sse = ArrayXd::Constant(p,0);
-        ArrayXd hinge_cut = ArrayXd::Constant(p,NAN);
+        Ref<ArrayXi> hinge_idx = S.hinge_idx.head(p); hinge_idx.setConstant(-1);
+        Ref<ArrayXd> hinge_sse = S.hinge_sse.head(p); hinge_sse.setZero();
 
         // Get sort indexes (into scratch)
         // TODO - we should keep a LRU cache as we usually pick from the
