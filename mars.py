@@ -8,7 +8,15 @@ import numba
 import numpy as np
 import marslib
 
-# ruff: noqa: E731
+__version__ = marslib.__version__
+__all__ = ["fit", "expand", "gram", "prune", "compact", "pprint", "__version__"]
+
+
+def __dir__():
+    return __all__
+
+
+# ruff: noqa: E731  ignore "do not assign a lambda expression warnings"
 
 
 def _dump_header(logger):

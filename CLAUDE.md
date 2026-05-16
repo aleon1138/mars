@@ -53,6 +53,12 @@ intrinsics in `covariates()` with `#pragma omp simd`. The pragma version was ~22
 slower (0.93 vs 1.14 ms/call, pinned core, `-O3 -march=native`).
 `-mprefer-vector-width=256` did not help. The hand-written intrinsics stay.
 
+**Performance note (2026-05-16):** We benchmarked widening `covariates_impl()`
+to AVX-512 (`__m512d`, 8-wide doubles). No measurable speedup on either
+Skylake-AVX512 or EPYC 9845 (Zen 5, full-width 512-bit FPU). The hot loop is
+not FMA-bound at typical m (~50–100) — likely limited by L1 load/store ports
+and per-call setup. The AVX2 intrinsics stay.
+
 **Data requirements:** `X` must be `float32`, **column-major** (Fortran order).
 `y` and `w` must be `float32` column-major 1D arrays. The bindings assert these
 layouts explicitly.
