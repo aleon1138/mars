@@ -1,4 +1,6 @@
 #include <stdexcept>
+#include <memory>
+#include <vector>
 
 inline void verify(bool check, const char *msg)
 {
@@ -8,10 +10,12 @@ inline void verify(bool check, const char *msg)
 }
 
 /*
- *  Per-thread scratch buffers for MarsAlgo::eval(). Allocated once and reused
- *  across calls so the OMP-parallel eval path never hits glibc's mmap-based
- *  large-allocation route -- 64 threads hammering mmap/munmap on the same
- *  process serializes on the kernel's mmap_lock and stalls threads in state D.
+ *  Per-thread scratch buffers for MarsAlgo::eval(). Production callers should
+ *  use MarsAlgo::reserve_scratches() + MarsAlgo::scratch(tid), which pools
+ *  these for the lifetime of the MarsAlgo so the OMP-parallel eval path never
+ *  hits glibc's mmap-based large-allocation route -- 64 threads hammering
+ *  mmap/munmap on the same process serializes on the kernel's mmap_lock and
+ *  stalls threads in state D. Constructible directly for unit tests.
  */
 class MarsScratch {
 public:
@@ -30,6 +34,7 @@ class MarsAlgo {
     int     _m    = 1;  // number of basis found
     double  _yvar = 0;  // variance of 'y'
     double  _tol  = 0;  // numerical error tolerance
+    std::vector<std::unique_ptr<MarsScratch>> _scratches;
 
 public:
     /*
@@ -49,6 +54,19 @@ public:
     int max_basis() const;
     double dsse() const;
     double yvar() const;
+
+    /*
+     *  Ensure at least `threads` per-thread scratch buffers exist. Idempotent;
+     *  call from the main thread before entering a parallel region. Allocations
+     *  happen serially here so they don't contend on the kernel's mmap_lock.
+     */
+    void reserve_scratches(int threads);
+
+    /*
+     *  Return the scratch buffer for thread `tid`. `reserve_scratches(n)` with
+     *  n > tid must have been called previously.
+     */
+    MarsScratch &scratch(int tid);
 
     /*
      *  Returns the delta SSE (sum of squared errors) given the existing basis

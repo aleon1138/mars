@@ -326,6 +326,17 @@ int MarsAlgo::max_basis() const
 {
     return _data->B.cols();
 }
+void MarsAlgo::reserve_scratches(int threads)
+{
+    _scratches.reserve(threads);
+    while ((int)_scratches.size() < threads) {
+        _scratches.emplace_back(new MarsScratch(nrows(), max_basis()));
+    }
+}
+MarsScratch &MarsAlgo::scratch(int tid)
+{
+    return *_scratches[tid];
+}
 double MarsAlgo::dsse() const
 {
     return _data->ybo.squaredNorm();
