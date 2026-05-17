@@ -7,7 +7,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name            = "mars"
-version         = "0.6"
+version         = "0.7"
 description     = "Multivariate Adaptive Regression Splines"
 readme          = "README.md"
 authors         = [{ name = "Arnaldo Leon", email = "amleon@alum.mit.edu" }]
