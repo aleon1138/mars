@@ -123,14 +123,18 @@ void orthonormalize(
         // DGKS retry gate -- see DGKS_GATE_RATIO_SQ in kernels.h. The
         // tol check skips columns we'd discard as degenerate anyway.
         double t_norm2 = 0.0;
-        for (int k = 0; k < m; ++k) t_norm2 += tc[k] * tc[k];
+        for (int k = 0; k < m; ++k) {
+            t_norm2 += tc[k] * tc[k];
+        }
         if (s > tol && s * DGKS_GATE_RATIO_SQ < t_norm2) {
             if (dgks_counter) {
                 dgks_counter->fetch_add(1, std::memory_order_relaxed);
             }
 
             // Recompute tc = Bo^T * bx (overwrite the original projection).
-            for (int k = 0; k < m; ++k) tc[k] = 0.0;
+            for (int k = 0; k < m; ++k) {
+                tc[k] = 0.0;
+            }
             for (int i = 0; i < n; ++i) {
                 double bxi = bx[i];
                 const double *bo_row = Bo + i * ldBo;
@@ -143,7 +147,9 @@ void orthonormalize(
                     _mm256_storeu_pd(tc + k, _mm256_fmadd_pd(bo, bcast, t));
                 }
 #endif
-                for (; k < m; ++k) tc[k] += bo_row[k] * bxi;
+                for (; k < m; ++k) {
+                    tc[k] += bo_row[k] * bxi;
+                }
             }
 
             // Second project-subtract-norm sweep (same shape as the first).
@@ -161,7 +167,9 @@ void orthonormalize(
                 }
                 acc = (acc4[0] + acc4[1]) + (acc4[2] + acc4[3]);
 #endif
-                for (; k < m; ++k) acc += bo_row[k] * tc[k];
+                for (; k < m; ++k) {
+                    acc += bo_row[k] * tc[k];
+                }
                 double v = bx[i] - acc;
                 bx[i] = v;
                 s += v * v;

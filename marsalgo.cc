@@ -72,10 +72,6 @@ int nonzero_into(int *out, const bool *mask, int n)
     return count;
 }
 
-// orthonormalize() now lives in kernels.cc as a raw-pointer BLAS-style
-// function. It replaces the Eigen-expression chain that used to be here;
-// see kernels.h for the layout contract.
-
 struct cov_t {
     double ff;
     double fy;
@@ -247,18 +243,18 @@ struct MarsData {
 struct MarsScratch::Impl {
     int       n;
     int       max_terms;
-    ArrayXf   x;       // normalized candidate column
-    ArrayXi32 k;       // sort permutation of x
-    ArrayXd   d;       // adjacent deltas of x along sort order (size n; d[0] unused, matches old `d = _d.data()-1` hack)
-    MatrixXd  Bx;      // (n, max_terms) column-major — basis interacted with x, ortho-normalized
-    MatrixXfC Bok;     // (n, max_terms) row-major   — Bo with rows permuted by k
-    ArrayXd   f;       // (max_terms+1) hinge projection accumulator
-    ArrayXd   g;       // (max_terms+1) basis-weighted ortho accumulator
-    ArrayXi   bcols;   // (max_terms) indexes of non-ignored basis (output of nonzero_into)
-    VectorXd  ybx;     // (max_terms) Bx^T * y, leading p entries used
-    ArrayXi   hinge_idx; // (max_terms) best hinge sort position per j (leading p)
-    ArrayXd   hinge_sse; // (max_terms) best hinge delta-SSE per j (leading p)
-    MatrixXd  BoTBx;   // (max_terms, max_terms) workspace for Bo^T*Bx in orthonormalize()
+    ArrayXf   x;            // normalized candidate column
+    ArrayXi32 k;            // sort permutation of x
+    ArrayXd   d;            // adjacent deltas of x along sort order (size n; d[0] unused, matches old `d = _d.data()-1` hack)
+    MatrixXd  Bx;           // (n, max_terms) column-major — basis interacted with x, ortho-normalized
+    MatrixXfC Bok;          // (n, max_terms) row-major   — Bo with rows permuted by k
+    ArrayXd   f;            // (max_terms+1) hinge projection accumulator
+    ArrayXd   g;            // (max_terms+1) basis-weighted ortho accumulator
+    ArrayXi   bcols;        // (max_terms) indexes of non-ignored basis (output of nonzero_into)
+    VectorXd  ybx;          // (max_terms) Bx^T * y, leading p entries used
+    ArrayXi   hinge_idx;    // (max_terms) best hinge sort position per j (leading p)
+    ArrayXd   hinge_sse;    // (max_terms) best hinge delta-SSE per j (leading p)
+    MatrixXd  BoTBx;        // (max_terms, max_terms) workspace for Bo^T*Bx in orthonormalize()
 
     Impl(int n_, int max_terms_)
         : n(n_), max_terms(max_terms_)
@@ -366,6 +362,8 @@ long MarsAlgo::dgks_consume()
     return _dgks_count.exchange(0, std::memory_order_relaxed);
 }
 
+///////////////////////////////////////////////////////////////////////////////
+
 void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
                     int xcol, const bool *bmask, int min_span, int end_span, bool linear_only,
                     MarsScratch &scratch)
@@ -389,7 +387,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
 
 #ifdef __SSE__
     const unsigned csr = _mm_getcsr();
-    _mm_setcsr(csr | 0x8040); // enable FTZ and DAZ
+    _mm_setcsr(csr | 0x8040);   // enable FTZ and DAZ
 #endif
 
     const int n = _data->X.rows();
@@ -399,9 +397,11 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     const Ref<const ArrayXf> x  = S.x;
     const Ref<MatrixXdC>     Bo = _data->Bo.leftCols(m);
 
-    // Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo` (into scratch).
-    // BoTBx is the (m, p) workspace for the Bo^T*Bx intermediate; sized at
-    // (max_terms, max_terms) so the leading m×p block is what the kernel uses.
+    /*
+     *  Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo`. BoTBx is
+     *  the (m, p) workspace for the Bo^T*Bx intermediate; sized at
+     *  (max_terms, max_terms) so the leading m×p block is what the kernel uses.
+     */
     Ref<MatrixXd> Bx = S.Bx.leftCols(p);
     mars::orthonormalize(
         n, m, p,
@@ -451,14 +451,16 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         const ArrayXd  &y = _data->y;
 
         /*
-         *  For each parent basis column b = B[:,bcols[j]], sweep potential hinge
-         *  cut locations from largest to smallest x (descending sort order). At
-         *  each cut h = x[k[i]] we evaluate the positive hinge h_plus = b*max(x-h,0),
-         *  which is nonzero only for the i samples above the cut.
+         *  For each parent basis column b = B[:,bcols[j]], sweep potential
+         *  hinge cut locations from largest to smallest x (descending sort
+         *  order). At each cut h = x[k[i]] we evaluate the positive hinge
+         *  h_plus = b*max(x-h,0), which is nonzero only for the i samples
+         *  above the cut.
          *
-         *  `covariates()` maintains f/g to track the projection of h_plus onto the
-         *  existing ortho-basis (Bo) AND the linear candidate (Bx[:,j]). The local
-         *  accumulators below build up the remaining terms needed for the delta-SSE:
+         *  `covariates()` maintains f/g to track the projection of h_plus onto
+         *  the existing ortho-basis (Bo) AND the linear candidate (Bx
+         *  [:,j]). The local accumulators below build up the remaining terms
+         *  needed for the delta-SSE:
          *
          *    b2   = sum_{j<i} b[k[j]]^2                  (squared norm of b above cut)
          *    vb   = sum_{j<i} b[k[j]] * y[k[j]]          (dot product <b,y> above cut)
@@ -466,16 +468,17 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
          *    k0+k1 = ||h_plus||^2                        (squared norm of positive hinge)
          *    w    = h_plus^T * y                         (dot product of hinge with target)
          *
-         *  Note: b2, vb, bd are updated AFTER computing the SSE for cut i, so they
-         *  always reflect the i samples above the current cut (0..i-1), not 0..i.
+         *  Note: b2, vb, bd are updated AFTER computing the SSE for cut i, so
+         *  they always reflect the i samples above the current cut
+         *  (0..i-1), not 0..i.
          *
          *  Final SSE formula at each cut:
          *    den = ||h_plus||^2 - ||proj_{Bo,Bx}(h_plus)||^2  = ||h_plus_perp||^2
          *    uw  = h_plus^T * proj_{Bo,Bx}(y) - h_plus^T * y  = -(h_plus_perp^T * y_perp)
          *    sse = uw^2 / den  (extra gain from the hinge beyond the linear candidate)
          *
-         *  The final hinge_dsse = linear_dsse + hinge_sse captures the combined gain
-         *  from the full hinge pair (h_plus and h_minus together).
+         *  The final hinge_dsse = linear_dsse + hinge_sse captures the combined
+         *  gain from the full hinge pair (h_plus and h_minus together).
          */
         for (int j = 0; j < p; ++j) {
             Ref<ArrayXd> f = S.f.head(m+1); f.setZero();
@@ -495,12 +498,15 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
             double vb = b_k*y_k;
             double b2 = b_k*b_k;
 
-            // Cuts are evaluated on a grid spaced by `min_span` along the sorted
-            // index, anchored at `head+1` (the first eligible position). The
-            // f/g/k0/k1/w/b2/vb/bd accumulators are running sums that depend on
-            // every sample, so they must update every iteration regardless of
-            // whether this `i` is on the grid; only the SSE reduction (o.ff,
-            // o.fy) is gated, since it is only consumed at on-grid positions.
+            /*
+             *  Cuts are evaluated on a grid spaced by `min_span` along the
+             *  sorted index, anchored at `head+1` (the first eligible
+             *  position). The f/g/k0/k1/w/b2/vb/bd accumulators are running
+             *  sums that depend on every sample, so they must update every
+             *  iteration regardless of whether this `i` is on the grid; only
+             *  the SSE reduction (o.ff, o.fy) is gated, since it is only
+             *  consumed at on-grid positions.
+             */
             for (int i = 1; i < tail; ++i) {
                 b_k  = b [k[i]]; // sort and upcast to double
                 bx_k = bx[k[i]];
@@ -575,13 +581,14 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
             throw std::runtime_error("invalid basis type");
     }
 
-    // Use Gram-Schmidt orthogonalization.
+    /*
+     *  Gram-Schmidt with a DGKS retry. The eval() side assumes Bo^T Bo = I, so
+     *  any orthogonality drift accumulates across the whole fit. See
+     *  mars::DGKS_GATE_RATIO_SQ in kernels.h for the trigger rationale.
+     */
     VectorXd v = _data->B.col(_m).cast<double>(); // make a copy
     _data->B.col(_m) /= v.norm();
 
-    // Gram-Schmidt with a DGKS retry. The eval() side assumes Bo^T Bo = I,
-    // so any orthogonality drift accumulates across the whole fit. See
-    // mars::DGKS_GATE_RATIO_SQ in kernels.h for the trigger rationale.
     double proj_norm2 = 0.0;
     for (int j = 0; j < _m; ++j) {
         const double c = _data->Bo.col(j).dot(v);
