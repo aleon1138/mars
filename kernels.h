@@ -8,7 +8,20 @@
  */
 #pragma once
 
+#include <atomic>
+
 namespace mars {
+
+/*
+ *  DGKS re-orthogonalization gate. Trigger when residual energy is less
+ *  than 1/9 of projection energy (eta^2 = 0.1, eta ~= 0.316). Stricter
+ *  than the textbook eta = 1/sqrt(2) (which corresponds to ratio = 1.0):
+ *  Bx is per-call scratch and we don't need bit-perfect orthogonality of
+ *  it, only protection against catastrophic cancellation. The looser
+ *  gate fires on numerically-benign cases and perturbs results within
+ *  the f32->f64 noise floor for no real accuracy gain.
+ */
+constexpr double DGKS_GATE_RATIO_SQ = 9.0;
 
 /*
  *  Interact a candidate regressor `x` with the basis columns selected by
@@ -30,6 +43,10 @@ namespace mars {
  *
  *  Uses AVX2 + FMA in the inner loops when available, scalar fallback otherwise.
  *  No heap allocations.
+ *
+ *  dgks_counter (optional): if non-null, atomically incremented each time the
+ *  DGKS re-orthogonalization branch fires for a column. Lets callers measure
+ *  numerical cancellation frequency without coupling to a global.
  */
 void orthonormalize(
     int n, int m, int p,
@@ -39,6 +56,7 @@ void orthonormalize(
     const double *Bo,   int ldBo,
     double       *Bx,   int ldBx,
     double       *T,    int ldT,
-    double tol);
+    double tol,
+    std::atomic<long> *dgks_counter = nullptr);
 
 } // namespace mars

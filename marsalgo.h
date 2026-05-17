@@ -1,6 +1,7 @@
 #include <stdexcept>
 #include <memory>
 #include <vector>
+#include <atomic>
 
 inline void verify(bool check, const char *msg)
 {
@@ -35,6 +36,7 @@ class MarsAlgo {
     double  _yvar = 0;  // variance of 'y'
     double  _tol  = 0;  // numerical error tolerance
     std::vector<std::unique_ptr<MarsScratch>> _scratches;
+    std::atomic<long> _dgks_count{0}; // DGKS re-orth triggers since last consume()
 
 public:
     /*
@@ -122,4 +124,12 @@ public:
      *      hinge cut point (ignored for linear basis).
      */
     double append(char type, int xcol, int bcol, float h);
+
+    /*
+     *  Return the number of DGKS re-orthogonalization triggers accumulated
+     *  in this instance since the last call, and reset the counter to zero.
+     *  Bumped by append() and (via &_dgks_count passed to orthonormalize())
+     *  by eval(). Atomic so the eval() OMP workers may race-free increment.
+     */
+    long dgks_consume();
 };

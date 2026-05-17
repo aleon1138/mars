@@ -82,4 +82,5 @@ r2     f4
 r2_cv  f4   — GCV-adjusted R²
 order  i4   — polynomial degree
 time   f4
+dgks   i4   — DGKS re-orth triggers during the epoch that added this row
 ```

@@ -442,3 +442,127 @@ the hinge-basis code path working as the validation oracle.
 - For the change-of-basis identity between truncated powers and B-splines:
   de Boor, "A Practical Guide to Splines" (revised ed., 2001), §IX.
   Standard reference; the identity is classical.
+
+# Smaller items / known issues
+
+Collected during the DGKS re-orthogonalization review (2026-05-17 session).
+Each item is independent and small; none of them block correctness today.
+
+## `eval()`'s bootstrap covariates_impl call passes the wrong `ym`
+
+**Location:** `marsalgo.cc:484`, the first call to `covariates_impl<true>` before
+the cut sweep loop.
+
+**Issue:** The `ym` parameter is hardcoded to `ybx[0]` but should be `ybx[j]`
+(the projection of the candidate column being swept). The call is tagged
+`<true>` so it pays the cost of computing `o.ff`/`o.fy`, but the return value
+is discarded. Currently harmless because `k0 = 0` keeps `f[m]` zero and the
+SSE math reads from `o` only in the main loop body.
+
+**Fix:** Switch to `<false>` (saves the per-call SSE arithmetic) and either
+fix `ybx[0]` to `ybx[j]` or drop the argument since the result is unused.
+One-line change.
+
+## `append()` recomputes the full `ybo` projection on every call
+
+**Location:** `marsalgo.cc:586-587`.
+
+**Issue:**
+```cpp
+VectorXd ybo = _data->Bo.leftCols(_m+1).transpose() * _data->y.matrix();
+```
+This is an O(n·m) matvec, but only the new last entry changed; the leading
+m entries are still valid in `_data->ybo`. Wasted work proportional to model
+size.
+
+**Fix:** Compute only the new entry and append it:
+```cpp
+const double new_ybo = _data->Bo.col(_m).dot(_data->y.matrix());
+const double mse = (1. - _data->ybo.squaredNorm() - new_ybo*new_ybo) / n;
+if (mse >= -_tol) {
+    _data->ybo.conservativeResize(_m+1);
+    _data->ybo[_m] = new_ybo;
+    ...
+}
+```
+
+## `prune()` is O(M⁴)
+
+**Location:** `mars.py:515-525`, the backward-elimination loop.
+
+**Issue:** Each elimination step calls `_gcv_sse` for every still-active term,
+and each `_gcv_sse` solves a fresh `np.linalg.lstsq` from scratch. Total cost
+is O(M⁴) where M is the final basis count. For M=30 it's ~14k full solves
+(seconds); M=100 is hours.
+
+**Fix:** Maintain a Cholesky (or QR) of `XX[active, active]` and do rank-1
+downdates when removing a column. Same algorithm, ~M× faster.
+
+## Python scalar loop builds `bmask` each epoch
+
+**Location:** `mars.py:263-265`.
+
+**Issue:**
+```python
+for i in input_to_use:
+    bmask[i] &= np.array([basic_filter(i, b) for b in basis])
+    bmask[i] &= np.array([aux_filter(i, b) for b in basis])
+```
+Two Python list comprehensions per input per epoch. For `len(input_to_use)`
+× `len(basis)` in the hundreds-to-thousands, this is the dominant cost on
+the Python side.
+
+**Fix:** Precompute once per epoch:
+- `degree = np.array([len(b) for b in basis])` (M,)
+- `contains[i,k] = (i in basis[k])` (p, M) -- bool sparse, O(p·M)
+
+Then:
+```python
+bmask &= (degree[None, :] < max_degree) & (~contains | self_interact)
+```
+Vectorized in numpy. `aux_filter` is user-supplied so it has to stay scalar,
+but the basic filter is the hot one.
+
+## `argsort` redone on every `eval()` call
+
+**Location:** `marsalgo.cc:429`.
+
+**Issue:** Per-xcol sort order depends only on `X`, which is immutable for the
+lifetime of `MarsAlgo`. Yet `argsort()` runs again every epoch for every
+candidate column.
+
+**Constraint:** A full `p × n` int32 cache is 4·p·n bytes -- 2.4 GB for the
+n=6M, p=100 case. Can't just cache everything.
+
+**Fix:** A Fast-MARS LRU sized to the current `max_inputs` cap covers the
+inputs we actually re-evaluate. Eviction by age matches Friedman's Fast-MARS
+recipe.
+
+## Counter cache-line layout
+
+**Location:** `marsalgo.h`, the `_dgks_count` atomic member.
+
+**Issue:** `_dgks_count` lives adjacent to `_scratches`, `_tol`, etc. on the
+`MarsAlgo` instance. Under heavy OMP parallelism inside `eval()`, a DGKS
+fetch_add from one worker invalidates the shared cache line for every other
+worker that's reading `_tol` (which they do, on every column). Probably
+negligible today because DGKS fires rarely, but if benchmarks ever show OMP
+scaling regressions on ill-conditioned data, separating the counter onto its
+own cache line (alignas(64), or a padded wrapper) is the fix.
+
+## Mac libomp double-link
+
+**Issue:** On Apple Silicon with `conda activate work`, running `mars.fit()`
+multi-threaded crashes:
+```
+OMP: Error #15: Initializing libomp.dylib, but found libomp.dylib already
+initialized.
+```
+This is the well-known Apple libomp + conda libomp link conflict, not
+specific to this codebase. Workaround:
+```
+KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 python ...
+```
+Single-threaded works fine. Real fix is to make the build link against
+exactly one libomp (either system or conda) -- not urgent since the
+production target is Linux.

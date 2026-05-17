@@ -1,5 +1,6 @@
 #include "../kernels.h"
 #include <Eigen/Dense>
+#include <atomic>
 #include <gtest/gtest.h>
 #include <numeric>
 #include <random>
@@ -179,4 +180,103 @@ TEST(KernelsTest, OrthonormalizeRespectsLeadingDims)
 
     // The unused padding columns of Bx_full must not have been touched.
     ASSERT_TRUE(Bx_full.rightCols(max_terms - p).isZero(0.0));
+}
+
+// ---------------------------------------------------------------------------
+// DGKS gate: when the candidate column has most of its energy in span(Bo)
+// (residual energy < 11% of projection energy), the kernel re-orthogonalizes
+// once and increments the counter. The retry must produce a result still
+// orthogonal to Bo and unit-norm.
+//
+// Construction: blend Bo[:,0] with a unit vector orthogonal to span(Bo) at
+// a 95%/5% energy split. That sits well past the s*9 < t_norm2 trigger
+// (0.05*9=0.45 << 0.95) but leaves enough residual that normalization stays
+// well above the degeneracy floor (tol = 1e-14).
+// ---------------------------------------------------------------------------
+TEST(KernelsTest, OrthonormalizeFiresDgksOnSevereCancellation)
+{
+    const int n = 200;
+    const int m = 4;
+    const int p = 1;
+    constexpr double TOL = 1e-14;
+
+    std::mt19937 rng(0xBADCAFE);
+    MatrixXdC Bo = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+
+    // Build a unit vector orthogonal to span(Bo) by projecting random noise
+    // out of Bo. This becomes the 5% "true residual" of the candidate column.
+    VectorXd v_perp = VectorXd::Random(n);
+    for (int k = 0; k < m; ++k) {
+        v_perp -= (Bo.col(k).dot(v_perp)) * Bo.col(k);
+    }
+    v_perp.normalize();
+
+    // 95%/5% energy split -- well inside the DGKS trigger region.
+    MatrixXf B(n, m);
+    B.setZero();
+    B.col(0) = (std::sqrt(0.95) * Bo.col(0) + std::sqrt(0.05) * v_perp).cast<float>();
+
+    ArrayXf x = ArrayXf::Ones(n);                // x=1 so B*x just selects col 0
+    ArrayXi mask(p); mask[0] = 0;
+
+    MatrixXd Bx(n, p);
+    MatrixXd T(m, p);
+    Bx.setZero();
+    T.setZero();
+
+    std::atomic<long> counter{0};
+    mars::orthonormalize(
+        n, m, p,
+        B.data(),    (int)B.outerStride(),
+        x.data(),
+        mask.data(),
+        Bo.data(),   (int)Bo.outerStride(),
+        Bx.data(),   (int)Bx.outerStride(),
+        T.data(),    (int)T.outerStride(),
+        TOL,
+        &counter);
+
+    // The DGKS branch must have fired exactly once (single column).
+    ASSERT_EQ(counter.load(), 1);
+
+    // Post-DGKS Bx is still orthogonal to Bo and unit-norm.
+    ASSERT_TRUE((Bo.transpose() * Bx).isZero(1e-12));
+    ASSERT_TRUE(Bx.colwise().norm().isOnes(1e-12));
+}
+
+// ---------------------------------------------------------------------------
+// Counter is left untouched when the input is well-conditioned (column has
+// most of its energy orthogonal to Bo).
+// ---------------------------------------------------------------------------
+TEST(KernelsTest, OrthonormalizeDoesNotFireDgksOnWellConditioned)
+{
+    const int n = 89;
+    const int m = 4;
+    const int p = 3;
+    constexpr double TOL = 1e-14;
+
+    std::mt19937 rng(0xFEED);
+    MatrixXdC Bo = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+    MatrixXf  B  = MatrixXf::Random(n, m);
+    ArrayXf   x  = ArrayXf::Random(n);
+    ArrayXi   mask = random_mask(m, p, rng);
+
+    MatrixXd Bx(n, p);
+    MatrixXd T(m, p);
+    Bx.setZero();
+    T.setZero();
+
+    std::atomic<long> counter{0};
+    mars::orthonormalize(
+        n, m, p,
+        B.data(),    (int)B.outerStride(),
+        x.data(),
+        mask.data(),
+        Bo.data(),   (int)Bo.outerStride(),
+        Bx.data(),   (int)Bx.outerStride(),
+        T.data(),    (int)T.outerStride(),
+        TOL,
+        &counter);
+
+    ASSERT_EQ(counter.load(), 0);
 }

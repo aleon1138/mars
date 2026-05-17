@@ -137,8 +137,9 @@ PYBIND11_MODULE(marslib, m)
          , py::arg("linear_only")
          , py::arg("threads")
         )
-    .def("nbasis", &MarsAlgo::nbasis)
-    .def("yvar",   &MarsAlgo::yvar)
-    .def("append", &MarsAlgo::append)
+    .def("nbasis",       &MarsAlgo::nbasis)
+    .def("yvar",         &MarsAlgo::yvar)
+    .def("append",       &MarsAlgo::append)
+    .def("dgks_consume", &MarsAlgo::dgks_consume)
     ;
 }

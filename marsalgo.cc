@@ -361,6 +361,10 @@ double MarsAlgo::yvar() const
 {
     return _yvar;
 }
+long MarsAlgo::dgks_consume()
+{
+    return _dgks_count.exchange(0, std::memory_order_relaxed);
+}
 
 void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
                     int xcol, const bool *bmask, int min_span, int end_span, bool linear_only,
@@ -407,7 +411,8 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         _data->Bo.data(), (int)_data->Bo.outerStride(),
         Bx.data(),        (int)Bx.outerStride(),
         S.BoTBx.data(),   (int)S.BoTBx.outerStride(),
-        _tol);
+        _tol,
+        &_dgks_count);
 
     // Calculate the linear delta SSE and map to the output buffer
     Ref<VectorXd> ybx = S.ybx.head(p);
@@ -574,8 +579,22 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
     VectorXd v = _data->B.col(_m).cast<double>(); // make a copy
     _data->B.col(_m) /= v.norm();
 
+    // Gram-Schmidt with a DGKS retry. The eval() side assumes Bo^T Bo = I,
+    // so any orthogonality drift accumulates across the whole fit. See
+    // mars::DGKS_GATE_RATIO_SQ in kernels.h for the trigger rationale.
+    double proj_norm2 = 0.0;
     for (int j = 0; j < _m; ++j) {
-        v -= (_data->Bo.col(j).transpose()*v) * _data->Bo.col(j);
+        const double c = _data->Bo.col(j).dot(v);
+        v.noalias() -= c * _data->Bo.col(j);
+        proj_norm2 += c * c;
+    }
+    const double v_norm2_post = v.squaredNorm();
+    if (v_norm2_post > _tol && v_norm2_post * mars::DGKS_GATE_RATIO_SQ < proj_norm2) {
+        _dgks_count.fetch_add(1, std::memory_order_relaxed);
+        for (int j = 0; j < _m; ++j) {
+            const double c = _data->Bo.col(j).dot(v);
+            v.noalias() -= c * _data->Bo.col(j);
+        }
     }
 
     const double w = v.norm();
