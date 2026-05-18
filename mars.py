@@ -463,7 +463,7 @@ def _init_inverse_state(XX, XY, YY, active_idx):
     except np.linalg.LinAlgError:
         # PSD-but-singular subblock: a tiny one-time jitter restores PD.
         # This doesn't propagate into the iterative updates.
-        jitter = 1e-12 * (np.trace(XX_sub) / m + 1.0)
+        jitter = 1e-8 * (np.trace(XX_sub) / m + 1.0)
         L = np.linalg.cholesky(XX_sub + jitter * np.eye(m))
 
     z = scipy.linalg.solve_triangular(L, XY_sub, lower=True)
