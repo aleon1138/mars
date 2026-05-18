@@ -6,6 +6,7 @@ Multivariate Adaptive Regression Splines
 import time
 import numba
 import numpy as np
+import scipy.linalg
 import marslib
 
 __version__ = marslib.__version__
@@ -421,7 +422,8 @@ def gram(A, B=None, chunk_size=128):
     """
     if B is None:
         B = A
-    assert len(A) == len(B)
+    if len(A) != len(B):
+        raise ValueError("shapes are not aligned: {A.shape} x {B.shape}")
 
     A2 = A[:, np.newaxis] if A.ndim == 1 else A
     B2 = B[:, np.newaxis] if B.ndim == 1 else B
@@ -442,10 +444,132 @@ def gram(A, B=None, chunk_size=128):
 # -----------------------------------------------------------------------------
 
 
+def _init_inverse_state(XX, XY, YY, active_idx):
+    """
+    Build (H, β, SSE) for the active subset via a fresh Cholesky.
+
+    Used both at the start of `_backward_eliminate` and as a periodic refresh
+    inside it. Computing H = (LLᵀ)⁻¹ via two triangular solves on L is more
+    accurate than `np.linalg.inv(XX_sub)`.
+    """
+    m = len(active_idx)
+    if m == 0:
+        return np.zeros((0, 0)), np.zeros(0), float(YY)
+
+    XX_sub = XX[np.ix_(active_idx, active_idx)]
+    XY_sub = XY[active_idx]
+    try:
+        L = np.linalg.cholesky(XX_sub)
+    except np.linalg.LinAlgError:
+        # PSD-but-singular subblock: a tiny one-time jitter restores PD.
+        # This doesn't propagate into the iterative updates.
+        jitter = 1e-12 * (np.trace(XX_sub) / m + 1.0)
+        L = np.linalg.cholesky(XX_sub + jitter * np.eye(m))
+
+    z = scipy.linalg.solve_triangular(L, XY_sub, lower=True)
+    beta = scipy.linalg.solve_triangular(L.T, z, lower=False)
+    L_inv = scipy.linalg.solve_triangular(L, np.eye(m), lower=True)
+    H = L_inv.T @ L_inv  # = (L Lᵀ)⁻¹ = XX_sub⁻¹
+    SSE = max(YY - z @ z, 0.0)
+    return H, beta, SSE
+
+
+def _backward_eliminate(XX, XY, YY, mask, penalty, n_true):
+    """
+    Backward stepwise selection via Schur-complement updates.
+
+    Maintains H = XX_active⁻¹ and β = H · XY_active across the elimination.
+    At each step the candidate with smallest ΔSSE_j = β_j² / H_jj is dropped,
+    and H, β are updated by rank-1 (block-inverse identity). This is O(m²) per
+    step → O(M³) total, vs. O(M⁵) for a full re-solve per candidate.
+
+    The intercept (global column 0) is protected from removal — `prune()`
+    assumes `B[:, 0] = 1`, matching the basis layout produced by `fit()`.
+
+    Numerical safeguards (catastrophic cancellation can otherwise bite when
+    columns are near-collinear, since the update H_jj' = H_jj - H_jk²/H_kk
+    is the difference of two similar positive quantities):
+      * Initial H built from Cholesky (not `np.linalg.inv`).
+      * H is re-symmetrized after every step.
+      * Diagonal clamped to ≥ 0 (rounding can push it slightly below zero).
+      * Candidates with H_jj below a tolerance are skipped.
+      * H, β, SSE are rebuilt from a fresh Cholesky every `max(64, M//4)`
+        steps to bound accumulated drift.
+      * The returned `best_mask` feeds only the final fresh-Cholesky solve
+        in `prune()`, so any residual drift in β/H never reaches the caller.
+    """
+    M = len(XX)
+    active_idx = np.where(mask)[0]
+    m = len(active_idx)
+    if m == 0:
+        return mask.copy()
+
+    H, beta, SSE = _init_inverse_state(XX, XY, YY, active_idx)
+
+    def _gcv(sse, mm):
+        dof = mm + penalty * (mm - 1)
+        denom = 1.0 - dof / n_true
+        return sse / (denom * denom) if denom > 0 else np.inf
+
+    best_gcv = _gcv(SSE, m)
+    best_mask = mask.copy()
+
+    refresh_every = max(64, M // 4)
+    since_refresh = 0
+
+    while m > 0:
+        diag_H = np.diag(H)
+        tol = 1e-12 * max(float(diag_H.max()), 1.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cand = np.where(diag_H > tol, beta * beta / np.maximum(diag_H, tol), np.inf)
+
+        # Protect the intercept (global column 0) from removal.
+        if active_idx[0] == 0:
+            cand[0] = np.inf
+
+        j = int(np.argmin(cand))
+        if not np.isfinite(cand[j]):
+            break  # intercept-only / all singular — nothing further to drop
+
+        SSE = SSE + max(float(cand[j]), 0.0)
+
+        # Rank-1 (Schur complement) update: H' = H - (H[:,k]/H_kk)·H[k,:]
+        h_col = H[:, j].copy()
+        h_kk = float(H[j, j])
+        if h_kk > tol:
+            v = h_col / h_kk
+            beta = beta - beta[j] * v
+            H = H - np.outer(v, h_col)
+            H = 0.5 * (H + H.T)  # symmetrize against floating-point drift
+            np.fill_diagonal(H, np.maximum(np.diag(H), 0.0))  # clamp -0 rounding
+
+        keep = np.arange(len(beta)) != j
+        beta = beta[keep]
+        H = H[np.ix_(keep, keep)]
+        mask[active_idx[j]] = False
+        active_idx = np.delete(active_idx, j)
+        m -= 1
+
+        since_refresh += 1
+        if since_refresh >= refresh_every and m > 0:
+            H, beta, SSE = _init_inverse_state(XX, XY, YY, active_idx)
+            since_refresh = 0
+
+        gcv = _gcv(SSE, m)
+        if gcv < best_gcv:
+            best_gcv = gcv
+            best_mask = mask.copy()
+
+    return best_mask
+
+
 def prune(B, y, w=None, n_true=None, penalty=3, ridge=0, mask=None):
     """
     Solve for the linear coefficients using backward stepwise selection
-    (GCV pruning).
+    (GCV pruning), following Friedman (1991) §3.4.
+
+    The intercept (column 0 of `B`, by convention from `fit()`/`expand()`)
+    is protected from removal.
 
     Columns of B are internally standardized (unit diagonal of the Gram matrix)
     so that `ridge` has a consistent effect across features. The returned
@@ -490,10 +614,6 @@ def prune(B, y, w=None, n_true=None, penalty=3, ridge=0, mask=None):
             beta[mask] = np.linalg.lstsq(xx, xy, rcond=None)[0]
         return beta
 
-    def _gcv_sse(xx, xy, yy, mask, dof, n_true):
-        sse = yy - np.dot(xy, _solve(xx, xy, mask))
-        return sse / (1.0 - dof / n_true) ** 2
-
     n, M = B.shape
     if n_true is None:
         n_true = n
@@ -523,38 +643,18 @@ def prune(B, y, w=None, n_true=None, penalty=3, ridge=0, mask=None):
     XX = XX / d_safe / d_safe[:, np.newaxis]
     XY = XY / d_safe
 
-    # Differs from Friedman (1991) Section 3.4 in two ways:
-    # 1. We minimize GCV directly at each elimination step rather than
-    #    removing the term with the smallest RSS increase and selecting
-    #    the best GCV subset post-hoc.
-    # 2. The intercept is not protected and may be removed if doing so
-    #    improves GCV.
+    # Backward stepwise elimination — see `_backward_eliminate` for the
+    # incremental O(M³) implementation and its numerical safeguards. The
+    # search returns the subset (along the elimination path) achieving the
+    # smallest GCV; we then redo the final solve from scratch below so the
+    # returned coefficients are not affected by any drift inside the loop.
     mask = np.array(mask) if mask is not None else np.ones(M, dtype="bool")
     mask = mask & active
-    m = mask.sum()
-    dof = m + penalty * (m - 1)
-    best_sse = _gcv_sse(XX, XY, YY, mask, dof, n_true)
-    best_mask = mask.copy()
-
-    # Eliminate terms one at a time, tracking the globally best GCV.
-    while mask.sum() > 0:
-        sse = np.full(M, np.inf)
-        for i in np.where(mask)[0]:
-            k = mask & (np.arange(M) != i)
-            m = k.sum()
-            dof = m + penalty * (m - 1)
-            sse[i] = _gcv_sse(XX, XY, YY, k, dof, n_true)
-        mask[np.argmin(sse)] = False
-        if sse.min() < best_sse:
-            best_sse = sse.min()
-            best_mask = mask.copy()
-            assert np.isfinite(best_sse)
-
-    mask = best_mask
+    best_mask = _backward_eliminate(XX, XY, YY, mask, penalty, n_true)
 
     if ridge > 0:
         XX = XX + np.eye(len(XX)) * ridge
-    return _solve(XX, XY, mask) / d_safe
+    return _solve(XX, XY, best_mask) / d_safe
 
 
 # -----------------------------------------------------------------------------

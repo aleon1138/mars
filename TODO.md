@@ -486,18 +486,6 @@ if (mse >= -_tol) {
 }
 ```
 
-## `prune()` is O(M⁴)
-
-**Location:** `mars.py:515-525`, the backward-elimination loop.
-
-**Issue:** Each elimination step calls `_gcv_sse` for every still-active term,
-and each `_gcv_sse` solves a fresh `np.linalg.lstsq` from scratch. Total cost
-is O(M⁴) where M is the final basis count. For M=30 it's ~14k full solves
-(seconds); M=100 is hours.
-
-**Fix:** Maintain a Cholesky (or QR) of `XX[active, active]` and do rank-1
-downdates when removing a column. Same algorithm, ~M× faster.
-
 ## Python scalar loop builds `bmask` each epoch
 
 **Location:** `mars.py:263-265`.
