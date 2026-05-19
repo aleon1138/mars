@@ -445,13 +445,7 @@ def gram(A, B=None, chunk_size=128):
 
 
 def _init_inverse_state(XX, XY, YY, active_idx):
-    """
-    Build (H, β, SSE) for the active subset via a fresh Cholesky.
-
-    Used both at the start of `_backward_eliminate` and as a periodic refresh
-    inside it. Computing H = (LLᵀ)⁻¹ via two triangular solves on L is more
-    accurate than `np.linalg.inv(XX_sub)`.
-    """
+    """Build (H, β, SSE) for the active subset via a fresh Cholesky."""
     m = len(active_idx)
     if m == 0:
         return np.zeros((0, 0)), np.zeros(0), float(YY)
@@ -461,15 +455,13 @@ def _init_inverse_state(XX, XY, YY, active_idx):
     try:
         L = np.linalg.cholesky(XX_sub)
     except np.linalg.LinAlgError:
-        # PSD-but-singular subblock: a tiny one-time jitter restores PD.
-        # This doesn't propagate into the iterative updates.
         jitter = 1e-8 * (np.trace(XX_sub) / m + 1.0)
         L = np.linalg.cholesky(XX_sub + jitter * np.eye(m))
 
     z = scipy.linalg.solve_triangular(L, XY_sub, lower=True)
     beta = scipy.linalg.solve_triangular(L.T, z, lower=False)
     L_inv = scipy.linalg.solve_triangular(L, np.eye(m), lower=True)
-    H = L_inv.T @ L_inv  # = (L Lᵀ)⁻¹ = XX_sub⁻¹
+    H = L_inv.T @ L_inv
     SSE = max(YY - z @ z, 0.0)
     return H, beta, SSE
 
@@ -478,25 +470,10 @@ def _backward_eliminate(XX, XY, YY, mask, penalty, n_true):
     """
     Backward stepwise selection via Schur-complement updates.
 
-    Maintains H = XX_active⁻¹ and β = H · XY_active across the elimination.
-    At each step the candidate with smallest ΔSSE_j = β_j² / H_jj is dropped,
-    and H, β are updated by rank-1 (block-inverse identity). This is O(m²) per
-    step → O(M³) total, vs. O(M⁵) for a full re-solve per candidate.
-
-    The intercept (global column 0) is protected from removal — `prune()`
-    assumes `B[:, 0] = 1`, matching the basis layout produced by `fit()`.
-
-    Numerical safeguards (catastrophic cancellation can otherwise bite when
-    columns are near-collinear, since the update H_jj' = H_jj - H_jk²/H_kk
-    is the difference of two similar positive quantities):
-      * Initial H built from Cholesky (not `np.linalg.inv`).
-      * H is re-symmetrized after every step.
-      * Diagonal clamped to ≥ 0 (rounding can push it slightly below zero).
-      * Candidates with H_jj below a tolerance are skipped.
-      * H, β, SSE are rebuilt from a fresh Cholesky every `max(64, M//4)`
-        steps to bound accumulated drift.
-      * The returned `best_mask` feeds only the final fresh-Cholesky solve
-        in `prune()`, so any residual drift in β/H never reaches the caller.
+    Maintains H = XX_active⁻¹ and β = H · XY_active; at each step drops the
+    candidate with smallest ΔSSE_j = β_j² / H_jj and updates H, β by rank-1.
+    O(M³) total, vs. O(M⁵) for a full re-solve per candidate. Periodic
+    Cholesky refresh bounds drift; the intercept (global column 0) is pinned.
     """
     M = len(XX)
     active_idx = np.where(mask)[0]
@@ -523,29 +500,24 @@ def _backward_eliminate(XX, XY, YY, mask, penalty, n_true):
         with np.errstate(divide="ignore", invalid="ignore"):
             cand = np.where(diag_H > tol, beta * beta / np.maximum(diag_H, tol), np.inf)
 
-        # Protect the intercept (global column 0) from removal.
         if active_idx[0] == 0:
             cand[0] = np.inf
 
         j = int(np.argmin(cand))
         if not np.isfinite(cand[j]):
-            break  # intercept-only / all singular — nothing further to drop
+            break
 
         SSE = SSE + max(float(cand[j]), 0.0)
 
-        # Rank-1 (Schur complement) update: H' = H - (H[:,k]/H_kk)·H[k,:]
-        h_col = H[:, j].copy()
-        h_kk = float(H[j, j])
-        if h_kk > tol:
-            v = h_col / h_kk
-            beta = beta - beta[j] * v
-            H = H - np.outer(v, h_col)
-            H = 0.5 * (H + H.T)  # symmetrize against floating-point drift
-            np.fill_diagonal(H, np.maximum(np.diag(H), 0.0))  # clamp -0 rounding
+        h_col = H[:, j]
+        v = h_col / H[j, j]
+        beta = beta - beta[j] * v
+        H = H - np.outer(v, h_col)
+        H = 0.5 * (H + H.T)
+        np.fill_diagonal(H, np.maximum(np.diag(H), 0.0))
 
-        keep = np.arange(len(beta)) != j
-        beta = beta[keep]
-        H = H[np.ix_(keep, keep)]
+        beta = np.delete(beta, j)
+        H = np.delete(np.delete(H, j, axis=0), j, axis=1)
         mask[active_idx[j]] = False
         active_idx = np.delete(active_idx, j)
         m -= 1
@@ -605,15 +577,6 @@ def prune(B, y, w=None, n_true=None, penalty=3, ridge=0, mask=None):
         Coefficient vector; pruned terms have coefficient 0.
     """
 
-    def _solve(xx, xy, mask):
-        # You must use 'lstsq' so we can handle under-determined problems
-        beta = np.zeros(len(xy))
-        if mask.any():
-            xx = xx[np.ix_(mask, mask)]
-            xy = xy[mask]
-            beta[mask] = np.linalg.lstsq(xx, xy, rcond=None)[0]
-        return beta
-
     n, M = B.shape
     if n_true is None:
         n_true = n
@@ -643,18 +606,21 @@ def prune(B, y, w=None, n_true=None, penalty=3, ridge=0, mask=None):
     XX = XX / d_safe / d_safe[:, np.newaxis]
     XY = XY / d_safe
 
-    # Backward stepwise elimination — see `_backward_eliminate` for the
-    # incremental O(M³) implementation and its numerical safeguards. The
-    # search returns the subset (along the elimination path) achieving the
-    # smallest GCV; we then redo the final solve from scratch below so the
-    # returned coefficients are not affected by any drift inside the loop.
+    # Backward elimination returns the GCV-best subset; we re-solve from
+    # scratch below so the returned coefficients are free of any drift.
     mask = np.array(mask) if mask is not None else np.ones(M, dtype="bool")
     mask = mask & active
     best_mask = _backward_eliminate(XX, XY, YY, mask, penalty, n_true)
 
     if ridge > 0:
         XX = XX + np.eye(len(XX)) * ridge
-    return _solve(XX, XY, best_mask) / d_safe
+    beta = np.zeros(M)
+    if best_mask.any():
+        # lstsq handles under-determined sub-problems gracefully
+        beta[best_mask] = np.linalg.lstsq(
+            XX[np.ix_(best_mask, best_mask)], XY[best_mask], rcond=None
+        )[0]
+    return beta / d_safe
 
 
 # -----------------------------------------------------------------------------
