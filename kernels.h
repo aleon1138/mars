@@ -1,11 +1,3 @@
-/*
- *  Hand-rolled numerical kernels that replace specific Eigen expressions on
- *  the eval() hot path. Eigen produces correct code but allocates temporaries
- *  for matmul-shaped expressions; in a 64-thread inner loop those allocations
- *  thrash glibc's per-thread arenas and serialize page faults behind the
- *  kernel's mmap_lock. The kernels here take raw pointers + strides (BLAS
- *  style) and do not allocate.
- */
 #pragma once
 
 #include <atomic>

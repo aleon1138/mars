@@ -1,12 +1,10 @@
 /*
- *  Hand-rolled BLAS-style kernels for the MARS forward pass. See kernels.h
- *  for layout contracts. Inner strides are unconditionally 1; the only
- *  parameters are outer (leading) strides that genuinely vary between
- *  callers. Not intended as a general-purpose library.
+ *  BLAS-style kernels for the MARS forward pass. See kernels.h for layout
+ *  contracts. Inner strides are unconditionally 1; the only parameters are
+ *  outer (leading) strides that genuinely vary between callers.
  */
 #include "kernels.h"
 #include <cmath>      // sqrt
-#include <cstddef>    // size_t
 #if defined(__AVX__)
 #  include <immintrin.h>
 #endif

@@ -19,7 +19,7 @@ struct cov_t {
 };
 
 void argsort(int32_t *idx, const float *v, int n);
-ArrayXi nonzero(const ArrayXb &x);
+int nonzero(int *out, const bool *mask, int n);
 cov_t covariates(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const double *y,
                  double xm, double ym, double k0, float k1, int m);
 
@@ -141,12 +141,10 @@ TEST(MarsTest, SortColumns)
 
 TEST(MarsTest, NonZero)
 {
-    ArrayXb mask = ArrayXb::Ones(5);
-    mask[0] = false;
-    mask[3] = false;
-
-    ArrayXi idx = nonzero(mask);
-    ASSERT_EQ(idx.rows(),3);
+    bool mask[5] = {false, true, true, false, true};
+    int idx[5];
+    int n = nonzero(idx, mask, 5);
+    ASSERT_EQ(n,3);
     ASSERT_EQ(idx[0],1);
     ASSERT_EQ(idx[1],2);
     ASSERT_EQ(idx[2],4);

@@ -42,26 +42,10 @@ void argsort(int32_t *idx, const float *v, int n)
 }
 
 /*
- *  Return the indexes of non-zero values.
- */
-ArrayXi nonzero(const ArrayXb &x)
-{
-    ArrayXi y(x.size());
-    int n = 0;
-    for (int i = 0; i < x.rows(); ++i) {
-        if (x[i]) {
-            y[n++] = i;
-        }
-    }
-    return y.head(n);
-}
-
-/*
  *  Fill `out` with the indexes of `true` entries in `mask` (length `n`) and
- *  return the count. Non-allocating variant of `nonzero` for the hot path.
- *  `out` must have capacity for at least `n` entries.
+ *  return the count. `out` must have capacity for at least `n` entries.
  */
-int nonzero_into(int *out, const bool *mask, int n)
+int nonzero(int *out, const bool *mask, int n)
 {
     int count = 0;
     for (int i = 0; i < n; ++i) {
@@ -379,7 +363,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     Map<ArrayXd>(hinge_cuts, _m) = ArrayXd::Constant(_m,NAN);
 
     auto &S = *scratch._impl;
-    const int p = nonzero_into(S.bcols.data(), bmask, _m);
+    const int p = nonzero(S.bcols.data(), bmask, _m);
     if (p == 0) {
         return;
     }

@@ -82,7 +82,7 @@ AVX-512 without bf16 is probably a wash because:
   hand-rolled AVX/FMA — Eigen isn't doing the heavy lifting there. The
   remaining ~70 Eigen touchpoints in `marsalgo.cc` are mostly book-keeping:
   views, slices, element-wise scaling, and norm reductions. There is exactly
-  one BLAS-like op in the codebase: `Bx.transpose() * y` at line 387
+  one BLAS-like op in the codebase: `Bx.transpose() * y` at line 403
   (matrix-vector product, p ≤ 400 columns), plus a couple of
   `colwise().squaredNorm()` calls at construction. A minimal BLAS providing
   GEMV, AXPY, dot/norm, and a few cwise kernels is enough.
@@ -117,11 +117,11 @@ AVX-512 without bf16 is probably a wash because:
 
 # MARS improvements — TODO
 
-Context for future-me: this is a roadmap of four improvements to the
+Context for future-me: this is a roadmap of three improvements to the
 `aleon1138/mars` codebase, ordered roughly from cheapest to most invasive.
-The first three sit on top of the existing hinge-basis design; the fourth
+The first two sit on top of the existing hinge-basis design; the third
 (BMARS) replaces the internal linear algebra wholesale. They are independent
-in principle — you can ship (1)–(3) without touching (4) — but (3) and (4)
+in principle — you can ship (1)–(2) without touching (3) — but (2) and (3)
 compose particularly well.
 
 The underlying motivation across all four is the same observation: stock MARS
@@ -134,7 +134,7 @@ below addresses some part of that failure chain.
 
 ## 1. Fix `endspan` logic
 
-Aplied at the **boundaries** of the data: minimum gap between the
+Applied at the **boundaries** of the data: minimum gap between the
 smallest/largest data point and the first/last candidate knot for each
 variable.
 
@@ -210,10 +210,10 @@ $K$ is the candidate grid size.
 
 ### Implementation order
 
-Do this **after** (1) and (2) are working — knot tuning amplifies the
-quality of the discrete pick, which itself depends on a clean candidate
-filter. Wire in the line search as a refinement step that runs after the
-discrete forward pass and before committing the basis function.
+Do this **after** (1) is working — knot tuning amplifies the quality of
+the discrete pick, which itself depends on a clean candidate filter. Wire
+in the line search as a refinement step that runs after the discrete
+forward pass and before committing the basis function.
 
 ### Validation
 
@@ -238,7 +238,7 @@ conditioned.
 
 ### Why this is the real fix
 
-Items (1)–(3) reduce the *frequency* of conditioning failures. They don't
+Items (1)–(2) reduce the *frequency* of conditioning failures. They don't
 fix the underlying problem, which is that truncated power basis functions
 $(x - t)_+$ have **unbounded support** — they grow without bound for
 $x > t$. Every pair of such basis functions has substantial overlap in
@@ -319,23 +319,23 @@ banded matvecs.
 
 Don't try to do the full thing in one go. Stage it:
 
-**Stage 4a — univariate, linear B-splines, snap-to-grid knots.**
+**Stage 3a — univariate, linear B-splines, snap-to-grid knots.**
 ~A few hundred lines. Replaces just the inner-product computation in the
 forward pass for univariate (non-interaction) terms. Validate on the
 Friedman benchmark — should match standard MARS to machine precision on
 well-conditioned cases and outperform it on ill-conditioned ones.
 
-**Stage 4b — extend to tensor-product interactions.**
+**Stage 3b — extend to tensor-product interactions.**
 The Kronecker matvec is the only really new piece. Cost per inner product
 for an order-$k$ interaction is $\mathcal{O}(k \cdot K \cdot \text{nnz})$,
 which beats the hinge version's dense $\mathcal{O}(N)$ for any $K \ll N$.
 
-**Stage 4c — integrate with knot tuning (item 3).**
+**Stage 3c — integrate with knot tuning (item 2).**
 Knot tuning in the B-spline basis is a 1D line search over the
 representation coefficients $\beta$, which is even cheaper than in the
 hinge basis because the support is bounded.
 
-**Stage 4d (optional) — quadratic B-splines for $C^1$ continuity.**
+**Stage 3d (optional) — quadratic B-splines for $C^1$ continuity.**
 This recovers Friedman's cubic-smoothing benefit (BMARS as published is
 purely $C^0$). A hinge isn't exactly representable in quadratic B-splines
 on a finite grid, but the error is a piecewise-quadratic correction that
@@ -347,7 +347,7 @@ solid and you have a concrete need for $C^1$.
 **Knot grid resolution vs. accuracy.** Snapping candidate knots to a grid
 of $K$ points gives up Friedman's continuous knot search. In practice this
 is fine — Friedman's own fast-MARS does subsampling that's morally
-equivalent — and item (3) above (knot tuning) gives you sub-grid resolution
+equivalent — and item (2) above (knot tuning) gives you sub-grid resolution
 back where it matters.
 
 **Boundary handling.** Linear B-splines at the edges of the grid are
@@ -406,20 +406,18 @@ Three regimes to test:
 
 ## Implementation order
 
-1. **Item 1 (`minspan`)** — easiest, biggest first improvement, catches
+1. **Item 1 (`endspan` audit/fix)** — easiest first improvement; catches
    regressions in the candidate-generation code path. Do this first.
-2. **Item 2 (`endspan` audit/fix)** — do alongside item 1 since they share
-   the candidate-slice logic.
-3. **Item 3 (knot tuning)** — depends on (1) and (2) being correct.
-   Independent of item 4.
-4. **Item 4a (univariate BMARS)** — biggest win, but most invasive.
-   Validate against items 1–3 in well-conditioned regime first.
-5. **Item 4b (tensor-product BMARS)** — extension of 4a.
-6. **Item 4c (knot tuning in B-spline basis)** — composition step.
-7. **Item 4d (quadratic B-splines)** — only if needed.
+2. **Item 2 (knot tuning)** — depends on (1) being correct. Independent
+   of item 3.
+3. **Item 3a (univariate BMARS)** — biggest win, but most invasive.
+   Validate against items 1–2 in well-conditioned regime first.
+4. **Item 3b (tensor-product BMARS)** — extension of 3a.
+5. **Item 3c (knot tuning in B-spline basis)** — composition step.
+6. **Item 3d (quadratic B-splines)** — only if needed.
 
-Items 1, 2, 3 can each ship as standalone improvements with their own
-benchmarks. Item 4 is a multi-month project; stage it carefully and keep
+Items 1 and 2 can each ship as standalone improvements with their own
+benchmarks. Item 3 is a multi-month project; stage it carefully and keep
 the hinge-basis code path working as the validation oracle.
 
 ---
@@ -450,7 +448,7 @@ Each item is independent and small; none of them block correctness today.
 
 ## `eval()`'s bootstrap covariates_impl call passes the wrong `ym`
 
-**Location:** `marsalgo.cc:484`, the first call to `covariates_impl<true>` before
+**Location:** `marsalgo.cc:476`, the first call to `covariates_impl<true>` before
 the cut sweep loop.
 
 **Issue:** The `ym` parameter is hardcoded to `ybx[0]` but should be `ybx[j]`
@@ -465,7 +463,7 @@ One-line change.
 
 ## `append()` recomputes the full `ybo` projection on every call
 
-**Location:** `marsalgo.cc:586-587`.
+**Location:** `marsalgo.cc:596-597`.
 
 **Issue:**
 ```cpp
@@ -513,7 +511,7 @@ but the basic filter is the hot one.
 
 ## `argsort` redone on every `eval()` call
 
-**Location:** `marsalgo.cc:429`.
+**Location:** `marsalgo.cc:418`.
 
 **Issue:** Per-xcol sort order depends only on `X`, which is immutable for the
 lifetime of `MarsAlgo`. Yet `argsort()` runs again every epoch for every
