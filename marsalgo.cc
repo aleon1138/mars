@@ -592,8 +592,11 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
     if (w*w > _tol) {
         _data->Bo.col(_m) = v/w;
 
-        // This assumes the norm of '_data->y' == 1
-        VectorXd ybo = _data->Bo.leftCols(_m+1).transpose() * _data->y.matrix();
+        // Extend the cached ybo with one new entry; relies on ||y|| == 1 so
+        // mse = (||y||^2 - ||ybo||^2) / n collapses to (1 - ||ybo||^2) / n.
+        VectorXd ybo(_m + 1);
+        ybo.head(_m) = _data->ybo;
+        ybo[_m] = _data->Bo.col(_m).dot(_data->y.matrix());
         const double mse = (1. - ybo.squaredNorm()) / _data->X.rows();
         if (mse >= -_tol) { // gracefully handle values close to zero
             _m += 1;

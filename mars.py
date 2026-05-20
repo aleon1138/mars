@@ -292,7 +292,8 @@ def fit(X, y, w=None, **kwargs):
 
         # Update the delta-SSE cache
         # TODO - should we really be using GCV adjusted SSE instead?
-        basis_sse[bmask.any(axis=0)] = sse2[:, bmask.any(axis=0)].max(axis=0)
+        basis_active = bmask.any(axis=0)
+        basis_sse[basis_active] = sse2[:, basis_active].max(axis=0)
         input_sse[input_to_use] = sse2[input_to_use].max(axis=1)
         input_age[input_to_use] = epoch
         epoch += 1
@@ -458,11 +459,10 @@ def _init_inverse_state(XX, XY, YY, active_idx):
         jitter = 1e-8 * (np.trace(XX_sub) / m + 1.0)
         L = np.linalg.cholesky(XX_sub + jitter * np.eye(m))
 
-    z = scipy.linalg.solve_triangular(L, XY_sub, lower=True)
-    beta = scipy.linalg.solve_triangular(L.T, z, lower=False)
-    L_inv = scipy.linalg.solve_triangular(L, np.eye(m), lower=True)
-    H = L_inv.T @ L_inv
-    SSE = max(YY - z @ z, 0.0)
+    cho = (L, True)
+    beta = scipy.linalg.cho_solve(cho, XY_sub)
+    H = scipy.linalg.cho_solve(cho, np.eye(m))
+    SSE = max(float(YY - XY_sub @ beta), 0.0)
     return H, beta, SSE
 
 
@@ -497,8 +497,8 @@ def _backward_eliminate(XX, XY, YY, mask, penalty, n_true):
     while m > 0:
         diag_H = np.diag(H)
         tol = 1e-12 * max(float(diag_H.max()), 1.0)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            cand = np.where(diag_H > tol, beta * beta / np.maximum(diag_H, tol), np.inf)
+        cand = np.full_like(beta, np.inf)
+        np.divide(beta * beta, diag_H, out=cand, where=diag_H > tol)
 
         if active_idx[0] == 0:
             cand[0] = np.inf
@@ -650,32 +650,22 @@ def compact(model, beta):
     beta : array
         Corresponding coefficient vector.
     """
-    M = len(model)
-    keep = np.zeros(M, dtype="bool")
+    beta = np.asarray(beta)
+    keep = beta != 0
 
-    # Mark nodes with non-zero beta
-    for i in range(M):
-        if beta[i] != 0:
-            keep[i] = True
+    # Parents always have a lower index than their children, so one reverse
+    # sweep propagates the ancestor flag all the way up the chain.
+    for i in range(len(model) - 1, 0, -1):
+        if keep[i] and model[i]["type"] != b"i":
+            keep[model[i]["basis"]] = True
 
-    # Walk up parent chains to keep all ancestors
-    for i in range(M):
-        j = i
-        while keep[j] and model[j]["type"] != b"i":
-            j = model[j]["basis"]
-            keep[j] = True
-
-    # Build old-to-new index mapping
-    new_idx = np.full(M, -1, dtype="i4")
+    # Remap parent pointers to the new (compacted) indices.
+    new_idx = np.full(len(model), -1, dtype="i4")
     new_idx[keep] = np.arange(keep.sum())
 
-    # Build compacted model and beta
     new_model = model[keep].copy()
     new_beta = beta[keep].copy()
-    for i in range(len(new_model)):
-        if new_model[i]["type"] != b"i":
-            new_model[i]["basis"] = new_idx[new_model[i]["basis"]]
-
+    new_model["basis"] = new_idx[new_model["basis"]]
     return new_model, new_beta
 
 

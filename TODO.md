@@ -461,29 +461,6 @@ SSE math reads from `o` only in the main loop body.
 fix `ybx[0]` to `ybx[j]` or drop the argument since the result is unused.
 One-line change.
 
-## `append()` recomputes the full `ybo` projection on every call
-
-**Location:** `marsalgo.cc:596-597`.
-
-**Issue:**
-```cpp
-VectorXd ybo = _data->Bo.leftCols(_m+1).transpose() * _data->y.matrix();
-```
-This is an O(n·m) matvec, but only the new last entry changed; the leading
-m entries are still valid in `_data->ybo`. Wasted work proportional to model
-size.
-
-**Fix:** Compute only the new entry and append it:
-```cpp
-const double new_ybo = _data->Bo.col(_m).dot(_data->y.matrix());
-const double mse = (1. - _data->ybo.squaredNorm() - new_ybo*new_ybo) / n;
-if (mse >= -_tol) {
-    _data->ybo.conservativeResize(_m+1);
-    _data->ybo[_m] = new_ybo;
-    ...
-}
-```
-
 ## Python scalar loop builds `bmask` each epoch
 
 **Location:** `mars.py:263-265`.

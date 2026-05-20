@@ -54,7 +54,8 @@ pairs to evaluate (Fast-MARS cache).
 on top of `marslib`. Uses `numba` for `expand()`. Key public API:
 - `fit(X, y, ...)` → structured numpy array `model` of basis nodes
 - `expand(X, model)` → basis matrix `B` for a new dataset
-- `prune(XX, XY, YY, ...)` → backward pass / GCV pruning
+- `prune(B, y, ...)` → backward pass / GCV pruning (returns a coefficient vector)
+- `compact(model, beta)` → drop pruned nodes, remap parent pointers
 - `pprint(model, beta)` → human-readable model formula
 
 **Performance note (2026-04-12):** We benchmarked replacing the hand-written AVX

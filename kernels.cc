@@ -10,6 +10,81 @@
 #endif
 
 namespace mars {
+namespace {
+
+/*
+ *  Inner kernels along the basis dimension k. AVX2 unrolls 4-wide; the
+ *  scalar tail covers the leftover. Hot on every column of orthonormalize().
+ */
+
+// tc[k] += scalar * bo_row[k] for k in 0..m.
+inline void axpy_m(double *tc, const double *bo_row, double scalar, int m)
+{
+    int k = 0;
+#if defined(__AVX__)
+    __m256d bcast = _mm256_set1_pd(scalar);
+    for (; k + 4 <= m; k += 4) {
+        __m256d t  = _mm256_loadu_pd(tc + k);
+        __m256d bo = _mm256_loadu_pd(bo_row + k);
+        _mm256_storeu_pd(tc + k, _mm256_fmadd_pd(bo, bcast, t));
+    }
+#endif
+    for (; k < m; ++k) {
+        tc[k] += bo_row[k] * scalar;
+    }
+}
+
+// dot(bo_row[:m], tc[:m]).
+inline double dot_m(const double *bo_row, const double *tc, int m)
+{
+    int k = 0;
+    double acc = 0.0;
+#if defined(__AVX__)
+    __m256d acc4 = _mm256_setzero_pd();
+    for (; k + 4 <= m; k += 4) {
+        __m256d bo = _mm256_loadu_pd(bo_row + k);
+        __m256d t  = _mm256_loadu_pd(tc + k);
+        acc4 = _mm256_fmadd_pd(bo, t, acc4);
+    }
+    acc = (acc4[0] + acc4[1]) + (acc4[2] + acc4[3]);
+#endif
+    for (; k < m; ++k) {
+        acc += bo_row[k] * tc[k];
+    }
+    return acc;
+}
+
+// For each row i: bx[i] -= dot(Bo[i,:], tc). Returns sum bx[i]^2 over the
+// updated column; lets the caller decide on the DGKS retry / normalization.
+inline double project_subtract_and_norm(
+    int n, int m,
+    const double *Bo, int ldBo,
+    const double *tc,
+    double *bx)
+{
+    double s = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double v = bx[i] - dot_m(Bo + i * ldBo, tc, m);
+        bx[i] = v;
+        s += v * v;
+    }
+    return s;
+}
+
+// tc = Bo^T * bx (single column).
+inline void compute_BoT_bx_col(
+    int n, int m,
+    const double *Bo, int ldBo,
+    const double *bx,
+    double *tc)
+{
+    for (int k = 0; k < m; ++k) tc[k] = 0.0;
+    for (int i = 0; i < n; ++i) {
+        axpy_m(tc, Bo + i * ldBo, bx[i], m);
+    }
+}
+
+} // namespace
 
 void orthonormalize(
     int n, int m, int p,
@@ -45,10 +120,8 @@ void orthonormalize(
 
     // ------------------------------------------------------------------------
     // Phase 1: T = Bo^T * Bx
-    //   T[k, j] = sum_i Bo[i, k] * Bx[i, j]
-    //
-    //   Bo is row-major, so Bo[i, :] is contiguous -- 4-wide AVX2 FMA along k
-    //   with a broadcasted Bx[i, j] scalar.
+    //   Bo is row-major, so the outer loop over i loads bo_row once and reuses
+    //   it across all p columns -- amortizes the row fetch.
     //
     // This is essentially a GEMM call, how would this compare to a tuned BLAS
     // implementation? For `p`, `k` in 100–500 and `n` in the millions, we'll
@@ -59,67 +132,27 @@ void orthonormalize(
     // ------------------------------------------------------------------------
     for (int j = 0; j < p; ++j) {
         double *tc = T + j * ldT;
-        for (int k = 0; k < m; ++k) {
-            tc[k] = 0.0;
-        }
+        for (int k = 0; k < m; ++k) tc[k] = 0.0;
     }
     for (int i = 0; i < n; ++i) {
         const double *bo_row = Bo + i * ldBo;
         for (int j = 0; j < p; ++j) {
-            double  bx_ij = Bx[i + j * ldBx];
-            double *tc    = T + j * ldT;
-            int k = 0;
-#if defined(__AVX__)
-            __m256d bcast = _mm256_set1_pd(bx_ij);
-            for (; k + 4 <= m; k += 4) {
-                __m256d t  = _mm256_loadu_pd(tc + k);
-                __m256d bo = _mm256_loadu_pd(bo_row + k);
-                _mm256_storeu_pd(tc + k, _mm256_fmadd_pd(bo, bcast, t));
-            }
-#endif
-            for (; k < m; ++k) {
-                tc[k] += bo_row[k] * bx_ij;
-            }
+            axpy_m(T + j * ldT, bo_row, Bx[i + j * ldBx], m);
         }
     }
 
     // ------------------------------------------------------------------------
-    // Phase 2: For each column j of Bx, fused project-out + normalize.
-    //   sweep i: Bx[i,j] -= dot(Bo[i,:], T[:,j]); s += Bx[i,j]^2
-    //   scale  = (s > tol) ? 1/sqrt(s + tol) : 0
-    //   sweep i: Bx[i,j] *= scale
-    //
-    //   Each (i, j) inner loop is a dot product along k -- the same shape as
-    //   Phase 1's inner loop, so AVX2 vectorizes the same way.
+    // Phase 2: project out Bo and normalize each column of Bx, with a DGKS
+    // retry when most of the column's energy ends up inside span(Bo).
     // ------------------------------------------------------------------------
     for (int j = 0; j < p; ++j) {
         double *tc = T  + j * ldT;
         double *bx = Bx + j * ldBx;
-        double s = 0.0;
 
-        for (int i = 0; i < n; ++i) {
-            const double *bo_row = Bo + i * ldBo;
-            double acc = 0.0;
-            int k = 0;
-#if defined(__AVX__)
-            __m256d acc4 = _mm256_setzero_pd();
-            for (; k + 4 <= m; k += 4) {
-                __m256d bo = _mm256_loadu_pd(bo_row + k);
-                __m256d t  = _mm256_loadu_pd(tc + k);
-                acc4 = _mm256_fmadd_pd(bo, t, acc4);
-            }
-            acc = (acc4[0] + acc4[1]) + (acc4[2] + acc4[3]);
-#endif
-            for (; k < m; ++k) {
-                acc += bo_row[k] * tc[k];
-            }
-            double v = bx[i] - acc;
-            bx[i] = v;
-            s += v * v;
-        }
+        double s = project_subtract_and_norm(n, m, Bo, ldBo, tc, bx);
 
-        // DGKS retry gate -- see DGKS_GATE_RATIO_SQ in kernels.h. The
-        // tol check skips columns we'd discard as degenerate anyway.
+        // DGKS retry gate -- see DGKS_GATE_RATIO_SQ in kernels.h. The tol
+        // check skips columns we'd discard as degenerate anyway.
         double t_norm2 = 0.0;
         for (int k = 0; k < m; ++k) {
             t_norm2 += tc[k] * tc[k];
@@ -128,50 +161,8 @@ void orthonormalize(
             if (dgks_counter) {
                 dgks_counter->fetch_add(1, std::memory_order_relaxed);
             }
-
-            // Recompute tc = Bo^T * bx (overwrite the original projection).
-            for (int k = 0; k < m; ++k) {
-                tc[k] = 0.0;
-            }
-            for (int i = 0; i < n; ++i) {
-                double bxi = bx[i];
-                const double *bo_row = Bo + i * ldBo;
-                int k = 0;
-#if defined(__AVX__)
-                __m256d bcast = _mm256_set1_pd(bxi);
-                for (; k + 4 <= m; k += 4) {
-                    __m256d t  = _mm256_loadu_pd(tc + k);
-                    __m256d bo = _mm256_loadu_pd(bo_row + k);
-                    _mm256_storeu_pd(tc + k, _mm256_fmadd_pd(bo, bcast, t));
-                }
-#endif
-                for (; k < m; ++k) {
-                    tc[k] += bo_row[k] * bxi;
-                }
-            }
-
-            // Second project-subtract-norm sweep (same shape as the first).
-            s = 0.0;
-            for (int i = 0; i < n; ++i) {
-                const double *bo_row = Bo + i * ldBo;
-                double acc = 0.0;
-                int k = 0;
-#if defined(__AVX__)
-                __m256d acc4 = _mm256_setzero_pd();
-                for (; k + 4 <= m; k += 4) {
-                    __m256d bo = _mm256_loadu_pd(bo_row + k);
-                    __m256d t  = _mm256_loadu_pd(tc + k);
-                    acc4 = _mm256_fmadd_pd(bo, t, acc4);
-                }
-                acc = (acc4[0] + acc4[1]) + (acc4[2] + acc4[3]);
-#endif
-                for (; k < m; ++k) {
-                    acc += bo_row[k] * tc[k];
-                }
-                double v = bx[i] - acc;
-                bx[i] = v;
-                s += v * v;
-            }
+            compute_BoT_bx_col(n, m, Bo, ldBo, bx, tc);
+            s = project_subtract_and_norm(n, m, Bo, ldBo, tc, bx);
         }
 
         const double scale = (s > tol) ? (1.0 / std::sqrt(s + tol)) : 0.0;
