@@ -387,6 +387,9 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
      *  (max_terms, max_terms) so the leading m×p block is what the kernel uses.
      */
     Ref<MatrixXd> Bx = S.Bx.leftCols(p);
+    // `S.ybx` is reused as the per-column squared-norm scratch for
+    // orthonormalize(); it is overwritten immediately below with Bx^T * y.
+    Ref<VectorXd> ybx = S.ybx.head(p);
     mars::orthonormalize(
         n, m, p,
         _data->B.data(),  (int)_data->B.outerStride(),
@@ -395,11 +398,11 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         _data->Bo.data(), (int)_data->Bo.outerStride(),
         Bx.data(),        (int)Bx.outerStride(),
         S.BoTBx.data(),   (int)S.BoTBx.outerStride(),
+        ybx.data(),
         _tol,
         &_dgks_count);
 
     // Calculate the linear delta SSE and map to the output buffer
-    Ref<VectorXd> ybx = S.ybx.head(p);
     ybx.noalias() = Bx.transpose() * _data->y.matrix();
     for (int j = 0; j < p; ++j) {
         linear_dsse[bcols[j]] = ybx[j]*ybx[j];

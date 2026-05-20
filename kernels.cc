@@ -96,6 +96,7 @@ void orthonormalize(
     const double *Bo,   int ldBo,
     double       *Bx,   int ldBx,
     double       *T,    int ldT,
+    double       *s_buf,
     double tol,
     std::atomic<long> *dgks_counter)
 {
@@ -109,6 +110,13 @@ void orthonormalize(
         double      *bx = Bx + j       * ldBx;
         int i = 0;
 #if defined(__AVX__)
+        for (; i + 8 <= n; i += 8) {
+            __m256 b8 = _mm256_loadu_ps(b + i);
+            __m256 x8 = _mm256_loadu_ps(x + i);
+            __m256 m8 = _mm256_mul_ps(b8, x8);
+            _mm256_storeu_pd(bx + i,     _mm256_cvtps_pd(_mm256_castps256_ps128(m8)));
+            _mm256_storeu_pd(bx + i + 4, _mm256_cvtps_pd(_mm256_extractf128_ps(m8, 1)));
+        }
         for (; i + 4 <= n; i += 4) {
             __m128 b4 = _mm_loadu_ps(b + i);
             __m128 x4 = _mm_loadu_ps(x + i);
@@ -145,24 +153,44 @@ void orthonormalize(
     // ------------------------------------------------------------------------
     // Phase 2: project out Bo and normalize each column of Bx, with a DGKS
     // retry when most of the column's energy ends up inside span(Bo).
+    //
+    // Phase 2a fuses the per-column subtract into a single sweep over Bo: each
+    // row of Bo is loaded once and reused across all p columns, dropping the
+    // Bo DRAM traffic from p*n*m to n*m. The per-column squared norms land in
+    // s_buf for the DGKS gate and the final scale step.
     // ------------------------------------------------------------------------
+    std::fill_n(s_buf, p, 0.0);
+    for (int i = 0; i < n; ++i) {
+        const double *bo_row = Bo + i * ldBo;
+        for (int j = 0; j < p; ++j) {
+            const double *tc = T  + j * ldT;
+            double       *bx = Bx + j * ldBx;
+            const double  v  = bx[i] - dot_m(bo_row, tc, m);
+            bx[i]    = v;
+            s_buf[j] += v * v;
+        }
+    }
+
+    // Phase 2b: DGKS retry on the (rare) columns where most of the energy
+    // landed inside span(Bo). The tol check skips columns we'd discard as
+    // degenerate anyway. See DGKS_GATE_RATIO_SQ in kernels.h.
     for (int j = 0; j < p; ++j) {
         double *tc = T  + j * ldT;
         double *bx = Bx + j * ldBx;
-
-        double s = project_subtract_and_norm(n, m, Bo, ldBo, tc, bx);
-
-        // DGKS retry gate -- see DGKS_GATE_RATIO_SQ in kernels.h. The tol
-        // check skips columns we'd discard as degenerate anyway.
         const double t_norm2 = dot_m(tc, tc, m);
-        if (s > tol && s * DGKS_GATE_RATIO_SQ < t_norm2) {
+        if (s_buf[j] > tol && s_buf[j] * DGKS_GATE_RATIO_SQ < t_norm2) {
             if (dgks_counter) {
                 dgks_counter->fetch_add(1, std::memory_order_relaxed);
             }
             compute_BoT_bx_col(n, m, Bo, ldBo, bx, tc);
-            s = project_subtract_and_norm(n, m, Bo, ldBo, tc, bx);
+            s_buf[j] = project_subtract_and_norm(n, m, Bo, ldBo, tc, bx);
         }
+    }
 
+    // Phase 2c: normalize.
+    for (int j = 0; j < p; ++j) {
+        double      *bx    = Bx + j * ldBx;
+        const double s     = s_buf[j];
         const double scale = (s > tol) ? (1.0 / std::sqrt(s + tol)) : 0.0;
         int i = 0;
 #if defined(__AVX__)

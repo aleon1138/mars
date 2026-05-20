@@ -97,6 +97,7 @@ TEST(KernelsTest, OrthonormalizeMatchesEigen)
     // Kernel output
     MatrixXd Bx(n, p);
     MatrixXd T(m, p);
+    VectorXd s(p);
     Bx.setZero();
     T.setZero();
     mars::orthonormalize(
@@ -107,6 +108,7 @@ TEST(KernelsTest, OrthonormalizeMatchesEigen)
         Bo.data(),   (int)Bo.outerStride(),
         Bx.data(),   (int)Bx.outerStride(),
         T.data(),    (int)T.outerStride(),
+        s.data(),
         TOL);
 
     // Bx is orthogonal to Bo
@@ -156,6 +158,7 @@ TEST(KernelsTest, OrthonormalizeRespectsLeadingDims)
     // Workspaces with extra padding to confirm strides are honored.
     MatrixXd Bx_full(n, max_terms);
     MatrixXd T_full (max_terms, max_terms);
+    VectorXd s(max_terms);
     Bx_full.setZero();
     T_full.setZero();
 
@@ -167,6 +170,7 @@ TEST(KernelsTest, OrthonormalizeRespectsLeadingDims)
         Bo_full.data(), (int)Bo_full.outerStride(),    // = max_terms (row-major)
         Bx_full.data(), (int)Bx_full.outerStride(),    // = n         (col-major)
         T_full.data(),  (int)T_full.outerStride(),     // = max_terms (col-major)
+        s.data(),
         TOL);
 
     MatrixXd Bx = Bx_full.leftCols(p);
@@ -221,6 +225,7 @@ TEST(KernelsTest, OrthonormalizeFiresDgksOnSevereCancellation)
 
     MatrixXd Bx(n, p);
     MatrixXd T(m, p);
+    VectorXd s(p);
     Bx.setZero();
     T.setZero();
 
@@ -233,6 +238,7 @@ TEST(KernelsTest, OrthonormalizeFiresDgksOnSevereCancellation)
         Bo.data(),   (int)Bo.outerStride(),
         Bx.data(),   (int)Bx.outerStride(),
         T.data(),    (int)T.outerStride(),
+        s.data(),
         TOL,
         &counter);
 
@@ -263,6 +269,7 @@ TEST(KernelsTest, OrthonormalizeDoesNotFireDgksOnWellConditioned)
 
     MatrixXd Bx(n, p);
     MatrixXd T(m, p);
+    VectorXd s(p);
     Bx.setZero();
     T.setZero();
 
@@ -275,6 +282,7 @@ TEST(KernelsTest, OrthonormalizeDoesNotFireDgksOnWellConditioned)
         Bo.data(),   (int)Bo.outerStride(),
         Bx.data(),   (int)Bx.outerStride(),
         T.data(),    (int)T.outerStride(),
+        s.data(),
         TOL,
         &counter);
 

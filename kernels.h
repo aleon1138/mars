@@ -25,13 +25,14 @@ constexpr double DGKS_GATE_RATIO_SQ = 9.0;
  *      Bx[:,j] *= (s > tol) ? 1/sqrt(s + tol) : 0          // normalize, zero degenerate
  *
  *  Layouts (caller's responsibility):
- *      B    : (n, *) col-major float;  col stride ldB.   Only columns mask[j] are read.
- *      x    : (n)    float
- *      mask : (p)    int32, indexes into columns of B
- *      Bo   : (n, m) row-major double; row stride ldBo
- *      Bx   : (n, p) col-major double; col stride ldBx       [output]
- *      T    : (m, p) col-major double; col stride ldT        [workspace; overwritten]
- *      tol  : tolerance for treating a column as degenerate
+ *      B     : (n, *) col-major float;  col stride ldB.   Only columns mask[j] are read.
+ *      x     : (n)    float
+ *      mask  : (p)    int32, indexes into columns of B
+ *      Bo    : (n, m) row-major double; row stride ldBo
+ *      Bx    : (n, p) col-major double; col stride ldBx       [output]
+ *      T     : (m, p) col-major double; col stride ldT        [workspace; overwritten]
+ *      s_buf : (p)    double                                  [workspace; overwritten]
+ *      tol   : tolerance for treating a column as degenerate
  *
  *  Uses AVX2 + FMA in the inner loops when available, scalar fallback otherwise.
  *  No heap allocations.
@@ -48,6 +49,7 @@ void orthonormalize(
     const double *Bo,   int ldBo,
     double       *Bx,   int ldBx,
     double       *T,    int ldT,
+    double       *s_buf,
     double tol,
     std::atomic<long> *dgks_counter = nullptr);
 
