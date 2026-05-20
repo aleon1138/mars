@@ -4,6 +4,7 @@
  *  outer (leading) strides that genuinely vary between callers.
  */
 #include "kernels.h"
+#include <algorithm>  // fill_n
 #include <cmath>      // sqrt
 #if defined(__AVX__)
 #  include <immintrin.h>
@@ -38,7 +39,6 @@ inline void axpy_m(double *tc, const double *bo_row, double scalar, int m)
 inline double dot_m(const double *bo_row, const double *tc, int m)
 {
     int k = 0;
-    double acc = 0.0;
 #if defined(__AVX__)
     __m256d acc4 = _mm256_setzero_pd();
     for (; k + 4 <= m; k += 4) {
@@ -46,7 +46,9 @@ inline double dot_m(const double *bo_row, const double *tc, int m)
         __m256d t  = _mm256_loadu_pd(tc + k);
         acc4 = _mm256_fmadd_pd(bo, t, acc4);
     }
-    acc = (acc4[0] + acc4[1]) + (acc4[2] + acc4[3]);
+    double acc = (acc4[0] + acc4[1]) + (acc4[2] + acc4[3]);
+#else
+    double acc = 0.0;
 #endif
     for (; k < m; ++k) {
         acc += bo_row[k] * tc[k];
@@ -78,7 +80,7 @@ inline void compute_BoT_bx_col(
     const double *bx,
     double *tc)
 {
-    for (int k = 0; k < m; ++k) tc[k] = 0.0;
+    std::fill_n(tc, m, 0.0);
     for (int i = 0; i < n; ++i) {
         axpy_m(tc, Bo + i * ldBo, bx[i], m);
     }
@@ -131,8 +133,7 @@ void orthonormalize(
     // benefits of packing are muted compared to square GEMMs.
     // ------------------------------------------------------------------------
     for (int j = 0; j < p; ++j) {
-        double *tc = T + j * ldT;
-        for (int k = 0; k < m; ++k) tc[k] = 0.0;
+        std::fill_n(T + j * ldT, m, 0.0);
     }
     for (int i = 0; i < n; ++i) {
         const double *bo_row = Bo + i * ldBo;
@@ -153,10 +154,7 @@ void orthonormalize(
 
         // DGKS retry gate -- see DGKS_GATE_RATIO_SQ in kernels.h. The tol
         // check skips columns we'd discard as degenerate anyway.
-        double t_norm2 = 0.0;
-        for (int k = 0; k < m; ++k) {
-            t_norm2 += tc[k] * tc[k];
-        }
+        const double t_norm2 = dot_m(tc, tc, m);
         if (s > tol && s * DGKS_GATE_RATIO_SQ < t_norm2) {
             if (dgks_counter) {
                 dgks_counter->fetch_add(1, std::memory_order_relaxed);
