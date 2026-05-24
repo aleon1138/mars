@@ -210,7 +210,7 @@ struct MarsScratch::Impl {
     int       max_terms;
     ArrayXf   x;            // normalized candidate column
     ArrayXi32 k;            // sort permutation of x
-    ArrayXd   d;            // adjacent deltas of x along sort order (size n; d[0] unused, matches old `d = _d.data()-1` hack)
+    ArrayXf   d;            // adjacent deltas of x along sort order (size n; d[0] unused). f32 storage -- the subtraction itself is f32-f32 so no precision is lost vs f64; upcast to f64 at the load before the FMA chain.
     MatrixXf  Bx;           // (n, max_terms) column-major — basis interacted with x, ortho-normalized (f32 storage; f64 arith)
     ArrayXd   f;            // (max_terms+1) hinge projection accumulator
     ArrayXd   g;            // (max_terms+1) basis-weighted ortho accumulator
@@ -403,8 +403,10 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         int32_t *k = S.k.data();
         argsort(k, _data->X.col(xcol).data(), n);
 
-        // Take the deltas of `x` (into scratch)
-        double *d = S.d.data(); // d[0] unused; valid indices are 1..n-1
+        // Take the deltas of `x` (into scratch). Stored as f32: x is f32, so
+        // the subtraction is f32-f32 anyway; the f64 store was just a wider
+        // copy. Upcast happens at every read site below.
+        float *d = S.d.data(); // d[0] unused; valid indices are 1..n-1
         for (int i = 1; i < n; ++i) {
             d[i] = x[k[i-1]] - x[k[i]];
         }
@@ -492,17 +494,18 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
                 b_k  = b [k[i]]; // sort and upcast to double
                 bx_k = bx[k[i]];
                 y_k  = y [k[i]];
+                const double di = d[i]; // upcast f32 delta once for the FMA chain
 
                 const bool on_grid = (i > head) && ((i - head - 1) % min_span == 0);
                 const float *bo_row = Bo_data + k[i]*ldBo;
                 cov_t o = on_grid
-                    ? covariates_impl<true >(f,g,bo_row,ybo,bx_k,ybx[j],d[i],b_k,m)
-                    : covariates_impl<false>(f,g,bo_row,ybo,bx_k,ybx[j],d[i],b_k,m);
+                    ? covariates_impl<true >(f,g,bo_row,ybo,bx_k,ybx[j],di,b_k,m)
+                    : covariates_impl<false>(f,g,bo_row,ybo,bx_k,ybx[j],di,b_k,m);
 
-                k0 = fma(d[i]*d[i],b2,k0);  // build up ||h_plus||^2 incrementally
-                k1 = fma(d[i]*2,bd,k1);
-                w  = fma(d[i],vb,w);        // w = h_plus^T * y
-                bd = fma(d[i],b2,bd);
+                k0 = fma(di*di,b2,k0);  // build up ||h_plus||^2 incrementally
+                k1 = fma(di*2 ,bd,k1);
+                w  = fma(di   ,vb,w);   // w = h_plus^T * y
+                bd = fma(di   ,b2,bd);
                 b2 = fma(b_k,b_k,b2);
                 vb = fma(y_k,b_k,vb);
 
