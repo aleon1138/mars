@@ -322,10 +322,6 @@ double MarsAlgo::yvar() const
 {
     return _yvar;
 }
-long MarsAlgo::dgks_consume()
-{
-    return _dgks_count.exchange(0, std::memory_order_relaxed);
-}
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -380,8 +376,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         Bx.data(),        (int)Bx.outerStride(),
         S.BoTBx.data(),   (int)S.BoTBx.outerStride(),
         ybx.data(),
-        _tol,
-        &_dgks_count);
+        _tol);
 
     // Calculate the linear delta SSE and map to the output buffer.
     // Bx is f32 storage; cast each column lazily so the dot product
@@ -587,7 +582,6 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
     }
     const double v_norm2_post = v.squaredNorm();
     if (v_norm2_post > _tol && v_norm2_post * mars::DGKS_GATE_RATIO_SQ < proj_norm2) {
-        _dgks_count.fetch_add(1, std::memory_order_relaxed);
         for (int j = 0; j < _m; ++j) {
             const auto   bj = _data->Bo.col(j).cast<double>();
             const double c  = bj.dot(v);

@@ -399,47 +399,6 @@ TEST(MarsTest, DeltaSSE)
 
 ///////////////////////////////////////////////////////////////////////////////
 
-// append()'s DGKS retry must fire when the new basis column is nearly
-// collinear with the existing Bo span. Construct X with two nearly-identical
-// columns; appending linear terms on both forces the second one's projection
-// out of Bo to leave a tiny residual relative to the projection (the
-// DGKS_GATE_RATIO_SQ trigger). On well-conditioned inputs (a third unrelated
-// column) the counter stays at zero.
-TEST(MarsTest, AppendDgksFiresOnCollinearBasis)
-{
-    srand(1);
-
-    const int N = 500;
-    const int M = 3;
-
-    MatrixXd X(MatrixXd::Random(N, M));
-    X.col(1) = X.col(0) + 1e-3 * MatrixXd::Random(N, 1);  // ~collinear with col 0
-    VectorXd y = X.col(0) + 0.1 * VectorXd::Random(N);
-
-    MatrixXf X32 = X.cast<float>();
-    VectorXf y32 = y.cast<float>();
-    ArrayXf  w32 = ArrayXf::Ones(N);
-
-    MarsAlgo algo(X32.data(), y32.data(), w32.data(),
-                  N, X.cols(), 8, X.rows());
-
-    // Append linear basis on col 0 -- well-conditioned, no DGKS.
-    ASSERT_GE(algo.append('l', 0, 0, 0.0f), 0.0);
-    ASSERT_EQ(algo.dgks_consume(), 0);
-
-    // Append linear basis on col 1 -- almost collinear with col 0 (already
-    // in Bo's span), so projection energy >> residual energy and DGKS fires.
-    ASSERT_GE(algo.append('l', 1, 0, 0.0f), 0.0);
-    ASSERT_GE(algo.dgks_consume(), 1);
-
-    // Append linear basis on col 2 (unrelated random column). Well-
-    // conditioned again -- counter stays at zero.
-    ASSERT_GE(algo.append('l', 2, 0, 0.0f), 0.0);
-    ASSERT_EQ(algo.dgks_consume(), 0);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-
 // Verify that MarsAlgo reproduces the closed-form WLS solution under
 // non-uniform observation weights. This exercises the sqrt(w) scaling
 // in the constructor.

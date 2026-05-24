@@ -501,15 +501,3 @@ n=6M, p=100 case. Can't just cache everything.
 inputs we actually re-evaluate. Eviction by age matches Friedman's Fast-MARS
 recipe.
 
-## Counter cache-line layout
-
-**Location:** `marsalgo.h`, the `_dgks_count` atomic member.
-
-**Issue:** `_dgks_count` lives adjacent to `_scratches`, `_tol`, etc. on the
-`MarsAlgo` instance. Under heavy OMP parallelism inside `eval()`, a DGKS
-fetch_add from one worker invalidates the shared cache line for every other
-worker that's reading `_tol` (which they do, on every column). Probably
-negligible today because DGKS fires rarely, but if benchmarks ever show OMP
-scaling regressions on ill-conditioned data, separating the counter onto its
-own cache line (alignas(64), or a padded wrapper) is the fix.
-

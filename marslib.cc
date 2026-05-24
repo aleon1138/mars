@@ -140,6 +140,5 @@ PYBIND11_MODULE(marslib, m)
     .def("nbasis",       &MarsAlgo::nbasis)
     .def("yvar",         &MarsAlgo::yvar)
     .def("append",       &MarsAlgo::append)
-    .def("dgks_consume", &MarsAlgo::dgks_consume)
     ;
 }

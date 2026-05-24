@@ -22,14 +22,14 @@ def __dir__():
 
 def _dump_header(logger):
     if logger:
-        logger.write("time        #   n    b    x   o    r²    r²_cv  dgks\n")
-        logger.write("---------- --- --- ---- ---- --  ------ ------- ----\n")
+        logger.write("time        #   n    b    x   o    r²    r²_cv\n")
+        logger.write("---------- --- --- ---- ---- --  ------ -------\n")
 
 
 def _dump_row(logger, epoch, nbasis, dt, row, labels):
     logger.write("%02d:%02d:%04.1f " % (dt // 3600, (dt // 60) % 60, dt % 60))
     logger.write(
-        "%3d %3d %4d %4d %2d  %6.4f %7.4f %4d"
+        "%3d %3d %4d %4d %2d  %6.4f %7.4f"
         % (
             epoch,
             nbasis - 1,
@@ -38,7 +38,6 @@ def _dump_row(logger, epoch, nbasis, dt, row, labels):
             row["order"],
             row["r2"],
             row["r2_cv"],
-            row["dgks"],
         )
     )
 
@@ -159,7 +158,6 @@ def fit(X, y, w=None, **kwargs):
             r2_cv  f4  -- GCV-adjusted R² (out-of-sample estimate)
             order  i4  -- polynomial degree
             time   f4  -- seconds since fit() started
-            dgks   i4  -- DGKS re-orthogonalization triggers
     """
 
     if w is None:
@@ -251,10 +249,9 @@ def fit(X, y, w=None, **kwargs):
             ("r2_cv", "f4"),
             ("order", "i4"),
             ("time",  "f4"),
-            ("dgks",  "i4"),
         ],
     )
-    model[0] = ("i", 0, 0, np.nan, 0, 0, 0, 0, 0)  # add the intercept
+    model[0] = ("i", 0, 0, np.nan, 0, 0, 0, 0)  # add the intercept
     # fmt: on
 
     _dump_header(logger)
@@ -285,10 +282,6 @@ def fit(X, y, w=None, **kwargs):
         # 'sse1' is the improvement by adding a linear term
         # 'sse2' is the improvement by adding two disjoint hinges
         sse0, sse1, sse2, cut = algo.eval(bmask, min_span, tail, linear_only, threads)
-
-        # Drain the kernels-side DGKS count now so an early `break` below
-        # doesn't leak it into the next-epoch counter or into nothing.
-        dgks_n = algo.dgks_consume()
 
         # Update the delta-SSE cache
         # TODO - should we really be using GCV adjusted SSE instead?
@@ -331,16 +324,11 @@ def fit(X, y, w=None, **kwargs):
                     1.0 - gcv_adj(mse, m + 1) / var_y,  # r2_cv
                     len(basis[-1]),                     # order
                     dt,                                 # time
-                    0,                                  # dgks (backfilled below)
                 )
                 basis_sse = np.append(basis_sse, [0.0])
                 m += 1
                 # fmt:on
         assert algo.nbasis() == len(basis) == m
-
-        # Add any append()-side DGKS triggers to the eval-side total drained
-        # above, and attribute the sum to every basis added in this epoch.
-        model["dgks"][m0:m] = dgks_n + algo.dgks_consume()
 
         if logger:
             _dump_row(logger, epoch, len(basis), dt, model[m - 1], labels)
