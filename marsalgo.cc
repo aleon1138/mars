@@ -189,26 +189,21 @@ struct MarsData {
  *  Pre-allocated per-thread scratch. Sized once at construction; eval() only
  *  uses leading sub-blocks (.head/.leftCols) so no growth happens at call time.
  *
- *  Bx (and now Bo, in MarsData) are stored as f32; halves the largest per-
- *  thread and per-fit buffers. All arithmetic inside orthonormalize() and
- *  append() Gram-Schmidt still happens in f64 -- only the storage narrows.
- *  The DGKS retry in kernels.cc and append() keeps orthogonality bounded
- *  by O(eps_f32) ~ 1e-7 against Bo. Downstream:
+ *  Bx (and Bo, in MarsData) are stored as f32; halves the largest per-thread
+ *  and per-fit buffers. All arithmetic inside orthonormalize() and append()
+ *  Gram-Schmidt still happens in f64 -- only the storage narrows. The DGKS
+ *  retry in kernels.cc and append() keeps orthogonality bounded by
+ *  O(eps_f32) ~ 1e-7 against Bo. Downstream:
  *    - linear_dsse: ybx = Bx^T * y is computed with f64 accumulation so
  *      the dot products do not lose precision against the f32 inputs.
- *    - hinge sweep: bx_k = (double)Bx[k[i], j] upcasts at the load.
+ *    - hinge sweep: bx_k = (double)Bx[k[i], j] upcasts at the load; Bo
+ *      rows are gathered on-the-fly via Bo_data + k[i]*ldBo with a
+ *      software prefetch a few iterations ahead.
  *
  *  TODO - narrow `d` from f64 to f32. Enters a long FMA chain in
  *  covariates_impl() over the full length of n on every hinge sweep;
  *  narrowing the input compounds roundoff across ~6M FMAs per call.
  *  Worth measuring once a hinge-heavy workload is profiled.
- *
- *  TODO - eliminate `Bok` (n*max_terms*4 bytes per thread) by random-gathering
- *  rows of Bo on the fly inside the j-loop in eval(), with software prefetch
- *  (`_mm_prefetch(Bo + k[i+W]*stride, ...)`) to hide the row-fetch latency.
- *  Now that Bo is itself f32, the on-the-fly gather costs the same bandwidth
- *  per row as Bok.row(i), but forfeits the HW prefetcher's sequentiality --
- *  the manual prefetch needs to make up the difference.
  */
 struct MarsScratch::Impl {
     int       n;
@@ -217,7 +212,6 @@ struct MarsScratch::Impl {
     ArrayXi32 k;            // sort permutation of x
     ArrayXd   d;            // adjacent deltas of x along sort order (size n; d[0] unused, matches old `d = _d.data()-1` hack)
     MatrixXf  Bx;           // (n, max_terms) column-major — basis interacted with x, ortho-normalized (f32 storage; f64 arith)
-    MatrixXfC Bok;          // (n, max_terms) row-major   — Bo with rows permuted by k
     ArrayXd   f;            // (max_terms+1) hinge projection accumulator
     ArrayXd   g;            // (max_terms+1) basis-weighted ortho accumulator
     ArrayXi   bcols;        // (max_terms) indexes of non-ignored basis (output of nonzero_into)
@@ -230,7 +224,6 @@ struct MarsScratch::Impl {
         : n(n_), max_terms(max_terms_)
         , x(n_), k(n_), d(n_)
         , Bx(n_, max_terms_)
-        , Bok(n_, max_terms_)
         , f(max_terms_+1), g(max_terms_+1)
         , bcols(max_terms_)
         , ybx(max_terms_)
@@ -410,13 +403,6 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         int32_t *k = S.k.data();
         argsort(k, _data->X.col(xcol).data(), n);
 
-        // Sort the rows of `Bo` into scratch.Bok (both are f32 row-major;
-        // no cast needed).
-        Ref<MatrixXfC> Bok = S.Bok.leftCols(m);
-        for (int i = 0; i < n; ++i) {
-            Bok.row(i) = Bo.row(k[i]);
-        }
-
         // Take the deltas of `x` (into scratch)
         double *d = S.d.data(); // d[0] unused; valid indices are 1..n-1
         for (int i = 1; i < n; ++i) {
@@ -427,6 +413,14 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         const int tail = n-end_span;
         const MatrixXf &B = _data->B;
         const ArrayXd  &y = _data->y;
+
+        // Bo rows are now gathered on the fly inside the inner sweep
+        // (no Bok scratch). Each iteration reads Bo.row(k[i]) at a random
+        // offset; the access pattern forfeits HW prefetch, so we issue
+        // software prefetch a few iterations ahead.
+        const float *Bo_data = Bo.data();
+        const int    ldBo    = (int)Bo.outerStride();
+        constexpr int PREFETCH_DIST = 4;
 
         /*
          *  For each parent basis column b = B[:,bcols[j]], sweep potential
@@ -467,7 +461,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
             double b_k  = b [k[0]]; // sort and upcast to double
             double bx_k = bx[k[0]];
             double y_k  = y [k[0]];
-            covariates_impl<true>(f,g,Bok.row(0).data(),ybo,bx_k,ybx[0],0,b_k,m);
+            covariates_impl<true>(f,g,Bo_data + k[0]*ldBo,ybo,bx_k,ybx[0],0,b_k,m);
 
             double k0 = 0;
             double k1 = 0;
@@ -486,14 +480,24 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
              *  consumed at on-grid positions.
              */
             for (int i = 1; i < tail; ++i) {
+                // Prefetch the Bo row we'll need PREFETCH_DIST iterations
+                // ahead; the HW prefetcher fills the rest of the row once
+                // we touch the first cache line.
+                if (i + PREFETCH_DIST < n) {
+                    _mm_prefetch(
+                        reinterpret_cast<const char *>(Bo_data + k[i + PREFETCH_DIST] * ldBo),
+                        _MM_HINT_T0);
+                }
+
                 b_k  = b [k[i]]; // sort and upcast to double
                 bx_k = bx[k[i]];
                 y_k  = y [k[i]];
 
                 const bool on_grid = (i > head) && ((i - head - 1) % min_span == 0);
+                const float *bo_row = Bo_data + k[i]*ldBo;
                 cov_t o = on_grid
-                    ? covariates_impl<true >(f,g,Bok.row(i).data(),ybo,bx_k,ybx[j],d[i],b_k,m)
-                    : covariates_impl<false>(f,g,Bok.row(i).data(),ybo,bx_k,ybx[j],d[i],b_k,m);
+                    ? covariates_impl<true >(f,g,bo_row,ybo,bx_k,ybx[j],d[i],b_k,m)
+                    : covariates_impl<false>(f,g,bo_row,ybo,bx_k,ybx[j],d[i],b_k,m);
 
                 k0 = fma(d[i]*d[i],b2,k0);  // build up ||h_plus||^2 incrementally
                 k1 = fma(d[i]*2,bd,k1);
