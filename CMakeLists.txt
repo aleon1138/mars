@@ -27,25 +27,52 @@ if(NOT Eigen3_FOUND AND NOT EIGEN3_FOUND)
         "brew install eigen) or set Eigen3_DIR / CMAKE_PREFIX_PATH.")
 endif()
 
-# --- OpenMP (with Homebrew libomp fallback on macOS) -------------------------
-if(APPLE AND NOT DEFINED OpenMP_ROOT)
-    execute_process(
-        COMMAND brew --prefix libomp
-        OUTPUT_VARIABLE _brew_libomp
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET)
-    if(_brew_libomp AND IS_DIRECTORY "${_brew_libomp}")
-        set(OpenMP_ROOT "${_brew_libomp}")
+# --- OpenMP ------------------------------------------------------------------
+# On macOS, statically link Homebrew's libomp into marslib.so so the OpenMP
+# runtime stays private to this extension. Avoids the "OMP: Error #15:
+# Initializing libomp.dylib, but found libomp.dylib already initialized"
+# crash that fires whenever another extension in the same Python interpreter
+# (numpy/scipy/sklearn/...) loads its own libomp.dylib first. Mac's two-level
+# namespace + the project-wide -fvisibility=hidden keep the static OMP from
+# leaking out of marslib.so.
+#
+# On Linux, find_package(OpenMP) is fine -- the system loader resolves a
+# single OMP runtime for the whole process and conflicts don't arise.
+add_library(mars_openmp INTERFACE)
+if(APPLE)
+    if(NOT DEFINED OpenMP_ROOT)
+        execute_process(
+            COMMAND brew --prefix libomp
+            OUTPUT_VARIABLE _brew_libomp
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(_brew_libomp AND IS_DIRECTORY "${_brew_libomp}")
+            set(OpenMP_ROOT "${_brew_libomp}")
+        endif()
     endif()
+    find_library(LIBOMP_STATIC NAMES libomp.a HINTS "${OpenMP_ROOT}/lib")
+    find_path(LIBOMP_INCLUDE NAMES omp.h     HINTS "${OpenMP_ROOT}/include")
+    if(NOT LIBOMP_STATIC OR NOT LIBOMP_INCLUDE)
+        message(FATAL_ERROR
+            "libomp.a / omp.h not found under '${OpenMP_ROOT}'. "
+            "Install with 'brew install libomp' or pass "
+            "-DOpenMP_ROOT=<prefix> to cmake.")
+    endif()
+    target_compile_options(mars_openmp INTERFACE -Xpreprocessor -fopenmp)
+    target_include_directories(mars_openmp INTERFACE "${LIBOMP_INCLUDE}")
+    target_link_options(mars_openmp INTERFACE
+        "LINKER:-force_load,${LIBOMP_STATIC}")
+else()
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+    target_link_libraries(mars_openmp INTERFACE OpenMP::OpenMP_CXX)
 endif()
-find_package(OpenMP REQUIRED COMPONENTS CXX)
 
 # --- Shared compile/link settings -------------------------------------------
 add_library(mars_common INTERFACE)
 target_compile_features(mars_common INTERFACE cxx_std_17)
 target_compile_options(mars_common INTERFACE -O3 -Wall -march=native -fvisibility=hidden)
 target_compile_definitions(mars_common INTERFACE NDEBUG EIGEN_DONT_PARALLELIZE)
-target_link_libraries(mars_common INTERFACE OpenMP::OpenMP_CXX)
+target_link_libraries(mars_common INTERFACE mars_openmp)
 if(Eigen3_FOUND)
     target_link_libraries(mars_common INTERFACE Eigen3::Eigen)
 else()

@@ -513,19 +513,3 @@ negligible today because DGKS fires rarely, but if benchmarks ever show OMP
 scaling regressions on ill-conditioned data, separating the counter onto its
 own cache line (alignas(64), or a padded wrapper) is the fix.
 
-## Mac libomp double-link
-
-**Issue:** On Apple Silicon with `conda activate work`, running `mars.fit()`
-multi-threaded crashes:
-```
-OMP: Error #15: Initializing libomp.dylib, but found libomp.dylib already
-initialized.
-```
-This is the well-known Apple libomp + conda libomp link conflict, not
-specific to this codebase. Workaround:
-```
-KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 python ...
-```
-Single-threaded works fine. Real fix is to make the build link against
-exactly one libomp (either system or conda) -- not urgent since the
-production target is Linux.

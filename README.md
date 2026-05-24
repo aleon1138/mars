@@ -48,6 +48,11 @@ sudo apt install -y cmake libeigen3-dev libgtest-dev
 ```bash
 brew install cmake eigen googletest libomp
 ```
+On macOS, `libomp` is **statically linked** into `marslib.so` so the OpenMP
+runtime stays private to this extension. This avoids the "OMP: Error #15:
+libomp.dylib already initialized" crash that fires whenever the Python
+interpreter already loaded a different `libomp.dylib` via another extension
+(numpy/scipy/sklearn/...). No `KMP_DUPLICATE_LIB_OK=TRUE` workaround needed.
 
 `pip install .` pulls `pybind11` and `scikit-build-core` automatically as build
 dependencies — no need to install them by hand.
