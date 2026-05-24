@@ -19,20 +19,27 @@ constexpr double DGKS_GATE_RATIO_SQ = 9.0;
  *  Interact a candidate regressor `x` with the basis columns selected by
  *  `mask`, orthonormalize against `Bo`, and normalize each column. For each
  *  j in [0, p):
- *      Bx[:,j]  = (double)(B[:, mask[j]] .* x)             // fill (f32 * f32 → f64)
- *      Bx[:,j] -= Bo * (Bo^T * Bx[:,j])                    // project out Bo's span
- *      s        = ||Bx[:,j]||^2
+ *      Bx[:,j]  = B[:, mask[j]] .* x                       // fill (f32 * f32 → f32 store)
+ *      Bx[:,j] -= Bo * (Bo^T * Bx[:,j])                    // project out Bo's span (f64 arith)
+ *      s        = ||Bx[:,j]||^2                            // f64 accumulator over post-store f32
  *      Bx[:,j] *= (s > tol) ? 1/sqrt(s + tol) : 0          // normalize, zero degenerate
+ *
+ *  Bx is stored as f32 to halve the per-thread scratch footprint; all
+ *  arithmetic (projection, dot products, norms) stays in f64. The
+ *  cancellation in (Bx -= Bo * Bo^T * Bx) is bounded by the DGKS retry, so
+ *  the rounded f32 storage keeps O(eps_f32) orthogonality against Bo --
+ *  see DGKS_GATE_RATIO_SQ below.
  *
  *  Layouts (caller's responsibility):
  *      B     : (n, *) col-major float;  col stride ldB.   Only columns mask[j] are read.
  *      x     : (n)    float
  *      mask  : (p)    int32, indexes into columns of B
  *      Bo    : (n, m) row-major double; row stride ldBo
- *      Bx    : (n, p) col-major double; col stride ldBx       [output]
+ *      Bx    : (n, p) col-major float;  col stride ldBx       [output]
  *      T     : (m, p) col-major double; col stride ldT        [workspace; overwritten]
  *      s_buf : (p)    double                                  [workspace; overwritten]
- *      tol   : tolerance for treating a column as degenerate
+ *      tol   : tolerance for treating a column as degenerate;
+ *              should be ~O(n * eps_f32^2) for the f32 storage floor.
  *
  *  Uses AVX2 + FMA in the inner loops when available, scalar fallback otherwise.
  *  No heap allocations.
@@ -47,7 +54,7 @@ void orthonormalize(
     const float  *x,
     const int    *mask,
     const double *Bo,   int ldBo,
-    double       *Bx,   int ldBx,
+    float        *Bx,   int ldBx,
     double       *T,    int ldT,
     double       *s_buf,
     double tol,

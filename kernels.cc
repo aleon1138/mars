@@ -56,33 +56,37 @@ inline double dot_m(const double *bo_row, const double *tc, int m)
     return acc;
 }
 
-// For each row i: bx[i] -= dot(Bo[i,:], tc). Returns sum bx[i]^2 over the
-// updated column; lets the caller decide on the DGKS retry / normalization.
+// For each row i: bx[i] -= dot(Bo[i,:], tc). Subtraction is done in f64,
+// rounded back to f32 on store. Returns sum (stored f32)^2 -- the post-store
+// norm, not the pre-round value -- so downstream normalize() uses the same
+// quantity that's actually in memory.
 inline double project_subtract_and_norm(
     int n, int m,
     const double *Bo, int ldBo,
     const double *tc,
-    double *bx)
+    float *bx)
 {
     double s = 0.0;
     for (int i = 0; i < n; ++i) {
-        double v = bx[i] - dot_m(Bo + i * ldBo, tc, m);
-        bx[i] = v;
-        s += v * v;
+        const double v = (double)bx[i] - dot_m(Bo + i * ldBo, tc, m);
+        const float  v_f32 = (float)v;
+        bx[i] = v_f32;
+        const double v_back = (double)v_f32;
+        s += v_back * v_back;
     }
     return s;
 }
 
-// tc = Bo^T * bx (single column).
+// tc = Bo^T * bx (single column). bx is f32, upcast to f64 inside axpy.
 inline void compute_BoT_bx_col(
     int n, int m,
     const double *Bo, int ldBo,
-    const double *bx,
+    const float *bx,
     double *tc)
 {
     std::fill_n(tc, m, 0.0);
     for (int i = 0; i < n; ++i) {
-        axpy_m(tc, Bo + i * ldBo, bx[i], m);
+        axpy_m(tc, Bo + i * ldBo, (double)bx[i], m);
     }
 }
 
@@ -94,44 +98,36 @@ void orthonormalize(
     const float  *x,
     const int    *mask,
     const double *Bo,   int ldBo,
-    double       *Bx,   int ldBx,
+    float        *Bx,   int ldBx,
     double       *T,    int ldT,
     double       *s_buf,
     double tol,
     std::atomic<long> *dgks_counter)
 {
-    // ------------------------------------------------------------------------
-    // Fill: Bx[i, j] = (double)(B[i, mask[j]] * x[i])
-    //   The f32 multiply happens first, then the cast to f64 -- matches the
-    //   prior Eigen expression `(B.col(mask[j]).array() * x).cast<double>()`.
-    // ------------------------------------------------------------------------
+    /*
+     *  Bx[i, j] = B[i, mask[j]] * x[i]  -- f32 * f32 stored as f32
+     */
     for (int j = 0; j < p; ++j) {
         const float *b  = B  + mask[j] * ldB;
-        double      *bx = Bx + j       * ldBx;
+        float       *bx = Bx + j       * ldBx;
         int i = 0;
 #if defined(__AVX__)
         for (; i + 8 <= n; i += 8) {
             __m256 b8 = _mm256_loadu_ps(b + i);
             __m256 x8 = _mm256_loadu_ps(x + i);
-            __m256 m8 = _mm256_mul_ps(b8, x8);
-            _mm256_storeu_pd(bx + i,     _mm256_cvtps_pd(_mm256_castps256_ps128(m8)));
-            _mm256_storeu_pd(bx + i + 4, _mm256_cvtps_pd(_mm256_extractf128_ps(m8, 1)));
-        }
-        for (; i + 4 <= n; i += 4) {
-            __m128 b4 = _mm_loadu_ps(b + i);
-            __m128 x4 = _mm_loadu_ps(x + i);
-            _mm256_storeu_pd(bx + i, _mm256_cvtps_pd(_mm_mul_ps(b4, x4)));
+            _mm256_storeu_ps(bx + i, _mm256_mul_ps(b8, x8));
         }
 #endif
         for (; i < n; ++i) {
-            bx[i] = (double)(b[i] * x[i]);
+            bx[i] = b[i] * x[i];
         }
     }
 
     // ------------------------------------------------------------------------
     // Phase 1: T = Bo^T * Bx
     //   Bo is row-major, so the outer loop over i loads bo_row once and reuses
-    //   it across all p columns -- amortizes the row fetch.
+    //   it across all p columns -- amortizes the row fetch. Bx[i,j] is f32,
+    //   upcast to f64 at the axpy_m call site; T stays f64.
     //
     // This is essentially a GEMM call, how would this compare to a tuned BLAS
     // implementation? For `p`, `k` in 100–500 and `n` in the millions, we'll
@@ -146,7 +142,7 @@ void orthonormalize(
     for (int i = 0; i < n; ++i) {
         const double *bo_row = Bo + i * ldBo;
         for (int j = 0; j < p; ++j) {
-            axpy_m(T + j * ldT, bo_row, Bx[i + j * ldBx], m);
+            axpy_m(T + j * ldT, bo_row, (double)Bx[i + j * ldBx], m);
         }
     }
 
@@ -156,18 +152,22 @@ void orthonormalize(
     //
     // Phase 2a fuses the per-column subtract into a single sweep over Bo: each
     // row of Bo is loaded once and reused across all p columns, dropping the
-    // Bo DRAM traffic from p*n*m to n*m. The per-column squared norms land in
-    // s_buf for the DGKS gate and the final scale step.
+    // Bo DRAM traffic from p*n*m to n*m. The subtract is done in f64, the
+    // result rounded back to f32 on store; s_buf accumulates the *stored*
+    // squared values so the downstream normalization sees the same magnitude
+    // that's in memory.
     // ------------------------------------------------------------------------
     std::fill_n(s_buf, p, 0.0);
     for (int i = 0; i < n; ++i) {
         const double *bo_row = Bo + i * ldBo;
         for (int j = 0; j < p; ++j) {
-            const double *tc = T  + j * ldT;
-            double       *bx = Bx + j * ldBx;
-            const double  v  = bx[i] - dot_m(bo_row, tc, m);
-            bx[i]    = v;
-            s_buf[j] += v * v;
+            const double *tc    = T  + j * ldT;
+            float        *bx    = Bx + j * ldBx;
+            const double  v     = (double)bx[i] - dot_m(bo_row, tc, m);
+            const float   v_f32 = (float)v;
+            bx[i]    = v_f32;
+            const double v_back = (double)v_f32;
+            s_buf[j] += v_back * v_back;
         }
     }
 
@@ -176,7 +176,7 @@ void orthonormalize(
     // degenerate anyway. See DGKS_GATE_RATIO_SQ in kernels.h.
     for (int j = 0; j < p; ++j) {
         double *tc = T  + j * ldT;
-        double *bx = Bx + j * ldBx;
+        float  *bx = Bx + j * ldBx;
         const double t_norm2 = dot_m(tc, tc, m);
         if (s_buf[j] > tol && s_buf[j] * DGKS_GATE_RATIO_SQ < t_norm2) {
             if (dgks_counter) {
@@ -187,17 +187,18 @@ void orthonormalize(
         }
     }
 
-    // Phase 2c: normalize.
+    // Phase 2c: normalize. f32 multiply; the scale stays f64 only until the
+    // store cast, since the column is already f32-bounded.
     for (int j = 0; j < p; ++j) {
-        double      *bx    = Bx + j * ldBx;
+        float       *bx    = Bx + j * ldBx;
         const double s     = s_buf[j];
-        const double scale = (s > tol) ? (1.0 / std::sqrt(s + tol)) : 0.0;
+        const float  scale = (s > tol) ? (float)(1.0 / std::sqrt(s + tol)) : 0.0f;
         int i = 0;
 #if defined(__AVX__)
-        __m256d s4 = _mm256_set1_pd(scale);
-        for (; i + 4 <= n; i += 4) {
-            __m256d bx4 = _mm256_loadu_pd(bx + i);
-            _mm256_storeu_pd(bx + i, _mm256_mul_pd(bx4, s4));
+        __m256 s8 = _mm256_set1_ps(scale);
+        for (; i + 8 <= n; i += 8) {
+            __m256 bx8 = _mm256_loadu_ps(bx + i);
+            _mm256_storeu_ps(bx + i, _mm256_mul_ps(bx8, s8));
         }
 #endif
         for (; i < n; ++i) {

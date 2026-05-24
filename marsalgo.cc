@@ -189,20 +189,18 @@ struct MarsData {
  *  Pre-allocated per-thread scratch. Sized once at construction; eval() only
  *  uses leading sub-blocks (.head/.leftCols) so no growth happens at call time.
  *
- *  TODO - narrow `Bx` and `d` from f64 to f32. They are by far the largest
- *  buffers (Bx ≈ n*max_terms*8 bytes, d ≈ n*8 bytes) and account for roughly
- *  half the scratch footprint per thread. NOT done yet because:
- *    - `Bx` is the output of orthonormalize()'s Gram-Schmidt step
- *      (Bx -= Bo * Bo^T * Bx, followed by normalization). That's a
- *      cancellation-heavy reduction; in f32 the columns lose orthogonality
- *      against Bo as m grows, and the `den > _tol` gate at the hinge SSE
- *      ratio in eval() is calibrated against `_tol = (n*0.02)*DBL_EPSILON`
- *      — switching Bx to single precision would silently break that gate.
- *    - `d` enters a long FMA chain in covariates_impl() that runs the full
- *      length of n on every hinge sweep. Narrowing the input compounds
- *      roundoff across ~6M FMAs per call.
- *  Worth ~500 MB/thread on the n=6M case if done carefully. Should land as
- *  its own diff with tests/repro_shuffle.py and the GCV pipeline verified.
+ *  Bx is stored as f32 (was f64); halves the per-thread footprint of the
+ *  largest buffer. All arithmetic inside orthonormalize() still happens in
+ *  f64, only the storage is narrowed. The DGKS retry in kernels.cc keeps
+ *  orthogonality bounded by O(eps_f32) ~ 1e-7 against Bo. Downstream:
+ *    - linear_dsse: ybx = Bx^T * y is computed with f64 accumulation so
+ *      the dot products do not lose precision against the f32 inputs.
+ *    - hinge sweep: bx_k = (double)Bx[k[i], j] upcasts at the load.
+ *
+ *  TODO - narrow `d` from f64 to f32. Enters a long FMA chain in
+ *  covariates_impl() over the full length of n on every hinge sweep;
+ *  narrowing the input compounds roundoff across ~6M FMAs per call.
+ *  Worth measuring once a hinge-heavy workload is profiled.
  *
  *  TODO - eliminate `Bok` (n*max_terms*4 bytes) entirely by random-gathering
  *  rows of Bo on the fly inside the j-loop in eval(), using software prefetch
@@ -219,10 +217,9 @@ struct MarsData {
  *  it for free; random `k[i]` indexing forfeits that.
  *
  *  Prerequisite: narrow Bo to f32 first (same Gram-Schmidt cancellation
- *  risks as the Bx narrowing above — needs careful validation). Once Bo is
- *  f32, on-the-fly gather + prefetch should match Bok bandwidth while
- *  freeing the Bok buffer (savings ≈ half of the Bx narrowing above, since
- *  Bok is already f32).
+ *  risks as the Bx narrowing — needs careful validation; M=400 accumulates).
+ *  Once Bo is f32, on-the-fly gather + prefetch should match Bok bandwidth
+ *  while freeing the Bok buffer.
  */
 struct MarsScratch::Impl {
     int       n;
@@ -230,7 +227,7 @@ struct MarsScratch::Impl {
     ArrayXf   x;            // normalized candidate column
     ArrayXi32 k;            // sort permutation of x
     ArrayXd   d;            // adjacent deltas of x along sort order (size n; d[0] unused, matches old `d = _d.data()-1` hack)
-    MatrixXd  Bx;           // (n, max_terms) column-major — basis interacted with x, ortho-normalized
+    MatrixXf  Bx;           // (n, max_terms) column-major — basis interacted with x, ortho-normalized (f32 storage; f64 arith)
     MatrixXfC Bok;          // (n, max_terms) row-major   — Bo with rows permuted by k
     ArrayXd   f;            // (max_terms+1) hinge projection accumulator
     ArrayXd   g;            // (max_terms+1) basis-weighted ortho accumulator
@@ -358,9 +355,9 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     verify(scratch._impl->n == _data->X.rows(), "scratch sized for wrong n");
     verify(scratch._impl->max_terms >= _m, "scratch too small for current basis count");
 
-    Map<ArrayXd>(linear_dsse,_m) = ArrayXd::Zero(_m);
-    Map<ArrayXd>(hinge_dsse, _m) = ArrayXd::Zero(_m);
-    Map<ArrayXd>(hinge_cuts, _m) = ArrayXd::Constant(_m,NAN);
+    std::fill_n(linear_dsse, _m, 0.0);
+    std::fill_n(hinge_dsse,  _m, 0.0);
+    std::fill_n(hinge_cuts,  _m, NAN);
 
     auto &S = *scratch._impl;
     const int p = nonzero(S.bcols.data(), bmask, _m);
@@ -386,7 +383,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
      *  the (m, p) workspace for the Bo^T*Bx intermediate; sized at
      *  (max_terms, max_terms) so the leading m×p block is what the kernel uses.
      */
-    Ref<MatrixXd> Bx = S.Bx.leftCols(p);
+    Ref<MatrixXf> Bx = S.Bx.leftCols(p);
     // `S.ybx` is reused as the per-column squared-norm scratch for
     // orthonormalize(); it is overwritten immediately below with Bx^T * y.
     Ref<VectorXd> ybx = S.ybx.head(p);
@@ -402,9 +399,11 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         _tol,
         &_dgks_count);
 
-    // Calculate the linear delta SSE and map to the output buffer
-    ybx.noalias() = Bx.transpose() * _data->y.matrix();
+    // Calculate the linear delta SSE and map to the output buffer.
+    // Bx is f32 storage; cast each column lazily so the dot product
+    // accumulates in f64 without materializing an f64 copy of Bx.
     for (int j = 0; j < p; ++j) {
+        ybx[j] = Bx.col(j).cast<double>().dot(_data->y.matrix());
         linear_dsse[bcols[j]] = ybx[j]*ybx[j];
     }
 
@@ -471,7 +470,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
             Ref<ArrayXd> f = S.f.head(m+1); f.setZero();
             Ref<ArrayXd> g = S.g.head(m+1); g.setZero();
             const float  *b  = B.col(bcols[j]).data();
-            const double *bx = Bx.col(j).data();
+            const float  *bx = Bx.col(j).data();        // f32 storage; upcast at the load
 
             double b_k  = b [k[0]]; // sort and upcast to double
             double bx_k = bx[k[0]];

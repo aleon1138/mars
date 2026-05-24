@@ -306,7 +306,10 @@ TEST(MarsTest, DeltaSSE)
         ALL_B.col(b_cols  ) = (x7 - CUT).cwiseMax(0);
         ALL_B.col(b_cols+1) = (CUT - x7).cwiseMax(0);
         dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-7);
+        // Tolerances relaxed from 1e-7..1e-8 to 1e-6 after narrowing Bx to f32
+        // storage; hinge SSE noise floor is dominated by the per-step f32
+        // round in the inner sweep accumulators (sqrt(N)*eps_f32 on dsse/N).
+        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-6);
 
         //---------------------------------------------------------------------
         // Test all permutations
@@ -315,25 +318,25 @@ TEST(MarsTest, DeltaSSE)
         ALL_B.col(b_cols+1) = ALL_B.col(0).array() * (res.hinge_cut[0] - x7).cwiseMax(0);
         dsse1 = res.base_dsse+res.hinge_dsse[0];
         dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-7);
+        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-6);
 
         ALL_B.col(b_cols  ) = ALL_B.col(1).array() * (x7 - res.hinge_cut[1]).cwiseMax(0);
         ALL_B.col(b_cols+1) = ALL_B.col(1).array() * (res.hinge_cut[1] - x7).cwiseMax(0);
         dsse1 = res.base_dsse+res.hinge_dsse[1];
         dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-8);
+        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-6);
 
         ALL_B.col(b_cols  ) = ALL_B.col(2).array() * (x7 - res.hinge_cut[2]).cwiseMax(0);
         ALL_B.col(b_cols+1) = ALL_B.col(2).array() * (res.hinge_cut[2] - x7).cwiseMax(0);
         dsse1 = res.base_dsse+res.hinge_dsse[2];
         dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-8);
+        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-6);
 
         ALL_B.col(b_cols  ) = ALL_B.col(3).array() * (x7 - res.hinge_cut[3]).cwiseMax(0);
         ALL_B.col(b_cols+1) = ALL_B.col(3).array() * (res.hinge_cut[3] - x7).cwiseMax(0);
         dsse1 = res.base_dsse+res.hinge_dsse[3];
         dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-8);
+        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-6);
 
         //---------------------------------------------------------------------
         // Append the hinges
