@@ -16,33 +16,34 @@ namespace {
 /*
  *  Inner kernels along the basis dimension k. AVX2 unrolls 4-wide; the
  *  scalar tail covers the leftover. Hot on every column of orthonormalize().
+ *  Bo is f32 storage; values are upcast to f64 on the load (cvtps_pd).
  */
 
-// tc[k] += scalar * bo_row[k] for k in 0..m.
-inline void axpy_m(double *tc, const double *bo_row, double scalar, int m)
+// tc[k] += scalar * (double)bo_row[k] for k in 0..m.
+inline void axpy_m(double *tc, const float *bo_row, double scalar, int m)
 {
     int k = 0;
 #if defined(__AVX__)
     __m256d bcast = _mm256_set1_pd(scalar);
     for (; k + 4 <= m; k += 4) {
         __m256d t  = _mm256_loadu_pd(tc + k);
-        __m256d bo = _mm256_loadu_pd(bo_row + k);
+        __m256d bo = _mm256_cvtps_pd(_mm_loadu_ps(bo_row + k));
         _mm256_storeu_pd(tc + k, _mm256_fmadd_pd(bo, bcast, t));
     }
 #endif
     for (; k < m; ++k) {
-        tc[k] += bo_row[k] * scalar;
+        tc[k] += (double)bo_row[k] * scalar;
     }
 }
 
-// dot(bo_row[:m], tc[:m]).
-inline double dot_m(const double *bo_row, const double *tc, int m)
+// dot((double)bo_row[:m], tc[:m]).  Bo is f32, tc is f64.
+inline double dot_bo(const float *bo_row, const double *tc, int m)
 {
     int k = 0;
 #if defined(__AVX__)
     __m256d acc4 = _mm256_setzero_pd();
     for (; k + 4 <= m; k += 4) {
-        __m256d bo = _mm256_loadu_pd(bo_row + k);
+        __m256d bo = _mm256_cvtps_pd(_mm_loadu_ps(bo_row + k));
         __m256d t  = _mm256_loadu_pd(tc + k);
         acc4 = _mm256_fmadd_pd(bo, t, acc4);
     }
@@ -51,7 +52,29 @@ inline double dot_m(const double *bo_row, const double *tc, int m)
     double acc = 0.0;
 #endif
     for (; k < m; ++k) {
-        acc += bo_row[k] * tc[k];
+        acc += (double)bo_row[k] * tc[k];
+    }
+    return acc;
+}
+
+// dot(a[:m], b[:m]) for f64*f64. Used only for the DGKS gate (tc dot tc),
+// where both operands are the f64 T workspace.
+inline double dot_m(const double *a, const double *b, int m)
+{
+    int k = 0;
+#if defined(__AVX__)
+    __m256d acc4 = _mm256_setzero_pd();
+    for (; k + 4 <= m; k += 4) {
+        __m256d av = _mm256_loadu_pd(a + k);
+        __m256d bv = _mm256_loadu_pd(b + k);
+        acc4 = _mm256_fmadd_pd(av, bv, acc4);
+    }
+    double acc = (acc4[0] + acc4[1]) + (acc4[2] + acc4[3]);
+#else
+    double acc = 0.0;
+#endif
+    for (; k < m; ++k) {
+        acc += a[k] * b[k];
     }
     return acc;
 }
@@ -62,13 +85,13 @@ inline double dot_m(const double *bo_row, const double *tc, int m)
 // quantity that's actually in memory.
 inline double project_subtract_and_norm(
     int n, int m,
-    const double *Bo, int ldBo,
+    const float *Bo, int ldBo,
     const double *tc,
     float *bx)
 {
     double s = 0.0;
     for (int i = 0; i < n; ++i) {
-        const double v = (double)bx[i] - dot_m(Bo + i * ldBo, tc, m);
+        const double v = (double)bx[i] - dot_bo(Bo + i * ldBo, tc, m);
         const float  v_f32 = (float)v;
         bx[i] = v_f32;
         const double v_back = (double)v_f32;
@@ -77,10 +100,11 @@ inline double project_subtract_and_norm(
     return s;
 }
 
-// tc = Bo^T * bx (single column). bx is f32, upcast to f64 inside axpy.
+// tc = Bo^T * bx (single column). Bo and bx are both f32, upcast to f64
+// inside axpy_m / at the bx[i] load.
 inline void compute_BoT_bx_col(
     int n, int m,
-    const double *Bo, int ldBo,
+    const float *Bo, int ldBo,
     const float *bx,
     double *tc)
 {
@@ -97,7 +121,7 @@ void orthonormalize(
     const float  *B,    int ldB,
     const float  *x,
     const int    *mask,
-    const double *Bo,   int ldBo,
+    const float  *Bo,   int ldBo,
     float        *Bx,   int ldBx,
     double       *T,    int ldT,
     double       *s_buf,
@@ -140,7 +164,7 @@ void orthonormalize(
         std::fill_n(T + j * ldT, m, 0.0);
     }
     for (int i = 0; i < n; ++i) {
-        const double *bo_row = Bo + i * ldBo;
+        const float *bo_row = Bo + i * ldBo;
         for (int j = 0; j < p; ++j) {
             axpy_m(T + j * ldT, bo_row, (double)Bx[i + j * ldBx], m);
         }
@@ -159,11 +183,11 @@ void orthonormalize(
     // ------------------------------------------------------------------------
     std::fill_n(s_buf, p, 0.0);
     for (int i = 0; i < n; ++i) {
-        const double *bo_row = Bo + i * ldBo;
+        const float *bo_row = Bo + i * ldBo;
         for (int j = 0; j < p; ++j) {
             const double *tc    = T  + j * ldT;
             float        *bx    = Bx + j * ldBx;
-            const double  v     = (double)bx[i] - dot_m(bo_row, tc, m);
+            const double  v     = (double)bx[i] - dot_bo(bo_row, tc, m);
             const float   v_f32 = (float)v;
             bx[i]    = v_f32;
             const double v_back = (double)v_f32;

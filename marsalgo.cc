@@ -175,12 +175,12 @@ struct MarsData {
     MarsData(const float *x, int n, int m, int p, int ldx)
         : X (x,n,m,Stride<Dynamic,1>(ldx,1))
         , B (MatrixXf ::Zero(n,p))
-        , Bo(MatrixXdC::Zero(n,p)) {}
+        , Bo(MatrixXfC::Zero(n,p)) {}
 
     Map<const MatrixXf,Aligned,Stride<Dynamic,1>>  X;   // read-only view of the regressors
     ArrayXd     y;      // target vector
     MatrixXf    B;      // all basis
-    MatrixXdC   Bo;     // all basis, orthonormalized
+    MatrixXfC   Bo;     // all basis, orthonormalized (f32 storage; f64 arithmetic)
     VectorXd    ybo;    // dot product of basis Bo with Y target
     ArrayXf     s;      // normalization constant for columns of 'X'
 };
@@ -189,10 +189,11 @@ struct MarsData {
  *  Pre-allocated per-thread scratch. Sized once at construction; eval() only
  *  uses leading sub-blocks (.head/.leftCols) so no growth happens at call time.
  *
- *  Bx is stored as f32 (was f64); halves the per-thread footprint of the
- *  largest buffer. All arithmetic inside orthonormalize() still happens in
- *  f64, only the storage is narrowed. The DGKS retry in kernels.cc keeps
- *  orthogonality bounded by O(eps_f32) ~ 1e-7 against Bo. Downstream:
+ *  Bx (and now Bo, in MarsData) are stored as f32; halves the largest per-
+ *  thread and per-fit buffers. All arithmetic inside orthonormalize() and
+ *  append() Gram-Schmidt still happens in f64 -- only the storage narrows.
+ *  The DGKS retry in kernels.cc and append() keeps orthogonality bounded
+ *  by O(eps_f32) ~ 1e-7 against Bo. Downstream:
  *    - linear_dsse: ybx = Bx^T * y is computed with f64 accumulation so
  *      the dot products do not lose precision against the f32 inputs.
  *    - hinge sweep: bx_k = (double)Bx[k[i], j] upcasts at the load.
@@ -202,24 +203,12 @@ struct MarsData {
  *  narrowing the input compounds roundoff across ~6M FMAs per call.
  *  Worth measuring once a hinge-heavy workload is profiled.
  *
- *  TODO - eliminate `Bok` (n*max_terms*4 bytes) entirely by random-gathering
- *  rows of Bo on the fly inside the j-loop in eval(), using software prefetch
+ *  TODO - eliminate `Bok` (n*max_terms*4 bytes per thread) by random-gathering
+ *  rows of Bo on the fly inside the j-loop in eval(), with software prefetch
  *  (`_mm_prefetch(Bo + k[i+W]*stride, ...)`) to hide the row-fetch latency.
- *  The inner kernel does ~m FMAs of work per iteration, plenty to overlap a
- *  one-row-ahead prefetch.
- *
- *  NOT done yet because Bo is stored as f64 (MatrixXdC) while Bok is f32 —
- *  gathering from Bo directly would double the per-iteration bandwidth on
- *  the covariates_impl() hot path, which the 2026-05-16 AVX-512 benchmark
- *  note flags as already L1 load/store-port limited. Software prefetch
- *  reorders misses but does not reduce total bytes through L1, and the
- *  current `Bok.row(i)` stream is sequential so the HW prefetcher handles
- *  it for free; random `k[i]` indexing forfeits that.
- *
- *  Prerequisite: narrow Bo to f32 first (same Gram-Schmidt cancellation
- *  risks as the Bx narrowing — needs careful validation; M=400 accumulates).
- *  Once Bo is f32, on-the-fly gather + prefetch should match Bok bandwidth
- *  while freeing the Bok buffer.
+ *  Now that Bo is itself f32, the on-the-fly gather costs the same bandwidth
+ *  per row as Bok.row(i), but forfeits the HW prefetcher's sequentiality --
+ *  the manual prefetch needs to make up the difference.
  */
 struct MarsScratch::Impl {
     int       n;
@@ -289,10 +278,12 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     _data->y /= y_norm;
     sqrt_w   /= w_norm;
 
-    // Initialize the first column of our basis with the intercept
+    // Initialize the first column of our basis with the intercept.
+    // Bo storage is f32 (sqrt_w computed in f64, downcast on store); ybo
+    // is computed in f64 with the column lazily upcast.
     _data->B .col(0) = sqrt_w.cast<float>();
-    _data->Bo.col(0) = sqrt_w;
-    _data->ybo = _data->Bo.leftCols(1).transpose() * _data->y.matrix();
+    _data->Bo.col(0) = sqrt_w.cast<float>();
+    _data->ybo = _data->Bo.leftCols(1).cast<double>().transpose() * _data->y.matrix();
 
     // Calculate the sample variance of the target 'y'.
     _yvar = (_data->y - _data->y.mean()).square().mean();
@@ -376,7 +367,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
 
     S.x = _data->X.col(xcol).array() * _data->s[xcol]; // in-place into pre-allocated scratch
     const Ref<const ArrayXf> x  = S.x;
-    const Ref<MatrixXdC>     Bo = _data->Bo.leftCols(m);
+    const Ref<MatrixXfC>     Bo = _data->Bo.leftCols(m);
 
     /*
      *  Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo`. BoTBx is
@@ -419,10 +410,11 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         int32_t *k = S.k.data();
         argsort(k, _data->X.col(xcol).data(), n);
 
-        // Sort the rows of `Bo` into scratch.Bok
+        // Sort the rows of `Bo` into scratch.Bok (both are f32 row-major;
+        // no cast needed).
         Ref<MatrixXfC> Bok = S.Bok.leftCols(m);
         for (int i = 0; i < n; ++i) {
-            Bok.row(i) = Bo.row(k[i]).cast<float>();
+            Bok.row(i) = Bo.row(k[i]);
         }
 
         // Take the deltas of `x` (into scratch)
@@ -571,34 +563,40 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
      *  Gram-Schmidt with a DGKS retry. The eval() side assumes Bo^T Bo = I, so
      *  any orthogonality drift accumulates across the whole fit. See
      *  mars::DGKS_GATE_RATIO_SQ in kernels.h for the trigger rationale.
+     *
+     *  Bo is f32 storage; v and the dot products stay f64. Each Bo column
+     *  is lazily cast to f64 on the load (no temp matrix). The final v/w
+     *  is downcast to f32 on the store into Bo.col(_m).
      */
     VectorXd v = _data->B.col(_m).cast<double>(); // make a copy
     _data->B.col(_m) /= v.norm();
 
     double proj_norm2 = 0.0;
     for (int j = 0; j < _m; ++j) {
-        const double c = _data->Bo.col(j).dot(v);
-        v.noalias() -= c * _data->Bo.col(j);
+        const auto   bj = _data->Bo.col(j).cast<double>();   // lazy expression
+        const double c  = bj.dot(v);
+        v.noalias() -= c * bj;
         proj_norm2 += c * c;
     }
     const double v_norm2_post = v.squaredNorm();
     if (v_norm2_post > _tol && v_norm2_post * mars::DGKS_GATE_RATIO_SQ < proj_norm2) {
         _dgks_count.fetch_add(1, std::memory_order_relaxed);
         for (int j = 0; j < _m; ++j) {
-            const double c = _data->Bo.col(j).dot(v);
-            v.noalias() -= c * _data->Bo.col(j);
+            const auto   bj = _data->Bo.col(j).cast<double>();
+            const double c  = bj.dot(v);
+            v.noalias() -= c * bj;
         }
     }
 
     const double w = v.norm();
     if (w*w > _tol) {
-        _data->Bo.col(_m) = v/w;
+        _data->Bo.col(_m) = (v/w).cast<float>();
 
         // Extend the cached ybo with one new entry; relies on ||y|| == 1 so
         // mse = (||y||^2 - ||ybo||^2) / n collapses to (1 - ||ybo||^2) / n.
         VectorXd ybo(_m + 1);
         ybo.head(_m) = _data->ybo;
-        ybo[_m] = _data->Bo.col(_m).dot(_data->y.matrix());
+        ybo[_m] = _data->Bo.col(_m).cast<double>().dot(_data->y.matrix());
         const double mse = (1. - ybo.squaredNorm()) / _data->X.rows();
         if (mse >= -_tol) { // gracefully handle values close to zero
             _m += 1;

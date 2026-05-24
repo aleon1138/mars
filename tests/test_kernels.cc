@@ -8,6 +8,7 @@
 
 using namespace Eigen;
 typedef Matrix<double, Dynamic, Dynamic, RowMajor> MatrixXdC;
+typedef Matrix<float,  Dynamic, Dynamic, RowMajor> MatrixXfC;
 
 namespace {
 
@@ -17,10 +18,14 @@ double invnorm(VectorXd x)
     return s > 1e-14 ? 1.0 / s : 0.0;
 }
 
-// Build a strictly orthonormal Bo from a random matrix using
-// modified Gram-Schmidt. Column `bad_col` is forced to be collinear with the
+// Build a strictly orthonormal Bo from a random matrix using modified
+// Gram-Schmidt. Column `bad_col` is forced to be collinear with the
 // previous column so it gets zeroed out -- exercises the degenerate path.
-MatrixXdC make_orthonormal_basis(int n, int m, int bad_col, std::mt19937 &rng)
+//
+// Internally builds in f64 for clean orthonormality, then casts to f32 --
+// matching what MarsData does after `append()` Gram-Schmidt (f64 arith,
+// f32 store).
+MatrixXfC make_orthonormal_basis(int n, int m, int bad_col, std::mt19937 &rng)
 {
     MatrixXf B = MatrixXf::Random(n, m);
     if (bad_col >= 0 && bad_col < m && bad_col > 0) {
@@ -36,7 +41,7 @@ MatrixXdC make_orthonormal_basis(int n, int m, int bad_col, std::mt19937 &rng)
         }
     }
     (void)rng;
-    return Bo;
+    return Bo.cast<float>();
 }
 
 ArrayXi random_mask(int m, int p, std::mt19937 &rng)
@@ -49,20 +54,21 @@ ArrayXi random_mask(int m, int p, std::mt19937 &rng)
 }
 
 // Eigen reference of what mars::orthonormalize computes -- used as ground
-// truth in the test. Computes in f64 throughout (the kernel narrows to f32
-// storage only); comparisons use f32-floor tolerances accordingly.
+// truth in the test. Bo is f32 (matches the kernel input); the reference
+// matmul casts to f64 lazily so the projection arithmetic is f64.
 MatrixXd eigen_reference(int n, int m, int p,
                          const MatrixXf  &B,
                          const ArrayXf   &x,
                          const ArrayXi   &mask,
-                         const MatrixXdC &Bo,
+                         const MatrixXfC &Bo,
                          double tol)
 {
     MatrixXd Bx(n, p);
     for (int j = 0; j < p; ++j) {
         Bx.col(j) = (B.col(mask[j]).array() * x).cast<double>();
     }
-    Bx -= Bo.leftCols(m) * (Bo.leftCols(m).transpose() * Bx);
+    const MatrixXd Bo_d = Bo.leftCols(m).cast<double>();
+    Bx -= Bo_d * (Bo_d.transpose() * Bx);
     const ArrayXd s = Bx.colwise().squaredNorm().array();
     Bx *= (s > tol).select(1 / (s + tol).sqrt(), 0).matrix().asDiagonal();
     return Bx;
@@ -86,16 +92,18 @@ TEST(KernelsTest, OrthonormalizeMatchesEigen)
     constexpr double F32_TOL = 1e-5;
 
     std::mt19937 rng(0xC0FFEE);
-    MatrixXdC Bo = make_orthonormal_basis(n, m, BAD_COL, rng);
+    MatrixXfC Bo = make_orthonormal_basis(n, m, BAD_COL, rng);
     MatrixXf  B  = MatrixXf::Random(n, m);
     B.col(BAD_COL) = B.col(BAD_COL - 1);  // also collinear in B
     ArrayXf   x  = ArrayXf::Random(n) * 10;
     ArrayXi   mask = random_mask(m, p, rng);
 
-    // Sanity: the manually built Bo is actually orthonormal (modulo the zeroed col).
+    // Sanity: the manually built Bo is orthonormal modulo the zeroed col and
+    // f32 storage round (relaxed from f64-tight TOL since Bo is now f32).
     MatrixXd I = MatrixXd::Identity(m, m);
     I(BAD_COL, BAD_COL) = 0;
-    ASSERT_TRUE((Bo.transpose() * Bo).isApprox(I, TOL));
+    MatrixXd Bod = Bo.cast<double>();
+    ASSERT_TRUE((Bod.transpose() * Bod).isApprox(I, F32_TOL));
 
     // Kernel output (Bx stored as f32)
     MatrixXf Bx(n, p);
@@ -117,7 +125,7 @@ TEST(KernelsTest, OrthonormalizeMatchesEigen)
     MatrixXd Bxd = Bx.cast<double>();
 
     // Bx is orthogonal to Bo
-    ASSERT_TRUE((Bo.transpose() * Bxd).isZero(F32_TOL));
+    ASSERT_TRUE((Bod.transpose() * Bxd).isZero(F32_TOL));
 
     // Columns of Bx are unit-norm
     ASSERT_TRUE(Bxd.colwise().norm().isOnes(F32_TOL));
@@ -143,18 +151,20 @@ TEST(KernelsTest, OrthonormalizeRespectsLeadingDims)
     constexpr double F32_TOL = 1e-5;
 
     std::mt19937 rng(42);
-    MatrixXdC Bo_full(n, max_terms);
-    Bo_full.setRandom();
-    {  // orthonormalize the leading m cols of Bo_full in place
-        Bo_full.col(0) *= invnorm(Bo_full.col(0));
+    MatrixXdC Bo_full_d(n, max_terms);
+    Bo_full_d.setRandom();
+    {  // orthonormalize the leading m cols of Bo_full in place (f64 for
+       // construction precision, then cast to f32 for the kernel call).
+        Bo_full_d.col(0) *= invnorm(Bo_full_d.col(0));
         for (int j = 1; j < m; ++j) {
-            Bo_full.col(j) *= invnorm(Bo_full.col(j));
+            Bo_full_d.col(j) *= invnorm(Bo_full_d.col(j));
             for (int k = 0; k < j; ++k) {
-                Bo_full.col(j) -= (Bo_full.col(k).transpose() * Bo_full.col(j)) * Bo_full.col(k);
-                Bo_full.col(j) *= invnorm(Bo_full.col(j));
+                Bo_full_d.col(j) -= (Bo_full_d.col(k).transpose() * Bo_full_d.col(j)) * Bo_full_d.col(k);
+                Bo_full_d.col(j) *= invnorm(Bo_full_d.col(j));
             }
         }
     }
+    MatrixXfC Bo_full = Bo_full_d.cast<float>();
 
     MatrixXf B(n, m);
     B.setRandom();
@@ -180,9 +190,10 @@ TEST(KernelsTest, OrthonormalizeRespectsLeadingDims)
         TOL);
 
     MatrixXd Bx = Bx_full.leftCols(p).cast<double>();
-    MatrixXdC Bo_used = Bo_full.leftCols(m);
+    MatrixXfC Bo_used = Bo_full.leftCols(m);
+    MatrixXd  Bo_used_d = Bo_used.cast<double>();
 
-    ASSERT_TRUE((Bo_used.transpose() * Bx).isZero(F32_TOL));
+    ASSERT_TRUE((Bo_used_d.transpose() * Bx).isZero(F32_TOL));
     ASSERT_TRUE(Bx.colwise().norm().isOnes(F32_TOL));
 
     MatrixXd Bx_ref = eigen_reference(n, m, p, B, x, mask, Bo_used, TOL);
@@ -212,20 +223,21 @@ TEST(KernelsTest, OrthonormalizeFiresDgksOnSevereCancellation)
     constexpr double F32_TOL = 1e-5;
 
     std::mt19937 rng(0xBADCAFE);
-    MatrixXdC Bo = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+    MatrixXfC Bo = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+    MatrixXd  Bod = Bo.cast<double>();
 
     // Build a unit vector orthogonal to span(Bo) by projecting random noise
     // out of Bo. This becomes the 5% "true residual" of the candidate column.
     VectorXd v_perp = VectorXd::Random(n);
     for (int k = 0; k < m; ++k) {
-        v_perp -= (Bo.col(k).dot(v_perp)) * Bo.col(k);
+        v_perp -= (Bod.col(k).dot(v_perp)) * Bod.col(k);
     }
     v_perp.normalize();
 
     // 95%/5% energy split -- well inside the DGKS trigger region.
     MatrixXf B(n, m);
     B.setZero();
-    B.col(0) = (std::sqrt(0.95) * Bo.col(0) + std::sqrt(0.05) * v_perp).cast<float>();
+    B.col(0) = (std::sqrt(0.95) * Bod.col(0) + std::sqrt(0.05) * v_perp).cast<float>();
 
     ArrayXf x = ArrayXf::Ones(n);                // x=1 so B*x just selects col 0
     ArrayXi mask(p); mask[0] = 0;
@@ -255,7 +267,7 @@ TEST(KernelsTest, OrthonormalizeFiresDgksOnSevereCancellation)
     ASSERT_EQ(counter.load(), 1);
 
     // Post-DGKS Bx is still orthogonal to Bo and unit-norm.
-    ASSERT_TRUE((Bo.transpose() * Bxd).isZero(F32_TOL));
+    ASSERT_TRUE((Bod.transpose() * Bxd).isZero(F32_TOL));
     ASSERT_TRUE(Bxd.colwise().norm().isOnes(F32_TOL));
 }
 
@@ -271,7 +283,7 @@ TEST(KernelsTest, OrthonormalizeDoesNotFireDgksOnWellConditioned)
     constexpr double TOL = 1e-14;
 
     std::mt19937 rng(0xFEED);
-    MatrixXdC Bo = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+    MatrixXfC Bo = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
     MatrixXf  B  = MatrixXf::Random(n, m);
     ArrayXf   x  = ArrayXf::Random(n);
     ArrayXi   mask = random_mask(m, p, rng);
@@ -306,11 +318,11 @@ TEST(KernelsTest, OrthonormalizeDoesNotFireDgksOnWellConditioned)
 //   - an exactly-degenerate column (must zero out via the s>tol gate)
 //   - mixed-magnitude regressors in B (cancellation pressure in projection)
 //
-// Why this exists: the current f64 storage of Bx delivers ~1e-13 orthogonality.
-// Before narrowing Bx (and later Bo) to f32, we want a published precision
-// baseline so the narrowing is a measurable change rather than an eyeballed
-// one. After narrowing Bx -> f32, the orth/norm tolerances are expected to
-// relax to roughly eps_f32 ~ 1e-6 (see bound rationale in comments below).
+// Why this exists: the precision floor of the f32 Bo + f32 Bx kernel is set
+// by the per-row store rounding plus the f32-rounding of Bo itself. This
+// test locks in a measurable baseline so future narrowing/widening changes
+// (e.g. further reduction of d, or hoisting tc into f32) are detectable
+// rather than eyeballed.
 // ---------------------------------------------------------------------------
 TEST(KernelsTest, OrthonormalizePrecisionStressBaseline)
 {
@@ -339,7 +351,8 @@ TEST(KernelsTest, OrthonormalizePrecisionStressBaseline)
     constexpr double VS_REF_TOL  = 1e-5;   // vs Eigen one-pass GS, well-conditioned cols only
 
     std::mt19937 rng(0xBAD5EED);
-    MatrixXdC Bo = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+    MatrixXfC Bo = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+    MatrixXd  Bod = Bo.cast<double>();
 
     // B with mixed magnitudes (factor up to 16 across columns) to apply
     // cancellation pressure when columns of different scales are projected.
@@ -357,14 +370,14 @@ TEST(KernelsTest, OrthonormalizePrecisionStressBaseline)
     // so the DGKS gate (ratio 9) fires on the projection energy split.
     VectorXd v_perp = VectorXd::Random(n);
     for (int k = 0; k < m; ++k) {
-        v_perp -= (Bo.col(k).dot(v_perp)) * Bo.col(k);
+        v_perp -= (Bod.col(k).dot(v_perp)) * Bod.col(k);
     }
     v_perp.normalize();
-    B.col(DGKS_COL) = (std::sqrt(0.97) * Bo.col(0)
+    B.col(DGKS_COL) = (std::sqrt(0.97) * Bod.col(0)
                        + std::sqrt(0.03) * v_perp).cast<float>();
 
     // Exactly-degenerate column: B[:,DEGEN_COL] * 1 sits entirely in span(Bo).
-    B.col(DEGEN_COL) = Bo.col(1).cast<float>();
+    B.col(DEGEN_COL) = Bo.col(1);
 
     ArrayXf x = ArrayXf::Ones(n);  // x = 1 so B*x is just the column.
 
@@ -414,7 +427,7 @@ TEST(KernelsTest, OrthonormalizePrecisionStressBaseline)
     // (1) Orthogonality of Bx against Bo holds across all columns including
     //     the DGKS-corrected one. Degenerate column is zeroed and therefore
     //     trivially orthogonal, so it counts here too.
-    const double orth = (Bo.transpose() * Bxd).cwiseAbs().maxCoeff();
+    const double orth = (Bod.transpose() * Bxd).cwiseAbs().maxCoeff();
     EXPECT_LT(orth, ORTH_TOL) << "orth=" << orth;
 
     // (2) Non-degenerate columns are unit-norm.
