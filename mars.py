@@ -262,13 +262,33 @@ def fit(X, y, w=None, **kwargs):
     _dump_header(logger)
 
     def _ranks(x):
-        y = np.empty(len(x), dtype="l")
+        y = np.empty_like(x, dtype=np.intp)
         y[np.argsort(x)] = np.arange(len(x))
         return y
 
     while algo.nbasis() < max_terms:
         # "Fast MARS" - rank the basis and inputs by delta SSE
         # contribution and take only the most promising ones.
+        #
+        # A candidate term is (parent basis) x hinge(input), so the search
+        # has two independent axes and we cap each one separately:
+        #   - basis_to_use: top 'max_basis' parents by cached delta-SSE. This
+        #     is Friedman's classic Fast MARS parent restriction (paper sec 3.0,
+        #     = earth's 'fast.k', default 20). No aging here: the basis pool
+        #     grows and is re-scored every epoch, so nothing gets starved.
+        #   - input_to_use: top 'max_inputs' inputs by the aged priority below.
+        #     This axis is our addition; earth/Friedman don't cap inputs.
+        #
+        # The input priority is Friedman's aging formula (paper sec 3.1, = Eq.
+        # 27, = earth's 'fast.beta'): improvement + beta * (iters since last
+        # used). The aging term is what keeps the *fixed* input pool fair -
+        # without it, an input that scored low once would be masked out forever
+        # and its stale score would never refresh. Two local tweaks:
+        #   - We use _ranks(input_sse) (integer rank 0..p-1) rather than the raw
+        #     SSE so the improvement term shares a scale with (epoch-input_age);
+        #     thus aging_factor=1 means "one stale epoch == one rank position".
+        #   - The (input_sse > 0) gate exempts known-dead inputs from aging.
+        # input_sse starts at +inf (see above) so every input is examined once.
         basis_to_use = np.argsort(basis_sse)[::-1][:max_basis]
         input_to_use = np.argsort(
             _ranks(input_sse) + aging_factor * (epoch - input_age) * (input_sse > 0)
