@@ -48,14 +48,14 @@ def make_data(n=200000, p=12, noise=0.3, seed=0, ties=True):
     return X, y.astype("f")
 
 
-def fit_curve(X, y, max_epochs=20, seed=None):
+def fit_curve(X, y, max_terms=41, seed=None):
     if seed is not None:
         rng = np.random.default_rng(seed)
         perm = rng.permutation(len(X))
         X, y = np.asfortranarray(X[perm]), y[perm]
     model = mars.fit(
         X, y,
-        max_epochs=max_epochs,
+        max_terms=max_terms,
         threads=1,        # avoid OpenMP nondeterminism
         r2_window=1_000,  # disable patience early-stop for clean curves
         r2_thresh=0.0,
@@ -71,14 +71,14 @@ def roughness(curve):
     return float(np.sum(np.abs(d2)))
 
 
-def measure(label, X, y, k_shuffles=10, max_epochs=20):
+def measure(label, X, y, k_shuffles=10, max_terms=41):
     sorted_idx = np.argsort(y)  # induce strong row-order structure
     Xs, ys = np.asfortranarray(X[sorted_idx]), y[sorted_idx]
-    sorted_curve = fit_curve(Xs, ys, max_epochs=max_epochs)
+    sorted_curve = fit_curve(Xs, ys, max_terms=max_terms)
 
     shuffled_curves = []
     for s in range(k_shuffles):
-        c = fit_curve(X, y, max_epochs=max_epochs, seed=1000 + s)
+        c = fit_curve(X, y, max_terms=max_terms, seed=1000 + s)
         shuffled_curves.append(c)
     L = min(len(sorted_curve), *(len(c) for c in shuffled_curves))
     sorted_curve = sorted_curve[:L]
@@ -109,5 +109,5 @@ def measure(label, X, y, k_shuffles=10, max_epochs=20):
 if __name__ == "__main__":
     X, y = make_data()
     label = sys.argv[1] if len(sys.argv) > 1 else "baseline"
-    out = measure(label, X, y, k_shuffles=8, max_epochs=25)
+    out = measure(label, X, y, k_shuffles=8, max_terms=51)
     np.savez(f"/tmp/repro_{label}.npz", **out["curves"])

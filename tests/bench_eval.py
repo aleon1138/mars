@@ -58,7 +58,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=100_000)
     ap.add_argument("--p", type=int, default=1200)
-    ap.add_argument("--epochs", type=int, default=6)
+    ap.add_argument("--max-terms", type=int, default=13)
     ap.add_argument("--threads", type=int, default=-1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--warmup", action="store_true",
@@ -69,23 +69,23 @@ def main():
     args = ap.parse_args()
 
     X, y = make_data(args.n, args.p, args.seed)
-    print(f"# n={args.n} p={args.p} epochs={args.epochs} threads={args.threads}"
+    print(f"# n={args.n} p={args.p} max_terms={args.max_terms} threads={args.threads}"
           f"  linear_only={args.linear_only}"
           f"  MALLOC_ARENA_MAX={os.environ.get('MALLOC_ARENA_MAX', 'default')}"
           f"  LD_PRELOAD={os.environ.get('LD_PRELOAD', '')}")
 
     if args.warmup:
-        mars.fit(X[:1000], y[:1000], max_epochs=2, threads=args.threads,
+        mars.fit(X[:1000], y[:1000], max_terms=5, threads=args.threads,
                  linear_only=args.linear_only)
 
     rss_before = rss_kb()
     for i in range(args.repeat):
         t0 = time.perf_counter()
-        model = mars.fit(X, y, max_epochs=args.epochs, threads=args.threads,
+        model = mars.fit(X, y, max_terms=args.max_terms, threads=args.threads,
                          linear_only=args.linear_only)
         dt = time.perf_counter() - t0
         print(f"run {i+1}/{args.repeat}: {dt:.2f}s  M={len(model)}"
-              f"  ms/epoch={1000*dt/args.epochs:.0f}"
+              f"  ms/term={1000*dt/max(len(model),1):.0f}"
               f"  peak_rss={rss_kb()/1024:.0f} MB"
               f"  Δrss={(rss_kb()-rss_before)/1024:+.0f} MB")
 

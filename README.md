@@ -91,7 +91,7 @@ y = np.array(y, dtype='f')
 
 # Fit the model
 import mars
-model = mars.fit(X, y, max_epochs=8, tail_span=0, linear_only=True)
+model = mars.fit(X, y, max_terms=17, tail_span=0, linear_only=True)
 B     = mars.expand(X, model) # expand the basis
 beta  = np.linalg.lstsq(B, y, rcond=None)[0]
 y_hat = B @ beta
