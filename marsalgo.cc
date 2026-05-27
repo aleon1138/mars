@@ -172,10 +172,12 @@ cov_t covariates(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const double 
 ///////////////////////////////////////////////////////////////////////////////
 
 struct MarsData {
-    MarsData(const float *x, int n, int m, int p, int ldx)
+    // B/Bo start at one column (the intercept) and grow one column per append()
+    // so Bo's row stride tracks the live basis count; see the rationale there.
+    MarsData(const float *x, int n, int m, int ldx)
         : X (x,n,m,Stride<Dynamic,1>(ldx,1))
-        , B (MatrixXf ::Zero(n,p))
-        , Bo(MatrixXfC::Zero(n,p)) {}
+        , B (MatrixXf ::Zero(n,1))
+        , Bo(MatrixXfC::Zero(n,1)) {}
 
     Map<const MatrixXf,Aligned,Stride<Dynamic,1>>  X;   // read-only view of the regressors
     ArrayXd     y;      // target vector
@@ -186,60 +188,80 @@ struct MarsData {
 };
 
 /*
- *  Pre-allocated per-thread scratch. Sized once at construction; eval() only
- *  uses leading sub-blocks (.head/.leftCols) so no growth happens at call time.
+ *  Per-thread eval() working memory. Held in a function-local thread_local
+ *  (see MarsAlgo::eval), so each OpenMP worker owns one for the lifetime of the
+ *  thread and ensure() reallocates only when the problem grows. Basis-sized
+ *  buffers grow geometrically, so a whole forward pass triggers O(log m)
+ *  reallocations per thread -- that keeps the large-allocation mmap traffic off
+ *  the hot path without the explicit pre-allocated scratch pool we used to
+ *  thread through reserve_scratches()/scratch(tid).
  *
- *  Bx (and Bo, in MarsData) are stored as f32; halves the largest per-thread
- *  and per-fit buffers. All arithmetic inside orthonormalize() and append()
- *  Gram-Schmidt still happens in f64 -- only the storage narrows. The DGKS
- *  retry in kernels.cc and append() keeps orthogonality bounded by
- *  O(eps_f32) ~ 1e-7 against Bo. Downstream:
- *    - linear_dsse: ybx = Bx^T * y is computed with f64 accumulation so
- *      the dot products do not lose precision against the f32 inputs.
- *    - hinge sweep: bx_k = (double)Bx[k[i], j] upcasts at the load; Bo
- *      rows are gathered on-the-fly via Bo_data + k[i]*ldBo with a
- *      software prefetch a few iterations ahead.
+ *  All basis-dimensioned buffers are over-allocated to `cap` (>= live m); the
+ *  hot loops slice leading sub-blocks via .head()/.leftCols(), so the slack is
+ *  invisible. Bx (and Bo, in MarsData) are stored as f32 to halve the largest
+ *  buffers; all Gram-Schmidt arithmetic in orthonormalize()/append() stays f64
+ *  -- only the storage narrows. The DGKS retry in kernels.cc and append() keeps
+ *  orthogonality bounded by O(eps_f32) ~ 1e-7 against Bo. Downstream:
+ *    - linear_dsse: ybx = Bx^T * y accumulates in f64 so the dot products do
+ *      not lose precision against the f32 inputs.
+ *    - hinge sweep: bx_k = (double)Bx[k[i], j] upcasts at the load; Bo rows
+ *      are gathered on the fly via Bo_data + k[i]*ldBo (ldBo == live m now) with
+ *      a software prefetch a few iterations ahead.
  *
  *  TODO - narrow `d` from f64 to f32. Enters a long FMA chain in
  *  covariates_impl() over the full length of n on every hinge sweep;
  *  narrowing the input compounds roundoff across ~6M FMAs per call.
  *  Worth measuring once a hinge-heavy workload is profiled.
  */
-struct MarsScratch::Impl {
-    int       n;
-    int       max_terms;
-    ArrayXf   x;            // normalized candidate column
-    ArrayXi32 k;            // sort permutation of x
-    ArrayXf   d;            // adjacent deltas of x along sort order (size n; d[0] unused). f32 storage -- the subtraction itself is f32-f32 so no precision is lost vs f64; upcast to f64 at the load before the FMA chain.
-    MatrixXf  Bx;           // (n, max_terms) column-major — basis interacted with x, ortho-normalized (f32 storage; f64 arith)
-    ArrayXd   f;            // (max_terms+1) hinge projection accumulator
-    ArrayXd   g;            // (max_terms+1) basis-weighted ortho accumulator
-    ArrayXi   bcols;        // (max_terms) indexes of non-ignored basis (output of nonzero_into)
-    VectorXd  ybx;          // (max_terms) Bx^T * y, leading p entries used
-    ArrayXi   hinge_idx;    // (max_terms) best hinge sort position per j (leading p)
-    ArrayXd   hinge_sse;    // (max_terms) best hinge delta-SSE per j (leading p)
-    MatrixXd  BoTBx;        // (max_terms, max_terms) workspace for Bo^T*Bx in orthonormalize()
+namespace {
+struct EvalScratch {
+    int       n   = 0;     // row count the n-sized buffers are sized for
+    int       cap = 0;     // basis capacity the m-sized buffers are sized for
+    ArrayXf   x;           // normalized candidate column
+    ArrayXi32 k;           // sort permutation of x
+    ArrayXf   d;           // adjacent deltas of x along sort order (d[0] unused). f32 storage -- the subtraction is f32-f32 so no precision is lost vs f64; upcast to f64 at the load before the FMA chain.
+    MatrixXf  Bx;          // (n, cap) column-major — basis interacted with x, ortho-normalized (f32 storage; f64 arith)
+    ArrayXd   f;           // (cap+1) hinge projection accumulator
+    ArrayXd   g;           // (cap+1) basis-weighted ortho accumulator
+    ArrayXi   bcols;       // (cap) indexes of non-ignored basis (output of nonzero)
+    VectorXd  ybx;         // (cap) Bx^T * y, leading p entries used
+    ArrayXi   hinge_idx;   // (cap) best hinge sort position per j (leading p)
+    ArrayXd   hinge_sse;   // (cap) best hinge delta-SSE per j (leading p)
+    MatrixXd  BoTBx;       // (cap, cap) workspace for Bo^T*Bx in orthonormalize()
 
-    Impl(int n_, int max_terms_)
-        : n(n_), max_terms(max_terms_)
-        , x(n_), k(n_), d(n_)
-        , Bx(n_, max_terms_)
-        , f(max_terms_+1), g(max_terms_+1)
-        , bcols(max_terms_)
-        , ybx(max_terms_)
-        , hinge_idx(max_terms_)
-        , hinge_sse(max_terms_)
-        , BoTBx(max_terms_, max_terms_)
-    {}
+    // Grow (never shrink) to hold n rows and at least m basis columns. The
+    // n-sized buffers reallocate only when the row count changes (a different
+    // MarsAlgo reused this thread's scratch); the basis-sized buffers grow
+    // geometrically so a forward pass triggers O(log m) reallocations.
+    void ensure(int n_, int m)
+    {
+        if (n_ != n) {
+            n = n_;
+            x.resize(n);
+            k.resize(n);
+            d.resize(n);
+            cap = 0;       // force the basis-sized buffers below to reallocate
+        }
+        if (m > cap) {
+            cap = m > 2 * cap ? m : 2 * cap;
+            Bx.resize(n, cap);
+            f.resize(cap + 1);
+            g.resize(cap + 1);
+            bcols.resize(cap);
+            ybx.resize(cap);
+            hinge_idx.resize(cap);
+            hinge_sse.resize(cap);
+            BoTBx.resize(cap, cap);
+        }
+    }
 };
-
-MarsScratch::MarsScratch(int n, int max_terms) : _impl(new Impl(n, max_terms)) {}
-MarsScratch::~MarsScratch() { delete _impl; }
+} // namespace
 
 MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m, int p, int ldx)
-    : _data(new MarsData(x, n, m, p, ldx))
+    : _data(new MarsData(x, n, m, ldx))
     , _tol((n*0.02)*DBL_EPSILON) // rough guess
 {
+    _max_terms = p;
     verify(!std::isfinite(NAN), "NAN check is disabled, recompile without --fast-math");
 
     // Copy and upcast target
@@ -299,21 +321,6 @@ int MarsAlgo::nrows() const
 {
     return _data->X.rows();
 }
-int MarsAlgo::max_basis() const
-{
-    return _data->B.cols();
-}
-void MarsAlgo::reserve_scratches(int threads)
-{
-    _scratches.reserve(threads);
-    while ((int)_scratches.size() < threads) {
-        _scratches.emplace_back(new MarsScratch(nrows(), max_basis()));
-    }
-}
-MarsScratch &MarsAlgo::scratch(int tid)
-{
-    return *_scratches[tid];
-}
 double MarsAlgo::dsse() const
 {
     return _data->ybo.squaredNorm();
@@ -326,20 +333,29 @@ double MarsAlgo::yvar() const
 ///////////////////////////////////////////////////////////////////////////////
 
 void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
-                    int xcol, const bool *bmask, int min_span, int end_span, bool linear_only,
-                    MarsScratch &scratch)
+                    int xcol, const bool *bmask, int min_span, int end_span, bool linear_only)
 {
     verify(xcol >= 0 && xcol < _data->X.cols(), "invalid X column index");
     verify(min_span >= 1, "min_span must be >= 1");
-    verify(scratch._impl != nullptr, "scratch is null");
-    verify(scratch._impl->n == _data->X.rows(), "scratch sized for wrong n");
-    verify(scratch._impl->max_terms >= _m, "scratch too small for current basis count");
 
     std::fill_n(linear_dsse, _m, 0.0);
     std::fill_n(hinge_dsse,  _m, 0.0);
     std::fill_n(hinge_cuts,  _m, NAN);
 
-    auto &S = *scratch._impl;
+    // Per-thread working memory, grown on demand and reused across calls. The
+    // thread_local is a *pointer* with a constant initializer (no lazy-init
+    // guard, no thread-exit destructor registration); the buffer is heap-
+    // allocated on first touch. A non-trivial thread_local object would instead
+    // be constructed the first time a thread reaches this line, and that
+    // construction crashes on an OpenMP worker thread under the statically
+    // linked libomp on macOS. The per-thread EvalScratch is intentionally
+    // leaked -- worker threads live for the process and there are <= `threads`.
+    thread_local EvalScratch *Sp = nullptr;
+    if (!Sp) {
+        Sp = new EvalScratch();
+    }
+    EvalScratch &S = *Sp;
+    S.ensure(_data->X.rows(), _m);
     const int p = nonzero(S.bcols.data(), bmask, _m);
     if (p == 0) {
         return;
@@ -389,8 +405,10 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     // Evaluate the delta SSE on all hinge locations
     if (linear_only == false) {
         const double *ybo = _data->ybo.data(); // dot(Bo.T,_data->y);
-        Ref<ArrayXi> hinge_idx = S.hinge_idx.head(p); hinge_idx.setConstant(-1);
-        Ref<ArrayXd> hinge_sse = S.hinge_sse.head(p); hinge_sse.setZero();
+        Ref<ArrayXi> hinge_idx = S.hinge_idx.head(p);
+        hinge_idx.setConstant(-1);
+        Ref<ArrayXd> hinge_sse = S.hinge_sse.head(p);
+        hinge_sse.setZero();
 
         // Get sort indexes (into scratch)
         // TODO - we should keep a LRU cache as we usually pick from the
@@ -450,8 +468,10 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
          *  gain from the full hinge pair (h_plus and h_minus together).
          */
         for (int j = 0; j < p; ++j) {
-            Ref<ArrayXd> f = S.f.head(m+1); f.setZero();
-            Ref<ArrayXd> g = S.g.head(m+1); g.setZero();
+            Ref<ArrayXd> f = S.f.head(m+1);
+            f.setZero();
+            Ref<ArrayXd> g = S.g.head(m+1);
+            g.setZero();
             const float  *b  = B.col(bcols[j]).data();
             const float  *bx = Bx.col(j).data();        // f32 storage; upcast at the load
 
@@ -481,9 +501,10 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
                 // ahead; the HW prefetcher fills the rest of the row once
                 // we touch the first cache line.
                 if (i + PREFETCH_DIST < n) {
-                    _mm_prefetch(
-                        reinterpret_cast<const char *>(Bo_data + k[i + PREFETCH_DIST] * ldBo),
-                        _MM_HINT_T0);
+                    // __builtin_prefetch(addr, rw=0 read, locality=3 high) lowers
+                    // to prefetcht0 on x86 (identical to _mm_prefetch + _MM_HINT_T0)
+                    // and is portable to non-x86 (arm64) where xmmintrin.h is absent.
+                    __builtin_prefetch(Bo_data + k[i + PREFETCH_DIST] * ldBo, 0, 3);
                 }
 
                 b_k  = b [k[i]]; // sort and upcast to double
@@ -494,13 +515,13 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
                 const bool on_grid = (i > head) && ((i - head - 1) % min_span == 0);
                 const float *bo_row = Bo_data + k[i]*ldBo;
                 cov_t o = on_grid
-                    ? covariates_impl<true >(f,g,bo_row,ybo,bx_k,ybx[j],di,b_k,m)
-                    : covariates_impl<false>(f,g,bo_row,ybo,bx_k,ybx[j],di,b_k,m);
+                          ? covariates_impl<true >(f,g,bo_row,ybo,bx_k,ybx[j],di,b_k,m)
+                          : covariates_impl<false>(f,g,bo_row,ybo,bx_k,ybx[j],di,b_k,m);
 
                 k0 = fma(di*di,b2,k0);  // build up ||h_plus||^2 incrementally
-                k1 = fma(di*2 ,bd,k1);
-                w  = fma(di   ,vb,w);   // w = h_plus^T * y
-                bd = fma(di   ,b2,bd);
+                k1 = fma(di*2,bd,k1);
+                w  = fma(di,vb,w);      // w = h_plus^T * y
+                bd = fma(di,b2,bd);
                 b2 = fma(b_k,b_k,b2);
                 vb = fma(y_k,b_k,vb);
 
@@ -534,13 +555,26 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
 
 double MarsAlgo::append(char type, int xcol, int bcol, float h)
 {
-    if (_m >= _data->B.cols()) {
+    if (_m >= _max_terms) {
         throw std::runtime_error("basis matrix is full");
     }
     if (bcol < 0 || bcol >= _m) {
         char msg[80];
         snprintf(msg, sizeof(msg), "invalid basis column number: %d", bcol);
         throw std::runtime_error(msg);
+    }
+
+    // Grow the basis storage by exactly one column so Bo's row stride stays
+    // equal to the live basis count. The eval() hinge sweep gathers Bo rows by
+    // that stride (ldBo == cols), so a tight stride keeps each randomly-gathered
+    // row to the minimum number of cache lines. The old allocate-once-at-
+    // max_terms storage left the stride at max_terms, which made a larger
+    // max_terms slower at equal basis count -- a TLB/cache sink, not just extra
+    // memory. conservativeResize preserves the existing columns; the resize must
+    // precede the `b` reference below, which would otherwise dangle.
+    if (_data->B.cols() < _m + 1) {
+        _data->B .conservativeResize(Eigen::NoChange, _m + 1);
+        _data->Bo.conservativeResize(Eigen::NoChange, _m + 1);
     }
 
     const float        s = _data->s[xcol];

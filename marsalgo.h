@@ -1,6 +1,4 @@
 #include <stdexcept>
-#include <memory>
-#include <vector>
 
 inline void verify(bool check, const char *msg)
 {
@@ -9,32 +7,12 @@ inline void verify(bool check, const char *msg)
     }
 }
 
-/*
- *  Per-thread scratch buffers for MarsAlgo::eval(). Production callers should
- *  use MarsAlgo::reserve_scratches() + MarsAlgo::scratch(tid), which pools
- *  these for the lifetime of the MarsAlgo so the OMP-parallel eval path never
- *  hits glibc's mmap-based large-allocation route -- 64 threads hammering
- *  mmap/munmap on the same process serializes on the kernel's mmap_lock and
- *  stalls threads in state D. Constructible directly for unit tests.
- */
-class MarsScratch {
-public:
-    MarsScratch(int n, int max_terms);
-    ~MarsScratch();
-    MarsScratch(const MarsScratch &) = delete;
-    MarsScratch &operator=(const MarsScratch &) = delete;
-private:
-    struct Impl;
-    Impl *_impl;
-    friend class MarsAlgo;
-};
-
 class MarsAlgo {
     struct MarsData *_data = nullptr;
-    int     _m    = 1;  // number of basis found
-    double  _yvar = 0;  // variance of 'y'
-    double  _tol  = 0;  // numerical error tolerance
-    std::vector<std::unique_ptr<MarsScratch>> _scratches;
+    int     _m         = 1;  // number of basis found
+    int     _max_terms = 0;  // capacity cap: B/Bo grow up to this many columns
+    double  _yvar      = 0;  // variance of 'y'
+    double  _tol       = 0;  // numerical error tolerance
 
 public:
     /*
@@ -51,26 +29,14 @@ public:
 
     int nbasis() const;
     int nrows() const;
-    int max_basis() const;
     double dsse() const;
     double yvar() const;
 
     /*
-     *  Ensure at least `threads` per-thread scratch buffers exist. Idempotent;
-     *  call from the main thread before entering a parallel region. Allocations
-     *  happen serially here so they don't contend on the kernel's mmap_lock.
-     */
-    void reserve_scratches(int threads);
-
-    /*
-     *  Return the scratch buffer for thread `tid`. `reserve_scratches(n)` with
-     *  n > tid must have been called previously.
-     */
-    MarsScratch &scratch(int tid);
-
-    /*
      *  Returns the delta SSE (sum of squared errors) given the existing basis
-     *  set and a candidate column of `X` to evaluate.
+     *  set and a candidate column of `X` to evaluate. Working memory is a
+     *  function-local thread_local sized on demand, so eval() is safe to call
+     *  concurrently from an OpenMP region with no caller-supplied scratch.
      *
      *  linear_dsse : double(m) [out]
      *      delta SSE from adding a linear term for each parent basis.
@@ -101,8 +67,7 @@ public:
      *      This will ignore the output values of `hinge_dsse` and `hinge_cuts`.
      */
     void eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
-              int xcol, const bool *bmask, int min_span, int end_span, bool linear_only,
-              MarsScratch &scratch);
+              int xcol, const bool *bmask, int min_span, int end_span, bool linear_only);
 
     /*
      *  Append a new basis function and update the orthonormalized state.

@@ -3,6 +3,8 @@
 #include <gtest/gtest.h>
 #include <vector>
 #include <random>
+#include <thread>
+#include <cmath>
 constexpr double EPS = 1e-14;
 
 
@@ -71,9 +73,8 @@ struct Result {
         hinge_dsse  = ArrayXd(mask.rows());
         hinge_cut   = ArrayXd(mask.rows());
         base_dsse = algo.dsse();
-        MarsScratch scratch(algo.nrows(), algo.max_basis());
         algo.eval(linear_dsse.data(), hinge_dsse.data(),
-                  hinge_cut.data(), xcol, mask.data(), min_span, 0, linear, scratch);
+                  hinge_cut.data(), xcol, mask.data(), min_span, 0, linear);
     }
 
     double  base_dsse;
@@ -491,4 +492,74 @@ TEST(MarsTest, MinSpan)
     EXPECT_NEAR(r1 .hinge_cut[0], CUT, 0.05);
     EXPECT_NEAR(r2 .hinge_cut[0], CUT, 0.05);
     EXPECT_NEAR(r10.hinge_cut[0], CUT, 0.05);
+}
+
+// eval() is called concurrently over X columns from the OpenMP region in the
+// bindings; production never exercised that path from the test suite. This
+// grows the basis through append() (so Bo is the tight-stride, grown matrix),
+// then checks that splitting the per-column eval() across std::threads -- which
+// forces the function-local thread_local scratch to be constructed on non-main
+// threads and has many readers hit the shared Bo at once -- reproduces the
+// single-threaded result bit-for-bit. std::thread keeps this independent of the
+// OpenMP runtime.
+TEST(MarsTest, ConcurrentEval)
+{
+    srand(0);
+    const int N = 4096; // rows
+    const int M = 24;   // X columns
+
+    MatrixXd X(MatrixXd::Random(N, M));
+    VectorXd y = (X.col(0).array() * 0.4
+                  - 0.7 * (X.col(1).array() - 0.1).cwiseMax(0)
+                  + 0.5 * X.col(2).array() * X.col(3).array()).matrix();
+    y += 0.3 * VectorXd::Random(N);
+
+    MatrixXf X32 = X.cast<float>();
+    VectorXf y32 = y.cast<float>();
+    ArrayXf  w32 = ArrayXf::Ones(N);
+
+    MarsAlgo algo(X32.data(), y32.data(), w32.data(), N, M, /*max_terms=*/40, N);
+
+    // Grow the basis via append(): linears, a mirror hinge pair, an interaction.
+    algo.append('l', 0, 0, 0);
+    algo.append('l', 1, 0, 0);
+    algo.append('+', 2, 0, 0.0f);
+    algo.append('-', 2, 0, 0.0f);
+    algo.append('l', 3, 1, 0);
+    const int m = algo.nbasis();
+    ASSERT_GE(m, 3);
+
+    ArrayXb   mask     = ArrayXb::Constant(m, true);
+    const int min_span = 1, end_span = 0;
+
+    auto run = [&](std::vector<ArrayXd> &lin, std::vector<ArrayXd> &hin,
+                   std::vector<ArrayXd> &cut, int t0, int t1) {
+        for (int xc = t0; xc < t1; ++xc) {
+            algo.eval(lin[xc].data(), hin[xc].data(), cut[xc].data(),
+                      xc, mask.data(), min_span, end_span, /*linear_only=*/false);
+        }
+    };
+
+    auto make = [&] { return std::vector<ArrayXd>(M, ArrayXd(m)); };
+    std::vector<ArrayXd> lin_ref = make(), hin_ref = make(), cut_ref = make();
+    run(lin_ref, hin_ref, cut_ref, 0, M); // single-threaded reference
+
+    std::vector<ArrayXd> lin = make(), hin = make(), cut = make();
+    const int nt = 4;
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nt; ++t) {
+        pool.emplace_back(run, std::ref(lin), std::ref(hin), std::ref(cut),
+                          (M * t) / nt, (M * (t + 1)) / nt);
+    }
+    for (auto &th : pool) th.join();
+
+    for (int xc = 0; xc < M; ++xc) {
+        for (int j = 0; j < m; ++j) {
+            ASSERT_EQ(lin[xc][j], lin_ref[xc][j]) << "linear_dsse col " << xc << " j " << j;
+            ASSERT_EQ(hin[xc][j], hin_ref[xc][j]) << "hinge_dsse col "  << xc << " j " << j;
+            const double c = cut[xc][j], cr = cut_ref[xc][j];
+            ASSERT_TRUE((std::isnan(c) && std::isnan(cr)) || c == cr)
+                << "hinge_cut col " << xc << " j " << j;
+        }
+    }
 }

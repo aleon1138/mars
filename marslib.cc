@@ -60,15 +60,6 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
     threads = std::min<int>(threads, mask_rows);
 
     /*
-     * Per-thread scratch buffers live on the MarsAlgo and are sized once on
-     * first use, then reused for every subsequent eval() call. This keeps the
-     * big mmaps off the kernel's per-process mmap_lock -- 64 concurrent
-     * mmap/munmap cycles per epoch would otherwise stall worker threads in
-     * state D as their page faults serialize behind the writer lock.
-     */
-    algo.reserve_scratches(threads);
-
-    /*
      * `mask` is a (r,c) boolean matrix where `r` is the number of columns of
      * the design matrix `X` and `c` is the number of basis already chosen by
      * the algorithm.
@@ -86,13 +77,13 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
             pthread_setname_np(pthread_self(), name);
 #endif
 
-            MarsScratch &scratch = algo.scratch(omp_get_thread_num());
-
+            // eval() uses a function-local thread_local scratch, grown on
+            // demand and reused across calls -- no caller-supplied buffer.
             #pragma omp for schedule(static)
             for (int i = 0; i < mask_rows; ++i) {
                 if (ok.load(std::memory_order_relaxed)) {
                     algo.eval(&dsse1_ptr(i,0), &dsse2_ptr(i,0), &h_cut_ptr(i,0),
-                              i, &mask(i,0), min_span, endspan, linear, scratch);
+                              i, &mask(i,0), min_span, endspan, linear);
                 }
 
                 if (i % 32 == 0) {
