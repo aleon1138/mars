@@ -390,12 +390,6 @@ def fit(X, y, w=None, **kwargs):
 # -----------------------------------------------------------------------------
 
 
-@numba.njit(parallel=True)
-def _expand_linear_basis(y, b, x):
-    for i in numba.prange(len(y)):
-        y[i] = b[i] * x[i]
-
-
 def expand(X, model):
     """
     Expand a feature set X into the bases of a MARS model.
@@ -416,7 +410,7 @@ def expand(X, model):
             assert 0 <= x < X.shape[1]
             assert 0 <= b < i
             if t == "l":
-                _expand_linear_basis(B[:, i], B[:, b], X[:, x])
+                B[:, i] = B[:, b] * X[:, x]
             elif t == "+":
                 B[:, i] = B[:, b] * np.maximum(X[:, x] - h, 0)
             elif t == "-":
