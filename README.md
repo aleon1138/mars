@@ -2,7 +2,7 @@
 
 A C++ implementation of [Multivariate Adaptive Regression Splines](https://w.wiki/GVPL).
 This is a semi-brute force search for interactions and non-linearities. It will
-provide competitive regression performance compared to neural network for, but
+provide competitive regression performance compared to neural network, but
 with much faster model evaluation runtimes.
 
 References:
