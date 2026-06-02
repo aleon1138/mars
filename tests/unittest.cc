@@ -7,6 +7,18 @@
 #include <cmath>
 constexpr double EPS = 1e-14;
 
+// Hinge-sweep delta-SSE goes through covariates_impl(). With AVX the f/g
+// reduction accumulates 4-wide via FMA; without it (e.g. arm64) the scalar
+// fallback sums in a different order, drifting the ill-conditioned
+// (small-denominator) cuts by a few e-6 on dsse/N -- reduction order, not a
+// real accuracy loss. Hold the AVX path to the tight f32-storage floor; relax
+// only the scalar path. Gated on the same macro covariates_impl() selects on.
+#if defined(__AVX__)
+constexpr double HINGE_DSSE_TOL = 1e-6;
+#else
+constexpr double HINGE_DSSE_TOL = 1e-5;
+#endif
+
 
 using namespace Eigen;
 typedef Matrix<double,Dynamic,Dynamic,RowMajor> MatrixXdC;
@@ -310,7 +322,8 @@ TEST(MarsTest, DeltaSSE)
         // Tolerances relaxed from 1e-7..1e-8 to 1e-6 after narrowing Bx to f32
         // storage; hinge SSE noise floor is dominated by the per-step f32
         // round in the inner sweep accumulators (sqrt(N)*eps_f32 on dsse/N).
-        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-6);
+        // HINGE_DSSE_TOL relaxes further on the non-AVX scalar path (see top).
+        ASSERT_NEAR(dsse1/N, dsse2/N, HINGE_DSSE_TOL);
 
         //---------------------------------------------------------------------
         // Test all permutations
@@ -319,25 +332,25 @@ TEST(MarsTest, DeltaSSE)
         ALL_B.col(b_cols+1) = ALL_B.col(0).array() * (res.hinge_cut[0] - x7).cwiseMax(0);
         dsse1 = res.base_dsse+res.hinge_dsse[0];
         dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-6);
+        ASSERT_NEAR(dsse1/N, dsse2/N, HINGE_DSSE_TOL);
 
         ALL_B.col(b_cols  ) = ALL_B.col(1).array() * (x7 - res.hinge_cut[1]).cwiseMax(0);
         ALL_B.col(b_cols+1) = ALL_B.col(1).array() * (res.hinge_cut[1] - x7).cwiseMax(0);
         dsse1 = res.base_dsse+res.hinge_dsse[1];
         dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-6);
+        ASSERT_NEAR(dsse1/N, dsse2/N, HINGE_DSSE_TOL);
 
         ALL_B.col(b_cols  ) = ALL_B.col(2).array() * (x7 - res.hinge_cut[2]).cwiseMax(0);
         ALL_B.col(b_cols+1) = ALL_B.col(2).array() * (res.hinge_cut[2] - x7).cwiseMax(0);
         dsse1 = res.base_dsse+res.hinge_dsse[2];
         dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-6);
+        ASSERT_NEAR(dsse1/N, dsse2/N, HINGE_DSSE_TOL);
 
         ALL_B.col(b_cols  ) = ALL_B.col(3).array() * (x7 - res.hinge_cut[3]).cwiseMax(0);
         ALL_B.col(b_cols+1) = ALL_B.col(3).array() * (res.hinge_cut[3] - x7).cwiseMax(0);
         dsse1 = res.base_dsse+res.hinge_dsse[3];
         dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-        ASSERT_NEAR(dsse1/N, dsse2/N, 1e-6);
+        ASSERT_NEAR(dsse1/N, dsse2/N, HINGE_DSSE_TOL);
 
         //---------------------------------------------------------------------
         // Append the hinges
