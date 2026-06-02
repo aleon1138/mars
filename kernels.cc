@@ -116,6 +116,31 @@ inline void compute_BoT_bx_col(
 
 } // namespace
 
+double dot_widen(const float *a, const float *b, int n)
+{
+    int i = 0;
+#if defined(__AVX__)
+    // Two accumulators so the two FMAs per iteration are independent; the
+    // f32->f64 widening (cvtps_pd) keeps the sum at the eps_f32 input floor.
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    for (; i + 8 <= n; i += 8) {
+        acc0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(a + i)),
+                               _mm256_cvtps_pd(_mm_loadu_ps(b + i)), acc0);
+        acc1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(a + i + 4)),
+                               _mm256_cvtps_pd(_mm_loadu_ps(b + i + 4)), acc1);
+    }
+    const __m256d acc = _mm256_add_pd(acc0, acc1);
+    double s = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+#else
+    double s = 0.0;
+#endif
+    for (; i < n; ++i) {
+        s += (double)a[i] * (double)b[i];
+    }
+    return s;
+}
+
 void orthonormalize(
     int n, int m, int p,
     const float  *B,    int ldB,

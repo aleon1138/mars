@@ -180,7 +180,7 @@ struct MarsData {
         , Bo(MatrixXfC::Zero(n,1)) {}
 
     Map<const MatrixXf,Aligned,Stride<Dynamic,1>>  X;   // read-only view of the regressors
-    ArrayXd     y;      // target vector
+    ArrayXf     y;      // target vector (f32 storage; dot products upcast to f64)
     MatrixXf    B;      // all basis
     MatrixXfC   Bo;     // all basis, orthonormalized (f32 storage; f64 arithmetic)
     VectorXd    ybo;    // dot product of basis Bo with Y target
@@ -264,8 +264,12 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     _max_terms = p;
     verify(!std::isfinite(NAN), "NAN check is disabled, recompile without --fast-math");
 
-    // Copy and upcast target
-    _data->y = Map<const ArrayXf>(y,n).cast<double>();
+    // Build the weighted, normalized target in f64, then store it as f32 (see
+    // the store below). The per-row weighting and the norm/variance reductions
+    // stay in f64 for precision; only the stored target narrows. Every dot
+    // product against _data->y downstream upcasts on the load, so it still
+    // accumulates in f64.
+    ArrayXd yd = Map<const ArrayXf>(y,n).cast<double>();
 
     // For WLS we scale rows by sqrt(w), so that the OLS objective on the
     // transformed problem equals the weighted RSS on the original.
@@ -274,10 +278,10 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     // Filter out NAN's and apply weight to the target 'y'.
     for (int i = 0; i < n; ++i) {
         if (!std::isfinite(y[i])) {
-            _data->y[i] = sqrt_w[i] = 0;
+            yd[i] = sqrt_w[i] = 0;
         }
     }
-    _data->y *= sqrt_w; // apply sqrt(w) to target
+    yd *= sqrt_w; // apply sqrt(w) to target
 
     // TODO - these row-order reductions (y_norm, w_norm, _yvar below, and
     // the column norms in _data->s) are sensitive to the input row order:
@@ -286,22 +290,27 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     // greedy search amplifies these tiny perturbations into different basis
     // selections. Switching to compensated/pairwise summation here would make
     // the algorithm row-order-invariant; see tests/repro_shuffle.py.
-    double y_norm = _data->y.matrix().norm();
+    double y_norm = yd.matrix().norm();
     double w_norm = sqrt_w.matrix().norm();
     verify(y_norm > 0.0 && w_norm > 0, "target Y is all zero or NANs");
 
-    _data->y /= y_norm;
-    sqrt_w   /= w_norm;
+    yd     /= y_norm;
+    sqrt_w /= w_norm;
+
+    // Store the normalized target as f32. This halves the footprint of the
+    // random y[k[i]] gather in the eval() hinge sweep; every dot product
+    // against it upcasts on the load so the accumulation stays f64.
+    _data->y = yd.cast<float>();
 
     // Initialize the first column of our basis with the intercept.
     // Bo storage is f32 (sqrt_w computed in f64, downcast on store); ybo
-    // is computed in f64 with the column lazily upcast.
+    // is computed in f64 with both factors lazily upcast.
     _data->B .col(0) = sqrt_w.cast<float>();
     _data->Bo.col(0) = sqrt_w.cast<float>();
-    _data->ybo = _data->Bo.leftCols(1).cast<double>().transpose() * _data->y.matrix();
+    _data->ybo = _data->Bo.leftCols(1).cast<double>().transpose() * _data->y.matrix().cast<double>();
 
-    // Calculate the sample variance of the target 'y'.
-    _yvar = (_data->y - _data->y.mean()).square().mean();
+    // Calculate the sample variance of the target 'y' (f64 reduction).
+    _yvar = (yd - yd.mean()).square().mean();
 
     // Calculate the column norm of 'X'.
     _data->s = (_data->X.colwise().squaredNorm()/_data->X.rows()).cwiseSqrt();
@@ -394,11 +403,12 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         ybx.data(),
         _tol);
 
-    // Calculate the linear delta SSE and map to the output buffer.
-    // Bx is f32 storage; cast each column lazily so the dot product
-    // accumulates in f64 without materializing an f64 copy of Bx.
+    // Calculate the linear delta SSE and map to the output buffer. Bx.col(j)
+    // and y are both contiguous f32; mars::dot_widen upcasts each at the load
+    // and accumulates in f64 (a vectorized f32->f64 dot that Eigen's
+    // cast-then-redux would otherwise scalarize). See kernels.h.
     for (int j = 0; j < p; ++j) {
-        ybx[j] = Bx.col(j).cast<double>().dot(_data->y.matrix());
+        ybx[j] = mars::dot_widen(Bx.col(j).data(), _data->y.data(), n);
         linear_dsse[bcols[j]] = ybx[j]*ybx[j];
     }
 
@@ -427,7 +437,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         const int head = end_span;
         const int tail = n-end_span;
         const MatrixXf &B = _data->B;
-        const ArrayXd  &y = _data->y;
+        const ArrayXf  &y = _data->y; // f32 storage; each y[k[i]] upcasts into double y_k below
 
         // Bo rows are now gathered on the fly inside the inner sweep
         // (no Bok scratch). Each iteration reads Bo.row(k[i]) at a random
@@ -631,7 +641,7 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
         // mse = (||y||^2 - ||ybo||^2) / n collapses to (1 - ||ybo||^2) / n.
         VectorXd ybo(_m + 1);
         ybo.head(_m) = _data->ybo;
-        ybo[_m] = _data->Bo.col(_m).cast<double>().dot(_data->y.matrix());
+        ybo[_m] = _data->Bo.col(_m).cast<double>().dot(_data->y.matrix().cast<double>());
         const double mse = (1. - ybo.squaredNorm()) / _data->X.rows();
         if (mse >= -_tol) { // gracefully handle values close to zero
             _m += 1;

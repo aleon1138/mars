@@ -69,6 +69,17 @@ Skylake-AVX512 or EPYC 9845 (Zen 5, full-width 512-bit FPU). The hot loop is
 not FMA-bound at typical m (~50–100) — likely limited by L1 load/store ports
 and per-call setup. The AVX2 intrinsics stay.
 
+**Performance note (2026-06-02):** We narrowed the target `_data->y` from f64 to
+f32 storage and replaced the Eigen `Bx.col(j).cast<double>().dot(...)` in the
+eval() linear-delta-SSE loop with a hand-written AVX2 kernel `mars::dot_widen`
+(`cvtps_pd` widening + f64 FMA, two accumulators). ~10% faster on `linear_only`
+fits (x86 AVX2 server); the gain is diluted in full hinge fits where the linear
+dot is only ~1/m of eval(). The inputs are upcast at the load, so the dot still
+accumulates in f64 — no accuracy change (DeltaSSE moves only at ~1e-13). The
+speedup is consistent with Eigen scalarizing the size-changing f32→f64 cast
+inside the reduction; the packed widening recovers it. The one-shot, strided
+`Bo.col()` ybo dots in the constructor and `append()` stay on Eigen.
+
 **Data requirements:** `X` must be `float32`, **column-major** (Fortran order).
 `y` and `w` must be `float32` column-major 1D arrays. The bindings assert these
 layouts explicitly.

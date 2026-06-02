@@ -455,3 +455,37 @@ TEST(KernelsTest, OrthonormalizePrecisionStressBaseline)
             << "col " << j << " (mask=" << mask[j] << ") vs-ref=" << diff;
     }
 }
+
+// ---------------------------------------------------------------------------
+// dot_widen: f32 inputs, f64 accumulation. The result must match an f64
+// reference (the same f32 values promoted to double) to ~machine precision --
+// far past the ~1e-3 relative error a naive f32 accumulation would hit on a
+// long vector. This is the regression guard for the "dot products accumulate
+// in f64" contract that backs narrowing y / Bx / Bo to f32 storage. Sizes
+// straddle the 8-wide AVX block to exercise the scalar tail and the n==0 edge.
+// ---------------------------------------------------------------------------
+TEST(KernelsTest, DotWidenAccumulatesInF64)
+{
+    std::mt19937 rng(0xD07);
+    // Positive range -> the sum is well-conditioned (cond ~ 1), so a tight
+    // tolerance still cleanly separates true f64 accumulation from f32.
+    std::uniform_real_distribution<float> uni(0.25f, 1.25f);
+
+    for (int n : {0, 1, 7, 8, 9, 31, 1024, 50000}) {
+        ArrayXf a(n), b(n);
+        for (int i = 0; i < n; ++i) { a[i] = uni(rng); b[i] = uni(rng); }
+
+        const double got = mars::dot_widen(a.data(), b.data(), n);
+
+        // Ground truth: a genuine f64 dot of the promoted f32 values.
+        const VectorXd ad = a.cast<double>();
+        const VectorXd bd = b.cast<double>();
+        const double   ref = ad.dot(bd);
+
+        // Only the summation order differs from the reference (both f64), so
+        // agreement is at the f64 floor. An f32 accumulation would miss by
+        // ~n*eps_f32 (orders of magnitude past this bound) at n=50000.
+        const double tol = 1e-9 * (1.0 + std::abs(ref));
+        EXPECT_NEAR(got, ref, tol) << "n=" << n;
+    }
+}

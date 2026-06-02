@@ -60,4 +60,19 @@ void orthonormalize(
     double tol,
     std::atomic<long> *dgks_counter = nullptr);
 
+/*
+ *  Dot product of two contiguous f32 vectors, accumulated in f64:
+ *
+ *      returns  sum_{i<n} (double)a[i] * (double)b[i]
+ *
+ *  Both inputs are upcast at the load (cvtps_pd) and summed in f64, so the
+ *  result carries only the ~eps_f32 floor of the f32 inputs -- the summation
+ *  adds nothing on top, unlike an f32 accumulation which grows ~sqrt(n)*eps_f32.
+ *  Two accumulators break the FMA dependency chain (one chain would cap at
+ *  ~1/4 of FMA throughput). AVX2+FMA when available, scalar fallback otherwise.
+ *
+ *      a, b : (n) contiguous float
+ */
+double dot_widen(const float *a, const float *b, int n);
+
 } // namespace mars
