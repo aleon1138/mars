@@ -104,10 +104,12 @@ cov_t covariates_impl(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const do
     double *f = f_.data();
     double *g = g_.data();
 
-    // f/g/y use unaligned loads/stores below, so no alignment is required of
-    // the caller. On Haswell+ loadu/storeu on aligned data is as fast as the
-    // aligned forms, and dropping the requirement lets callers hand us plain
-    // (16-byte) std::vector storage instead of over-aligned buffers.
+    /*
+     *  f/g/y use unaligned loads/stores below, so no alignment is required of
+     *  the caller. On Haswell+ loadu/storeu on aligned data is as fast as the
+     *  aligned forms, and dropping the requirement lets callers hand us plain
+     *  (16-byte) std::vector storage instead of over-aligned buffers.
+     */
     cov_t o = {0,0};
 
 #ifndef __AVX__
@@ -122,7 +124,7 @@ cov_t covariates_impl(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const do
     for (int i = 0; i < m0; i+=4) {
         __m256d f0 = _mm256_loadu_pd(f+i);
         __m256d g0 = _mm256_loadu_pd(g+i);
-        __m256d x0 = _mm256_cvtps_pd(_mm_loadu_ps(x+i)); // `x` might be unaligned!
+        __m256d x0 = _mm256_cvtps_pd(_mm_loadu_ps(x+i));
 
         f0 = _mm256_fmadd_pd(K0,g0,f0);
         g0 = _mm256_fmadd_pd(K1,x0,g0);
@@ -173,13 +175,30 @@ cov_t covariates(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const double 
 
 ///////////////////////////////////////////////////////////////////////////////
 
+/*
+ *  Grow a tightly-packed row-major (n x cols) f32 matrix in place to cols+1
+ *  columns, within a buffer of capacity >= n*(cols+1). As the row stride grows
+ *  the rows spread apart, so repack back-to-front (high row first, high column
+ *  first within a row); the new last column is left for the caller to fill.
+ *  This replicates Eigen conservativeResize on the row-major Bo, keeping the
+ *  tight stride the eval() sweep relies on. Cold path (once per append).
+ */
+static void bo_grow_one_column(float *Bo, int n, int cols)
+{
+    for (int i = n - 1; i >= 0; --i) {
+        const float *src = Bo + (size_t)i * cols;
+        float       *dst = Bo + (size_t)i * (cols + 1);
+        for (int j = cols - 1; j >= 0; --j) dst[j] = src[j];
+    }
+}
+
 struct MarsData {
     // B/Bo start at one column (the intercept) and grow one column per append()
     // so Bo's row stride tracks the live basis count; see the rationale there.
     MarsData(const float *x, int n, int m, int ldx, int max_terms)
         : n(n), p(m), ldX(ldx), X(x)
-        , B((size_t)n*max_terms, 0.0f)
-        , Bo(MatrixXfC::Zero(n,1)) {}
+        , B ((size_t)n*max_terms, 0.0f)
+        , Bo((size_t)n*max_terms, 0.0f) {}
 
     const int    n;     // rows in X / length of y / rows of B, Bo
     const int    p;     // columns in X (candidate regressors)
@@ -187,7 +206,8 @@ struct MarsData {
     const float *X;     // read-only column-major view of the regressors
     std::vector<float>  y;   // target vector (f32 storage; dot products upcast to f64)
     std::vector<float>  B;   // all basis (col-major, n x max_terms preallocated; col stride n)
-    MatrixXfC   Bo;     // all basis, orthonormalized (f32 storage; f64 arithmetic)
+    std::vector<float>  Bo;  // orthonormalized basis (ROW-major; row stride == bo_cols)
+    int         bo_cols = 1; // live columns of Bo == its row stride (starts at the intercept)
     std::vector<double> ybo; // dot product of basis Bo with Y target
     std::vector<float> s; // normalization constant for columns of 'X' (1/rms)
 };
@@ -322,8 +342,8 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     // contiguous). ybo is then the f64 dot of the *stored* f32 intercept with
     // the *stored* f32 target -- each upcast on the load, matching the prior
     // Bo.col(0).cast<double>() . y.cast<double>().
-    float *b0  = _data->B.data();          // col 0 of col-major B is the base
-    float *bo0 = _data->Bo.col(0).data();
+    float *b0  = _data->B.data();   // col 0 of col-major B is the base
+    float *bo0 = _data->Bo.data();  // col 0 of Bo is contiguous at bo_cols==1
     for (int i = 0; i < n; ++i) b0[i] = bo0[i] = (float)sqrt_w[i];
 
     double ybo0 = 0.0;
@@ -432,7 +452,6 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         for (int i = 0; i < n; ++i) sx_out[i] = xc[i] * sx;
     }
     const Ref<const ArrayXf> x  = S.x;
-    const Ref<MatrixXfC>     Bo = _data->Bo.leftCols(m);
 
     /*
      *  Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo`. BoTBx is
@@ -448,7 +467,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         _data->B.data(),  _data->n,
         x.data(),
         bcols.data(),
-        _data->Bo.data(), (int)_data->Bo.outerStride(),
+        _data->Bo.data(), _data->bo_cols,
         Bx.data(),        (int)Bx.outerStride(),
         S.BoTBx.data(),   (int)S.BoTBx.outerStride(),
         ybx.data(),
@@ -490,12 +509,14 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         const float    *B = _data->B.data(); // col-major, col stride n
         const float    *y = _data->y.data(); // f32 storage; each y[k[i]] upcasts into double y_k below
 
-        // Bo rows are now gathered on the fly inside the inner sweep
-        // (no Bok scratch). Each iteration reads Bo.row(k[i]) at a random
-        // offset; the access pattern forfeits HW prefetch, so we issue
-        // software prefetch a few iterations ahead.
-        const float *Bo_data = Bo.data();
-        const int    ldBo    = (int)Bo.outerStride();
+        /*
+         *  Bo rows are now gathered on the fly inside the inner sweep
+         *  (no Bok scratch). Each iteration reads Bo.row(k[i]) at a random
+         *  offset; the access pattern forfeits HW prefetch, so we issue
+         *  software prefetch a few iterations ahead.
+         */
+        const float *Bo_data = _data->Bo.data();
+        const int    ldBo    = _data->bo_cols;
         constexpr int PREFETCH_DIST = 4;
 
         /*
@@ -625,15 +646,18 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
         throw std::runtime_error(msg);
     }
 
-    // Grow Bo by exactly one column so its row stride stays equal to the live
-    // basis count. The eval() hinge sweep gathers Bo rows by that stride
-    // (ldBo == cols), so a tight stride keeps each randomly-gathered row to the
-    // minimum number of cache lines; a fixed max_terms stride would be a
-    // TLB/cache sink at equal basis count. B is column-major (col stride n
-    // regardless of column count) and preallocated to max_terms, so it needs no
-    // resize. conservativeResize preserves Bo's existing columns.
-    if (_data->Bo.cols() < _m + 1) {
-        _data->Bo.conservativeResize(Eigen::NoChange, _m + 1);
+    /*
+     *  Grow Bo by exactly one column so its row stride stays equal to the live
+     *  basis count. The eval() hinge sweep gathers Bo rows by that stride
+     *  (ldBo == cols), so a tight stride keeps each randomly-gathered row to the
+     *  minimum number of cache lines; a fixed max_terms stride would be a
+     *  TLB/cache sink at equal basis count. B is column-major (col stride n
+     *  regardless of column count) and preallocated to max_terms, so it needs no
+     *  resize. conservativeResize preserves Bo's existing columns.
+     */
+    if (_data->bo_cols < _m + 1) {
+        bo_grow_one_column(_data->Bo.data(), _data->n, _data->bo_cols);
+        _data->bo_cols = _m + 1;
     }
 
     const float        s = _data->s[xcol];
@@ -656,48 +680,43 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
     }
 
     /*
-     *  Gram-Schmidt with a DGKS retry. The eval() side assumes Bo^T Bo = I, so
-     *  any orthogonality drift accumulates across the whole fit. See
-     *  mars::DGKS_GATE_RATIO_SQ in kernels.h for the trigger rationale.
-     *
-     *  Bo is f32 storage; v and the dot products stay f64. Each Bo column
-     *  is lazily cast to f64 on the load (no temp matrix). The final v/w
-     *  is downcast to f32 on the store into Bo.col(_m).
+     *  Gram-Schmidt with a DGKS retry (mars::orthonormalize_col). The eval()
+     *  side assumes Bo^T Bo = I, so any orthogonality drift accumulates across
+     *  the whole fit. Bo is f32 storage; the residual v and the dot products
+     *  stay f64. The stored f32 B column is separately normalized by its own
+     *  pre-projection norm (matching the prior B.col(_m) /= v.norm()).
      */
-    VectorXd v = Bm.cast<double>(); // make a copy
-    Bm /= v.norm();
+    const int n = _data->n;
+    std::vector<double> v(n);
+    for (int i = 0; i < n; ++i) v[i] = (double)Bm[i];
 
-    double proj_norm2 = 0.0;
-    for (int j = 0; j < _m; ++j) {
-        const auto   bj = _data->Bo.col(j).cast<double>();   // lazy expression
-        const double c  = bj.dot(v);
-        v.noalias() -= c * bj;
-        proj_norm2 += c * c;
-    }
-    const double v_norm2_post = v.squaredNorm();
-    if (v_norm2_post > _tol && v_norm2_post * mars::DGKS_GATE_RATIO_SQ < proj_norm2) {
-        for (int j = 0; j < _m; ++j) {
-            const auto   bj = _data->Bo.col(j).cast<double>();
-            const double c  = bj.dot(v);
-            v.noalias() -= c * bj;
-        }
-    }
+    double v_raw_norm2 = 0.0;
+    for (int i = 0; i < n; ++i) v_raw_norm2 += v[i] * v[i];
+    const float v_raw_norm = (float)std::sqrt(v_raw_norm2);
+    for (int i = 0; i < n; ++i) Bm[i] /= v_raw_norm;
 
-    const double w = v.norm();
+    const double w = mars::orthonormalize_col(
+        n, _m, v.data(), _data->Bo.data(), _data->bo_cols, _tol);
+
     if (w*w > _tol) {
-        _data->Bo.col(_m) = (v/w).cast<float>();
+        // orthonormalize_col left v as the unit residual; store it (f32) into
+        // Bo's new column _m (row-major, stride bo_cols).
+        float    *Bo   = _data->Bo.data();
+        const int ldBo = _data->bo_cols;
+        for (int i = 0; i < n; ++i) Bo[(size_t)i*ldBo + _m] = (float)v[i];
 
         /*
          *  Extend the cached ybo with one new entry; relies on ||y|| == 1 so
          *  mse = (||y||^2 - ||ybo||^2) / n collapses to (1 - ||ybo||^2) / n.
-         *  y is f32 storage wrapped as an Eigen array so the still-Eigen
-         *  Bo.col(_m) dot stays unchanged (Bo converts in a later step).
+         *  The new entry is the f64 dot of the *stored* f32 Bo column with the
+         *  *stored* f32 target (each upcast on the load).
          */
-        Map<const ArrayXf> y_map(_data->y.data(), _data->n);
-        const double ybo_m = _data->Bo.col(_m).cast<double>().dot(y_map.matrix().cast<double>());
+        const float *y = _data->y.data();
+        double ybo_m = 0.0;
+        for (int i = 0; i < n; ++i) ybo_m += (double)Bo[(size_t)i*ldBo + _m] * (double)y[i];
         double ybo_sq = ybo_m * ybo_m;
-        for (double v : _data->ybo) ybo_sq += v * v;
-        const double mse = (1. - ybo_sq) / _data->n;
+        for (double e : _data->ybo) ybo_sq += e * e;
+        const double mse = (1. - ybo_sq) / n;
         if (mse >= -_tol) { // gracefully handle values close to zero
             _m += 1;
             _data->ybo.push_back(ybo_m); // extend the cache for next iteration

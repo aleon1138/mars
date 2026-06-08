@@ -82,10 +82,12 @@ inline double dot_m(const double *a, const double *b, int m)
     return acc;
 }
 
-// For each row i: bx[i] -= dot(Bo[i,:], tc). Subtraction is done in f64,
-// rounded back to f32 on store. Returns sum (stored f32)^2 -- the post-store
-// norm, not the pre-round value -- so downstream normalize() uses the same
-// quantity that's actually in memory.
+/*
+ *  For each row i: bx[i] -= dot(Bo[i,:], tc). Subtraction is done in f64,
+ *  rounded back to f32 on store. Returns sum (stored f32)^2 -- the post-store
+ *  norm, not the pre-round value -- so downstream normalize() uses the same
+ *  quantity that's actually in memory.
+ */
 inline double project_subtract_and_norm(
     int n, int m,
     const float *Bo, int ldBo,
@@ -103,8 +105,10 @@ inline double project_subtract_and_norm(
     return s;
 }
 
-// tc = Bo^T * bx (single column). Bo and bx are both f32, upcast to f64
-// inside axpy_m / at the bx[i] load.
+/*
+ *  tc = Bo^T * bx (single column). Bo and bx are both f32, upcast to f64
+ *  inside axpy_m / at the bx[i] load.
+ */
 inline void compute_BoT_bx_col(
     int n, int m,
     const float *Bo, int ldBo,
@@ -225,19 +229,19 @@ void orthonormalize(
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Phase 1: T = Bo^T * Bx
-    //   Bo is row-major, so the outer loop over i loads bo_row once and reuses
-    //   it across all p columns -- amortizes the row fetch. Bx[i,j] is f32,
-    //   upcast to f64 at the axpy_m call site; T stays f64.
-    //
-    // This is essentially a GEMM call, how would this compare to a tuned BLAS
-    // implementation? For `p`, `k` in 100–500 and `n` in the millions, we'll
-    // get 80–90% of the CPU's single-thread peak, which is essentially where
-    // OpenBLAS would land too. The remaining 10–20% is packing. The gap is
-    // small because `Bo` and `Bx` have good access patterns so the cache/TLB
-    // benefits of packing are muted compared to square GEMMs.
-    // ------------------------------------------------------------------------
+    /*
+     *  Phase 1: T = Bo^T * Bx
+     *  Bo is row-major, so the outer loop over i loads bo_row once and reuses
+     *  it across all p columns -- amortizes the row fetch. Bx[i,j] is f32,
+     *  upcast to f64 at the axpy_m call site; T stays f64.
+     *
+     *  This is essentially a GEMM call, how would this compare to a tuned BLAS
+     *  implementation? For `p`, `k` in 100–500 and `n` in the millions, we'll
+     *  get 80–90% of the CPU's single-thread peak, which is essentially where
+     *  OpenBLAS would land too. The remaining 10–20% is packing. The gap is
+     *  small because `Bo` and `Bx` have good access patterns so the cache/TLB
+     *  benefits of packing are muted compared to square GEMMs.
+     */
     for (int j = 0; j < p; ++j) {
         std::fill_n(T + j * ldT, m, 0.0);
     }
@@ -248,17 +252,17 @@ void orthonormalize(
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Phase 2: project out Bo and normalize each column of Bx, with a DGKS
-    // retry when most of the column's energy ends up inside span(Bo).
-    //
-    // Phase 2a fuses the per-column subtract into a single sweep over Bo: each
-    // row of Bo is loaded once and reused across all p columns, dropping the
-    // Bo DRAM traffic from p*n*m to n*m. The subtract is done in f64, the
-    // result rounded back to f32 on store; s_buf accumulates the *stored*
-    // squared values so the downstream normalization sees the same magnitude
-    // that's in memory.
-    // ------------------------------------------------------------------------
+    /*
+     *  Phase 2: project out Bo and normalize each column of Bx, with a DGKS
+     *  retry when most of the column's energy ends up inside span(Bo).
+     *
+     *  Phase 2a fuses the per-column subtract into a single sweep over Bo: each
+     *  row of Bo is loaded once and reused across all p columns, dropping the
+     *  Bo DRAM traffic from p*n*m to n*m. The subtract is done in f64, the
+     *  result rounded back to f32 on store; s_buf accumulates the *stored*
+     *  squared values so the downstream normalization sees the same magnitude
+     *  that's in memory.
+     */
     std::fill_n(s_buf, p, 0.0);
     for (int i = 0; i < n; ++i) {
         const float *bo_row = Bo + i * ldBo;
