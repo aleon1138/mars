@@ -4,7 +4,6 @@ Multivariate Adaptive Regression Splines
 """
 
 import time
-import numba
 import numpy as np
 import scipy.linalg
 import marslib
