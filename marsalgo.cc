@@ -176,9 +176,9 @@ cov_t covariates(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const double 
 struct MarsData {
     // B/Bo start at one column (the intercept) and grow one column per append()
     // so Bo's row stride tracks the live basis count; see the rationale there.
-    MarsData(const float *x, int n, int m, int ldx)
+    MarsData(const float *x, int n, int m, int ldx, int max_terms)
         : n(n), p(m), ldX(ldx), X(x)
-        , B (MatrixXf ::Zero(n,1))
+        , B((size_t)n*max_terms, 0.0f)
         , Bo(MatrixXfC::Zero(n,1)) {}
 
     const int    n;     // rows in X / length of y / rows of B, Bo
@@ -186,7 +186,7 @@ struct MarsData {
     const int    ldX;   // X column stride (column j starts at X + j*ldX)
     const float *X;     // read-only column-major view of the regressors
     std::vector<float>  y;   // target vector (f32 storage; dot products upcast to f64)
-    MatrixXf    B;      // all basis
+    std::vector<float>  B;   // all basis (col-major, n x max_terms preallocated; col stride n)
     MatrixXfC   Bo;     // all basis, orthonormalized (f32 storage; f64 arithmetic)
     std::vector<double> ybo; // dot product of basis Bo with Y target
     std::vector<float> s; // normalization constant for columns of 'X' (1/rms)
@@ -263,7 +263,7 @@ struct EvalScratch {
 } // namespace
 
 MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m, int p, int ldx)
-    : _data(new MarsData(x, n, m, ldx))
+    : _data(new MarsData(x, n, m, ldx, p))
     , _tol((n*0.02)*DBL_EPSILON) // rough guess
 {
     _max_terms = p;
@@ -322,7 +322,7 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     // contiguous). ybo is then the f64 dot of the *stored* f32 intercept with
     // the *stored* f32 target -- each upcast on the load, matching the prior
     // Bo.col(0).cast<double>() . y.cast<double>().
-    float *b0  = _data->B .col(0).data();
+    float *b0  = _data->B.data();          // col 0 of col-major B is the base
     float *bo0 = _data->Bo.col(0).data();
     for (int i = 0; i < n; ++i) b0[i] = bo0[i] = (float)sqrt_w[i];
 
@@ -445,7 +445,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     Ref<VectorXd> ybx = S.ybx.head(p);
     mars::orthonormalize(
         n, m, p,
-        _data->B.data(),  (int)_data->B.outerStride(),
+        _data->B.data(),  _data->n,
         x.data(),
         bcols.data(),
         _data->Bo.data(), (int)_data->Bo.outerStride(),
@@ -487,7 +487,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
 
         const int head = end_span;
         const int tail = n-end_span;
-        const MatrixXf &B = _data->B;
+        const float    *B = _data->B.data(); // col-major, col stride n
         const float    *y = _data->y.data(); // f32 storage; each y[k[i]] upcasts into double y_k below
 
         // Bo rows are now gathered on the fly inside the inner sweep
@@ -533,7 +533,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
             f.setZero();
             Ref<ArrayXd> g = S.g.head(m+1);
             g.setZero();
-            const float  *b  = B.col(bcols[j]).data();
+            const float  *b  = B + (size_t)bcols[j]*n;
             const float  *bx = Bx.col(j).data();        // f32 storage; upcast at the load
 
             double b_k  = b [k[0]]; // sort and upcast to double
@@ -625,32 +625,31 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
         throw std::runtime_error(msg);
     }
 
-    // Grow the basis storage by exactly one column so Bo's row stride stays
-    // equal to the live basis count. The eval() hinge sweep gathers Bo rows by
-    // that stride (ldBo == cols), so a tight stride keeps each randomly-gathered
-    // row to the minimum number of cache lines. The old allocate-once-at-
-    // max_terms storage left the stride at max_terms, which made a larger
-    // max_terms slower at equal basis count -- a TLB/cache sink, not just extra
-    // memory. conservativeResize preserves the existing columns; the resize must
-    // precede the `b` reference below, which would otherwise dangle.
-    if (_data->B.cols() < _m + 1) {
-        _data->B .conservativeResize(Eigen::NoChange, _m + 1);
+    // Grow Bo by exactly one column so its row stride stays equal to the live
+    // basis count. The eval() hinge sweep gathers Bo rows by that stride
+    // (ldBo == cols), so a tight stride keeps each randomly-gathered row to the
+    // minimum number of cache lines; a fixed max_terms stride would be a
+    // TLB/cache sink at equal basis count. B is column-major (col stride n
+    // regardless of column count) and preallocated to max_terms, so it needs no
+    // resize. conservativeResize preserves Bo's existing columns.
+    if (_data->Bo.cols() < _m + 1) {
         _data->Bo.conservativeResize(Eigen::NoChange, _m + 1);
     }
 
     const float        s = _data->s[xcol];
-    Ref<ArrayXf>       b = _data->B.col(bcol).array();
+    Map<const ArrayXf> b(_data->B.data() + (size_t)bcol*_data->n, _data->n);
     Map<const ArrayXf> x(_data->X + (size_t)xcol*_data->ldX, _data->n);
+    Map<VectorXf>      Bm(_data->B.data() + (size_t)_m*_data->n, _data->n); // new column
 
     switch(type) {
         case 'l':
-            _data->B.col(_m) = (s*b*x);
+            Bm = (s*b*x);
             break;
         case '+':
-            _data->B.col(_m) = (s*b*(x-h).cwiseMax(0));
+            Bm = (s*b*(x-h).cwiseMax(0));
             break;
         case '-':
-            _data->B.col(_m) = (s*b*(h-x).cwiseMax(0));
+            Bm = (s*b*(h-x).cwiseMax(0));
             break;
         default:
             throw std::runtime_error("invalid basis type");
@@ -665,8 +664,8 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
      *  is lazily cast to f64 on the load (no temp matrix). The final v/w
      *  is downcast to f32 on the store into Bo.col(_m).
      */
-    VectorXd v = _data->B.col(_m).cast<double>(); // make a copy
-    _data->B.col(_m) /= v.norm();
+    VectorXd v = Bm.cast<double>(); // make a copy
+    Bm /= v.norm();
 
     double proj_norm2 = 0.0;
     for (int j = 0; j < _m; ++j) {
@@ -688,10 +687,12 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
     if (w*w > _tol) {
         _data->Bo.col(_m) = (v/w).cast<float>();
 
-        // Extend the cached ybo with one new entry; relies on ||y|| == 1 so
-        // mse = (||y||^2 - ||ybo||^2) / n collapses to (1 - ||ybo||^2) / n.
-        // y is f32 storage wrapped as an Eigen array so the still-Eigen
-        // Bo.col(_m) dot stays unchanged (Bo converts in a later step).
+        /*
+         *  Extend the cached ybo with one new entry; relies on ||y|| == 1 so
+         *  mse = (||y||^2 - ||ybo||^2) / n collapses to (1 - ||ybo||^2) / n.
+         *  y is f32 storage wrapped as an Eigen array so the still-Eigen
+         *  Bo.col(_m) dot stays unchanged (Bo converts in a later step).
+         */
         Map<const ArrayXf> y_map(_data->y.data(), _data->n);
         const double ybo_m = _data->Bo.col(_m).cast<double>().dot(y_map.matrix().cast<double>());
         double ybo_sq = ybo_m * ybo_m;
