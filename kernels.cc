@@ -166,13 +166,19 @@ double orthonormalize_col(
     double proj_norm2 = 0.0;
     for (int j = 0; j < m; ++j) {
         double c = 0.0;
-        for (int i = 0; i < n; ++i) c += (double)Bo[(size_t)i*ldBo + j] * v[i];
-        for (int i = 0; i < n; ++i) v[i] -= c * (double)Bo[(size_t)i*ldBo + j];
+        for (int i = 0; i < n; ++i) {
+            c += (double)Bo[(size_t)i*ldBo + j] * v[i];
+        }
+        for (int i = 0; i < n; ++i) {
+            v[i] -= c * (double)Bo[(size_t)i*ldBo + j];
+        }
         proj_norm2 += c * c;
     }
 
     double v_norm2 = 0.0;
-    for (int i = 0; i < n; ++i) v_norm2 += v[i] * v[i];
+    for (int i = 0; i < n; ++i) {
+        v_norm2 += v[i] * v[i];
+    }
 
     /*
      *  DGKS retry: re-orthogonalize once when the residual energy is small
@@ -184,16 +190,24 @@ double orthonormalize_col(
         }
         for (int j = 0; j < m; ++j) {
             double c = 0.0;
-            for (int i = 0; i < n; ++i) c += (double)Bo[(size_t)i*ldBo + j] * v[i];
-            for (int i = 0; i < n; ++i) v[i] -= c * (double)Bo[(size_t)i*ldBo + j];
+            for (int i = 0; i < n; ++i) {
+                c += (double)Bo[(size_t)i*ldBo + j] * v[i];
+            }
+            for (int i = 0; i < n; ++i) {
+                v[i] -= c * (double)Bo[(size_t)i*ldBo + j];
+            }
         }
         v_norm2 = 0.0;
-        for (int i = 0; i < n; ++i) v_norm2 += v[i] * v[i];
+        for (int i = 0; i < n; ++i) {
+            v_norm2 += v[i] * v[i];
+        }
     }
 
     const double w = std::sqrt(v_norm2);
     if (w * w > tol) {
-        for (int i = 0; i < n; ++i) v[i] /= w;
+        for (int i = 0; i < n; ++i) {
+            v[i] /= w;
+        }
     }
     return w;
 }

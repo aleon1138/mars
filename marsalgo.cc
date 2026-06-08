@@ -176,7 +176,9 @@ static void bo_grow_one_column(float *Bo, int n, int cols)
     for (int i = n - 1; i >= 0; --i) {
         const float *src = Bo + (size_t)i * cols;
         float       *dst = Bo + (size_t)i * (cols + 1);
-        for (int j = cols - 1; j >= 0; --j) dst[j] = src[j];
+        for (int j = cols - 1; j >= 0; --j) {
+            dst[j] = src[j];
+        }
     }
 }
 
@@ -323,7 +325,9 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     // against it upcasts on the load so the accumulation stays f64.
     _data->y.resize(n);
     float *yp = _data->y.data();
-    for (int i = 0; i < n; ++i) yp[i] = (float)yd[i];
+    for (int i = 0; i < n; ++i) {
+        yp[i] = (float)yd[i];
+    }
 
     // Initialize the first basis column (the intercept) with sqrt(w), in both
     // B and its ortho-normalized copy Bo (both n x 1 here, so each column is
@@ -332,16 +336,22 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     // Bo.col(0).cast<double>() . y.cast<double>().
     float *b0  = _data->B.data();   // col 0 of col-major B is the base
     float *bo0 = _data->Bo.data();  // col 0 of Bo is contiguous at bo_cols==1
-    for (int i = 0; i < n; ++i) b0[i] = bo0[i] = (float)sqrt_w[i];
+    for (int i = 0; i < n; ++i) {
+        b0[i] = bo0[i] = (float)sqrt_w[i];
+    }
 
     double ybo0 = 0.0;
-    for (int i = 0; i < n; ++i) ybo0 += (double)bo0[i] * (double)yp[i];
+    for (int i = 0; i < n; ++i) {
+        ybo0 += (double)bo0[i] * (double)yp[i];
+    }
     _data->ybo.resize(1);
     _data->ybo[0] = ybo0;
 
     // Sample variance of the (normalized) target 'y' (f64 reduction).
     double ymean_sum = 0.0;
-    for (int i = 0; i < n; ++i) ymean_sum += yd[i];
+    for (int i = 0; i < n; ++i) {
+        ymean_sum += yd[i];
+    }
     const double ymean = ymean_sum / n;
     double vsum = 0.0;
     for (int i = 0; i < n; ++i) {
@@ -360,7 +370,9 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     for (int j = 0; j < m; ++j) {
         const float *xj = x + (size_t)j*ldx;
         double sq = 0.0;
-        for (int i = 0; i < n; ++i) sq += (double)xj[i] * (double)xj[i];
+        for (int i = 0; i < n; ++i) {
+            sq += (double)xj[i] * (double)xj[i];
+        }
         const double rms = std::sqrt(sq / n);
         verify(std::isfinite(rms), "not all columns in X are finite");
         _data->s[j] = rms > 0.0 ? (float)(1.0 / rms) : 1.0f;
@@ -382,7 +394,9 @@ int MarsAlgo::nrows() const
 double MarsAlgo::dsse() const
 {
     double s = 0.0;
-    for (double v : _data->ybo) s += v * v;
+    for (double v : _data->ybo) {
+        s += v * v;
+    }
     return s;
 }
 double MarsAlgo::yvar() const
@@ -437,7 +451,9 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         const float *xc     = _data->X + (size_t)xcol*_data->ldX;
         const float  sx     = _data->s[xcol];
         float       *sx_out = S.x.data();
-        for (int i = 0; i < n; ++i) sx_out[i] = xc[i] * sx;
+        for (int i = 0; i < n; ++i) {
+            sx_out[i] = xc[i] * sx;
+        }
     }
     const float *x = S.x.data();
 
@@ -658,13 +674,19 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
     // prior Eigen array expression bit-for-bit (elementwise f32, no FMA).
     switch(type) {
         case 'l':
-            for (int i = 0; i < n; ++i) Bm[i] = s*bp[i]*xp[i];
+            for (int i = 0; i < n; ++i) {
+                Bm[i] = s*bp[i]*xp[i];
+            }
             break;
         case '+':
-            for (int i = 0; i < n; ++i) Bm[i] = s*bp[i]*std::max(xp[i]-h, 0.0f);
+            for (int i = 0; i < n; ++i) {
+                Bm[i] = s*bp[i]*std::max(xp[i]-h, 0.0f);
+            }
             break;
         case '-':
-            for (int i = 0; i < n; ++i) Bm[i] = s*bp[i]*std::max(h-xp[i], 0.0f);
+            for (int i = 0; i < n; ++i) {
+                Bm[i] = s*bp[i]*std::max(h-xp[i], 0.0f);
+            }
             break;
         default:
             throw std::runtime_error("invalid basis type");
@@ -678,22 +700,30 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
      *  pre-projection norm (matching the prior B.col(_m) /= v.norm()).
      */
     std::vector<double> v(n);
-    for (int i = 0; i < n; ++i) v[i] = (double)Bm[i];
+    for (int i = 0; i < n; ++i) {
+        v[i] = (double)Bm[i];
+    }
 
     double v_raw_norm2 = 0.0;
-    for (int i = 0; i < n; ++i) v_raw_norm2 += v[i] * v[i];
+    for (int i = 0; i < n; ++i) {
+        v_raw_norm2 += v[i] * v[i];
+    }
     const float v_raw_norm = (float)std::sqrt(v_raw_norm2);
-    for (int i = 0; i < n; ++i) Bm[i] /= v_raw_norm;
+    for (int i = 0; i < n; ++i) {
+        Bm[i] /= v_raw_norm;
+    }
 
     const double w = mars::orthonormalize_col(
-        n, _m, v.data(), _data->Bo.data(), _data->bo_cols, _tol);
+                         n, _m, v.data(), _data->Bo.data(), _data->bo_cols, _tol);
 
     if (w*w > _tol) {
         // orthonormalize_col left v as the unit residual; store it (f32) into
         // Bo's new column _m (row-major, stride bo_cols).
         float    *Bo   = _data->Bo.data();
         const int ldBo = _data->bo_cols;
-        for (int i = 0; i < n; ++i) Bo[(size_t)i*ldBo + _m] = (float)v[i];
+        for (int i = 0; i < n; ++i) {
+            Bo[(size_t)i*ldBo + _m] = (float)v[i];
+        }
 
         /*
          *  Extend the cached ybo with one new entry; relies on ||y|| == 1 so
@@ -703,9 +733,13 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
          */
         const float *y = _data->y.data();
         double ybo_m = 0.0;
-        for (int i = 0; i < n; ++i) ybo_m += (double)Bo[(size_t)i*ldBo + _m] * (double)y[i];
+        for (int i = 0; i < n; ++i) {
+            ybo_m += (double)Bo[(size_t)i*ldBo + _m] * (double)y[i];
+        }
         double ybo_sq = ybo_m * ybo_m;
-        for (double e : _data->ybo) ybo_sq += e * e;
+        for (double e : _data->ybo) {
+            ybo_sq += e * e;
+        }
         const double mse = (1. - ybo_sq) / n;
         if (mse >= -_tol) { // gracefully handle values close to zero
             _m += 1;
