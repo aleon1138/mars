@@ -6,6 +6,7 @@
 #include "kernels.h"
 #include <algorithm>  // fill_n
 #include <cmath>      // sqrt
+#include <cstddef>    // size_t
 #if defined(__AVX__)
 #  include <immintrin.h>
 #endif
@@ -57,8 +58,10 @@ inline double dot_bo(const float *bo_row, const double *tc, int m)
     return acc;
 }
 
-// dot(a[:m], b[:m]) for f64*f64. Used only for the DGKS gate (tc dot tc),
-// where both operands are the f64 T workspace.
+/*
+ *  dot(a[:m], b[:m]) for f64*f64. Used only for the DGKS gate (tc dot tc),
+ *  where both operands are the f64 T workspace.
+ */
 inline double dot_m(const double *a, const double *b, int m)
 {
     int k = 0;
@@ -141,6 +144,50 @@ double dot_widen(const float *a, const float *b, int n)
     return s;
 }
 
+double orthonormalize_col(
+    int n, int m,
+    double       *v,
+    const float  *Bo,   int ldBo,
+    double tol,
+    std::atomic<long> *dgks_counter)
+{
+    // Modified Gram-Schmidt against the m orthonormal columns of Bo, matching
+    // MarsAlgo::append(): each projection updates v before the next, and the
+    // projected energy feeds the DGKS gate. Column j of row i is at
+    // Bo[i*ldBo + j] (row-major); the per-column walk is therefore strided.
+    double proj_norm2 = 0.0;
+    for (int j = 0; j < m; ++j) {
+        double c = 0.0;
+        for (int i = 0; i < n; ++i) c += (double)Bo[(size_t)i*ldBo + j] * v[i];
+        for (int i = 0; i < n; ++i) v[i] -= c * (double)Bo[(size_t)i*ldBo + j];
+        proj_norm2 += c * c;
+    }
+
+    double v_norm2 = 0.0;
+    for (int i = 0; i < n; ++i) v_norm2 += v[i] * v[i];
+
+    // DGKS retry: re-orthogonalize once when the residual energy is small
+    // relative to what was projected out.
+    if (v_norm2 > tol && v_norm2 * DGKS_GATE_RATIO_SQ < proj_norm2) {
+        if (dgks_counter) {
+            dgks_counter->fetch_add(1, std::memory_order_relaxed);
+        }
+        for (int j = 0; j < m; ++j) {
+            double c = 0.0;
+            for (int i = 0; i < n; ++i) c += (double)Bo[(size_t)i*ldBo + j] * v[i];
+            for (int i = 0; i < n; ++i) v[i] -= c * (double)Bo[(size_t)i*ldBo + j];
+        }
+        v_norm2 = 0.0;
+        for (int i = 0; i < n; ++i) v_norm2 += v[i] * v[i];
+    }
+
+    const double w = std::sqrt(v_norm2);
+    if (w * w > tol) {
+        for (int i = 0; i < n; ++i) v[i] /= w;
+    }
+    return w;
+}
+
 void orthonormalize(
     int n, int m, int p,
     const float  *B,    int ldB,
@@ -220,9 +267,11 @@ void orthonormalize(
         }
     }
 
-    // Phase 2b: DGKS retry on the (rare) columns where most of the energy
-    // landed inside span(Bo). The tol check skips columns we'd discard as
-    // degenerate anyway. See DGKS_GATE_RATIO_SQ in kernels.h.
+    /*
+     *  Phase 2b: DGKS retry on the (rare) columns where most of the energy
+     *  landed inside span(Bo). The tol check skips columns we'd discard as
+     *  degenerate anyway. See DGKS_GATE_RATIO_SQ in kernels.h.
+     */
     for (int j = 0; j < p; ++j) {
         double *tc = T  + j * ldT;
         float  *bx = Bx + j * ldBx;
@@ -236,8 +285,10 @@ void orthonormalize(
         }
     }
 
-    // Phase 2c: normalize. f32 multiply; the scale stays f64 only until the
-    // store cast, since the column is already f32-bounded.
+    /*
+     *  Phase 2c: normalize. f32 multiply; the scale stays f64 only until the
+     *  store cast, since the column is already f32-bounded.
+     */
     for (int j = 0; j < p; ++j) {
         float       *bx    = Bx + j * ldBx;
         const double s     = s_buf[j];

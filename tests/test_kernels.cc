@@ -74,6 +74,34 @@ MatrixXd eigen_reference(int n, int m, int p,
     return Bx;
 }
 
+// Eigen MGS reference mirroring mars::orthonormalize_col (and MarsAlgo::append):
+// modified Gram-Schmidt against the f32 Bo (upcast to f64), a single DGKS retry,
+// then v/||v|| (no +tol) when above the degeneracy floor. Reports the
+// pre-normalization length in w_out.
+VectorXd orthonormalize_col_reference(VectorXd v, const MatrixXfC &Bo, int m,
+                                      double tol, double &w_out)
+{
+    const MatrixXd Bod = Bo.leftCols(m).cast<double>();
+    double proj_norm2 = 0.0;
+    for (int j = 0; j < m; ++j) {
+        const double c = Bod.col(j).dot(v);
+        v -= c * Bod.col(j);
+        proj_norm2 += c * c;
+    }
+    double v_norm2 = v.squaredNorm();
+    if (v_norm2 > tol && v_norm2 * mars::DGKS_GATE_RATIO_SQ < proj_norm2) {
+        for (int j = 0; j < m; ++j) {
+            const double c = Bod.col(j).dot(v);
+            v -= c * Bod.col(j);
+        }
+        v_norm2 = v.squaredNorm();
+    }
+    const double w = std::sqrt(v_norm2);
+    if (w * w > tol) v /= w;
+    w_out = w;
+    return v;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -488,4 +516,92 @@ TEST(KernelsTest, DotWidenAccumulatesInF64)
         const double tol = 1e-9 * (1.0 + std::abs(ref));
         EXPECT_NEAR(got, ref, tol) << "n=" << n;
     }
+}
+
+// ---------------------------------------------------------------------------
+// orthonormalize_col: the single-column GS used by append(). A well-conditioned
+// column must match the Eigen MGS reference, be orthogonal to Bo and unit-norm,
+// and must NOT trip the DGKS retry. v is f64; Bo is f32, so orthogonality is
+// floored at ~eps_f32 while the vs-reference agreement is at the f64 floor.
+// ---------------------------------------------------------------------------
+TEST(KernelsTest, OrthonormalizeColMatchesEigen)
+{
+    const int n = 89;
+    const int m = 13;
+    constexpr double TOL      = 1e-14;
+    constexpr double ORTH_TOL = 1e-6;   // limited by Bo's f32 storage
+    constexpr double REF_TOL  = 1e-9;   // f64 vs f64, only summation order differs
+
+    std::mt19937 rng(0x0C0FFEE);
+    MatrixXfC Bo  = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+    MatrixXd  Bod = Bo.cast<double>();
+
+    VectorXd v0 = VectorXd::Random(n) * 3.0;  // mostly outside span(Bo)
+
+    VectorXd v = v0;
+    std::atomic<long> counter{0};
+    const double w = mars::orthonormalize_col(
+        n, m, v.data(), Bo.data(), (int)Bo.outerStride(), TOL, &counter);
+
+    double w_ref = 0.0;
+    VectorXd v_ref = orthonormalize_col_reference(v0, Bo, m, TOL, w_ref);
+
+    EXPECT_NEAR(w, w_ref, REF_TOL * (1.0 + std::abs(w_ref)));
+    EXPECT_TRUE(v.isApprox(v_ref, REF_TOL));
+    EXPECT_LT((Bod.transpose() * v).cwiseAbs().maxCoeff(), ORTH_TOL);
+    EXPECT_NEAR(v.norm(), 1.0, REF_TOL);
+    EXPECT_EQ(counter.load(), 0);  // well-conditioned: no retry
+}
+
+// DGKS retry: a column with 95% of its energy in span(Bo) trips the gate once;
+// the result is still orthogonal to Bo and unit-norm.
+TEST(KernelsTest, OrthonormalizeColFiresDgksOnSevereCancellation)
+{
+    const int n = 200;
+    const int m = 4;
+    constexpr double TOL      = 1e-14;
+    constexpr double ORTH_TOL = 1e-6;
+
+    std::mt19937 rng(0xBADF00D);
+    MatrixXfC Bo  = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+    MatrixXd  Bod = Bo.cast<double>();
+
+    VectorXd v_perp = VectorXd::Random(n);
+    for (int k = 0; k < m; ++k) v_perp -= Bod.col(k).dot(v_perp) * Bod.col(k);
+    v_perp.normalize();
+
+    // 95% in span(Bo), 5% outside -> residual*9 = 0.45 < projected 0.95.
+    VectorXd v = std::sqrt(0.95) * Bod.col(0) + std::sqrt(0.05) * v_perp;
+
+    std::atomic<long> counter{0};
+    const double w = mars::orthonormalize_col(
+        n, m, v.data(), Bo.data(), (int)Bo.outerStride(), TOL, &counter);
+
+    EXPECT_EQ(counter.load(), 1);
+    EXPECT_GT(w, 0.0);
+    EXPECT_LT((Bod.transpose() * v).cwiseAbs().maxCoeff(), ORTH_TOL);
+    EXPECT_NEAR(v.norm(), 1.0, ORTH_TOL);
+}
+
+// Degenerate column (lies in span(Bo)): the residual collapses below the
+// degeneracy floor, so the kernel returns a ~0 length and leaves v
+// un-normalized (the caller rejects on w*w <= tol).
+TEST(KernelsTest, OrthonormalizeColLeavesDegenerateUnnormalized)
+{
+    const int n = 64;
+    const int m = 5;
+    constexpr double TOL = 1e-6;  // well above the f32 residual floor
+
+    std::mt19937 rng(0xDEADBEEF);
+    MatrixXfC Bo = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+
+    VectorXd v = Bo.col(1).cast<double>();  // entirely in span(Bo)
+
+    std::atomic<long> counter{0};
+    const double w = mars::orthonormalize_col(
+        n, m, v.data(), Bo.data(), (int)Bo.outerStride(), TOL, &counter);
+
+    EXPECT_LE(w * w, TOL);        // below the degeneracy floor
+    EXPECT_LT(v.norm(), 1e-3);    // left un-normalized (still the tiny residual)
+    EXPECT_EQ(counter.load(), 0); // gate needs v_norm2 > tol, so no retry
 }

@@ -61,6 +61,40 @@ void orthonormalize(
     std::atomic<long> *dgks_counter = nullptr);
 
 /*
+ *  Single-column Gram-Schmidt: orthonormalize one new basis column against the
+ *  m existing orthonormal columns of `Bo`, in place. This is the per-append
+ *  counterpart of orthonormalize() (which batches p candidate columns for
+ *  eval()); it mirrors the math in MarsAlgo::append().
+ *
+ *  Uses MODIFIED Gram-Schmidt (each projection updates v before the next is
+ *  computed) plus one DGKS retry when the residual energy is small relative to
+ *  what was projected out (see DGKS_GATE_RATIO_SQ). With Bo orthonormal, MGS
+ *  and classical GS coincide up to O(eps); MGS is chosen to match append()
+ *  bit-for-bit. On return:
+ *      v        <- v_perp / ||v_perp||   if ||v_perp||^2 > tol  (unit residual)
+ *               <- v_perp (unchanged)    otherwise              (degenerate)
+ *      returns     ||v_perp||            (pre-normalization; caller accepts the
+ *                                         column iff w*w > tol and stores v)
+ *
+ *  All arithmetic is f64; Bo is f32 storage, upcast on the load. Scalar: this
+ *  runs once per accepted basis (cold), and the per-column Bo access is strided
+ *  (Bo is row-major), so there is nothing to vectorize.
+ *
+ *  Layouts:
+ *      v    : (n)    double, in/out -- the raw new column; residual on return
+ *      Bo   : (n, m) row-major float; row stride ldBo
+ *      tol  : degeneracy threshold (same scale as orthonormalize()'s tol)
+ *
+ *  dgks_counter (optional): atomically incremented if the DGKS retry fires.
+ */
+double orthonormalize_col(
+    int n, int m,
+    double       *v,
+    const float  *Bo,   int ldBo,
+    double tol,
+    std::atomic<long> *dgks_counter = nullptr);
+
+/*
  *  Dot product of two contiguous f32 vectors, accumulated in f64:
  *
  *      returns  sum_{i<n} (double)a[i] * (double)b[i]
