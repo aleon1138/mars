@@ -123,8 +123,10 @@ double dot_widen(const float *a, const float *b, int n)
 {
     int i = 0;
 #if defined(__AVX__)
-    // Two accumulators so the two FMAs per iteration are independent; the
-    // f32->f64 widening (cvtps_pd) keeps the sum at the eps_f32 input floor.
+    /*
+     *  Two accumulators so the two FMAs per iteration are independent; the
+     *  f32->f64 widening (cvtps_pd) keeps the sum at the eps_f32 input floor.
+     */
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
     for (; i + 8 <= n; i += 8) {
@@ -151,10 +153,12 @@ double orthonormalize_col(
     double tol,
     std::atomic<long> *dgks_counter)
 {
-    // Modified Gram-Schmidt against the m orthonormal columns of Bo, matching
-    // MarsAlgo::append(): each projection updates v before the next, and the
-    // projected energy feeds the DGKS gate. Column j of row i is at
-    // Bo[i*ldBo + j] (row-major); the per-column walk is therefore strided.
+    /*
+     *  Modified Gram-Schmidt against the m orthonormal columns of Bo, matching
+     *  MarsAlgo::append(): each projection updates v before the next, and the
+     *  projected energy feeds the DGKS gate. Column j of row i is at
+     *  Bo[i*ldBo + j] (row-major); the per-column walk is therefore strided.
+     */
     double proj_norm2 = 0.0;
     for (int j = 0; j < m; ++j) {
         double c = 0.0;
@@ -166,8 +170,10 @@ double orthonormalize_col(
     double v_norm2 = 0.0;
     for (int i = 0; i < n; ++i) v_norm2 += v[i] * v[i];
 
-    // DGKS retry: re-orthogonalize once when the residual energy is small
-    // relative to what was projected out.
+    /*
+     *  DGKS retry: re-orthogonalize once when the residual energy is small
+     *  relative to what was projected out.
+     */
     if (v_norm2 > tol && v_norm2 * DGKS_GATE_RATIO_SQ < proj_norm2) {
         if (dgks_counter) {
             dgks_counter->fetch_add(1, std::memory_order_relaxed);

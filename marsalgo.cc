@@ -185,10 +185,10 @@ struct MarsData {
     const int    p;     // columns in X (candidate regressors)
     const int    ldX;   // X column stride (column j starts at X + j*ldX)
     const float *X;     // read-only column-major view of the regressors
-    ArrayXf     y;      // target vector (f32 storage; dot products upcast to f64)
+    std::vector<float>  y;   // target vector (f32 storage; dot products upcast to f64)
     MatrixXf    B;      // all basis
     MatrixXfC   Bo;     // all basis, orthonormalized (f32 storage; f64 arithmetic)
-    VectorXd    ybo;    // dot product of basis Bo with Y target
+    std::vector<double> ybo; // dot product of basis Bo with Y target
     std::vector<float> s; // normalization constant for columns of 'X' (1/rms)
 };
 
@@ -373,7 +373,9 @@ int MarsAlgo::nrows() const
 }
 double MarsAlgo::dsse() const
 {
-    return _data->ybo.squaredNorm();
+    double s = 0.0;
+    for (double v : _data->ybo) s += v * v;
+    return s;
 }
 double MarsAlgo::yvar() const
 {
@@ -486,7 +488,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         const int head = end_span;
         const int tail = n-end_span;
         const MatrixXf &B = _data->B;
-        const ArrayXf  &y = _data->y; // f32 storage; each y[k[i]] upcasts into double y_k below
+        const float    *y = _data->y.data(); // f32 storage; each y[k[i]] upcasts into double y_k below
 
         // Bo rows are now gathered on the fly inside the inner sweep
         // (no Bok scratch). Each iteration reads Bo.row(k[i]) at a random
@@ -688,13 +690,16 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
 
         // Extend the cached ybo with one new entry; relies on ||y|| == 1 so
         // mse = (||y||^2 - ||ybo||^2) / n collapses to (1 - ||ybo||^2) / n.
-        VectorXd ybo(_m + 1);
-        ybo.head(_m) = _data->ybo;
-        ybo[_m] = _data->Bo.col(_m).cast<double>().dot(_data->y.matrix().cast<double>());
-        const double mse = (1. - ybo.squaredNorm()) / _data->n;
+        // y is f32 storage wrapped as an Eigen array so the still-Eigen
+        // Bo.col(_m) dot stays unchanged (Bo converts in a later step).
+        Map<const ArrayXf> y_map(_data->y.data(), _data->n);
+        const double ybo_m = _data->Bo.col(_m).cast<double>().dot(y_map.matrix().cast<double>());
+        double ybo_sq = ybo_m * ybo_m;
+        for (double v : _data->ybo) ybo_sq += v * v;
+        const double mse = (1. - ybo_sq) / _data->n;
         if (mse >= -_tol) { // gracefully handle values close to zero
             _m += 1;
-            _data->ybo = ybo; // save for next iteration
+            _data->ybo.push_back(ybo_m); // extend the cache for next iteration
             return std::max(mse,0.0);
         }
     }
