@@ -32,10 +32,12 @@ To run a single GoogleTest: `./build/unittest --gtest_filter=MarsTest.DeltaSSE`
 The library has two layers:
 
 **C++ core (`marsalgo.h` / `marsalgo.cc`)** — implements `MarsAlgo`, a stateful
-object that maintains the growing basis matrix during the forward pass. Key
-internal state (in `MarsData`):
-- `X` — read-only Fortran-order (column-major) view of training data
-- `B` / `Bo` — the current basis and its ortho-normalized counterpart (kept in sync via Gram-Schmidt)
+object that maintains the growing basis matrix during the forward pass. The
+core is Eigen-free: all state below is plain `std::vector`/raw pointers with
+explicit BLAS-style strides (see the 2026-06-09 note). Key internal state (in
+`MarsData`):
+- `X` — read-only column-major (Fortran-order) pointer + stride `ldX` into the caller's data
+- `B` / `Bo` — the current basis and its ortho-normalized counterpart (kept in sync via Gram-Schmidt). `B` is column-major (stride `n`); `Bo` is row-major with row stride == live basis count
 - `y`, `ybo` — normalized target and its projection onto the ortho-basis
 
 Three methods drive the algorithm:
@@ -77,8 +79,22 @@ fits (x86 AVX2 server); the gain is diluted in full hinge fits where the linear
 dot is only ~1/m of eval(). The inputs are upcast at the load, so the dot still
 accumulates in f64 — no accuracy change (DeltaSSE moves only at ~1e-13). The
 speedup is consistent with Eigen scalarizing the size-changing f32→f64 cast
-inside the reduction; the packed widening recovers it. The one-shot, strided
-`Bo.col()` ybo dots in the constructor and `append()` stay on Eigen.
+inside the reduction; the packed widening recovers it. (The one-shot strided
+`Bo.col()` ybo dots in the constructor and `append()` were later moved off
+Eigen too — see the 2026-06-09 note below.)
+
+**Architecture note (2026-06-09):** Removed Eigen entirely from the shipped
+library. `MarsData` (`X`/`B`/`Bo`/`y`/`ybo`/`s`) and the per-thread `eval()`
+scratch are now `std::vector`/raw pointers with explicit strides. `B` is
+preallocated column-major (stride `n`, no per-append resize); `Bo` is row-major
+with row stride == live basis count, grown by an in-place back-to-front repack
+(`bo_grow_one_column`) that preserves the tight stride the sweep relies on.
+`append()`'s Gram-Schmidt is now `mars::orthonormalize_col` (single-column
+modified GS + DGKS), validated against an Eigen oracle in the tests. The `s`
+column norms were widened f32→f64 (the prior Eigen `colwise().squaredNorm()`
+accumulated in f32). `marsalgo.cc`/`marslib.cc`/`kernels.{h,cc}` are Eigen-free;
+`find_package(Eigen3)` is scoped to the `BUILD_TESTING` block, so a library/wheel
+build doesn't need Eigen. Eigen survives only as the unit-test oracle.
 
 **Data requirements:** `X` must be `float32`, **column-major** (Fortran order).
 `y` and `w` must be `float32` column-major 1D arrays. The bindings assert these

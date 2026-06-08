@@ -37,16 +37,23 @@ These instructions have been verified to work on the following platforms:
 ## Build Requirements
 
 * [CMake](https://cmake.org/) ≥ 3.18
-* [Eigen](http://eigen.tuxfamily.org/) ≥ 3.3
-* [GoogleTest](https://github.com/google/googletest) (only needed for `make test`)
 * A C++17 compiler with OpenMP support
 
+The library itself has no linear-algebra dependency. [Eigen](http://eigen.tuxfamily.org/) ≥ 3.3
+and [GoogleTest](https://github.com/google/googletest) are needed **only** to
+build the C++ unit tests (`make test`) — Eigen serves as the test oracle. A
+plain `pip install .` / `make` builds `marslib.so` without either.
+
 ```bash
-sudo apt install -y cmake libeigen3-dev libgtest-dev
+# library only:
+sudo apt install -y cmake
+# add the unit-test deps:
+sudo apt install -y libeigen3-dev libgtest-dev
 ```
 ... on macOS:
 ```bash
-brew install cmake eigen googletest libomp
+brew install cmake libomp          # library
+brew install eigen googletest      # unit tests only
 ```
 On macOS, `libomp` is **statically linked** into `marslib.so` so the OpenMP
 runtime stays private to this extension. This avoids the "OMP: Error #15:
