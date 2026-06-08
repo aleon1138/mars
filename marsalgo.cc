@@ -4,6 +4,8 @@
 #include <numeric>          // for std::iota
 #include <cfloat>           // for DBL_EPSILON
 #include <cassert>
+#include <cmath>            // for std::sqrt, std::isfinite
+#include <vector>
 #ifdef __SSE__
 #   include <immintrin.h>   // for _mm_getcsr
 #endif
@@ -273,19 +275,20 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     // stay in f64 for precision; only the stored target narrows. Every dot
     // product against _data->y downstream upcasts on the load, so it still
     // accumulates in f64.
-    ArrayXd yd = Map<const ArrayXf>(y,n).cast<double>();
-
-    // For WLS we scale rows by sqrt(w), so that the OLS objective on the
-    // transformed problem equals the weighted RSS on the original.
-    ArrayXd sqrt_w = Map<const ArrayXf>(w,n).cast<double>().sqrt();
-
-    // Filter out NAN's and apply weight to the target 'y'.
+    // Build the weighted target in f64. For WLS we scale each row by sqrt(w)
+    // so the OLS objective on the transformed problem equals the weighted RSS
+    // on the original. A non-finite target zeros both factors for that row,
+    // before the weighting multiply (matches the prior filter-then-multiply).
+    std::vector<double> yd(n), sqrt_w(n);
     for (int i = 0; i < n; ++i) {
+        double yi  = (double)y[i];
+        double swi = std::sqrt((double)w[i]);
         if (!std::isfinite(y[i])) {
-            yd[i] = sqrt_w[i] = 0;
+            yi = swi = 0.0;
         }
+        sqrt_w[i] = swi;
+        yd[i]     = yi * swi; // apply sqrt(w) to target
     }
-    yd *= sqrt_w; // apply sqrt(w) to target
 
     // TODO - these row-order reductions (y_norm, w_norm, _yvar below, and
     // the column norms in _data->s) are sensitive to the input row order:
@@ -294,30 +297,58 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     // greedy search amplifies these tiny perturbations into different basis
     // selections. Switching to compensated/pairwise summation here would make
     // the algorithm row-order-invariant; see tests/repro_shuffle.py.
-    double y_norm = yd.matrix().norm();
-    double w_norm = sqrt_w.matrix().norm();
-    verify(y_norm > 0.0 && w_norm > 0, "target Y is all zero or NANs");
+    double y_sq = 0.0, w_sq = 0.0;
+    for (int i = 0; i < n; ++i) {
+        y_sq += yd[i]*yd[i];
+        w_sq += sqrt_w[i]*sqrt_w[i];
+    }
+    const double y_norm = std::sqrt(y_sq);
+    const double w_norm = std::sqrt(w_sq);
+    verify(y_norm > 0.0 && w_norm > 0.0, "target Y is all zero or NANs");
 
-    yd     /= y_norm;
-    sqrt_w /= w_norm;
+    for (int i = 0; i < n; ++i) {
+        yd[i]     /= y_norm;
+        sqrt_w[i] /= w_norm;
+    }
 
     // Store the normalized target as f32. This halves the footprint of the
     // random y[k[i]] gather in the eval() hinge sweep; every dot product
     // against it upcasts on the load so the accumulation stays f64.
-    _data->y = yd.cast<float>();
+    _data->y.resize(n);
+    float *yp = _data->y.data();
+    for (int i = 0; i < n; ++i) yp[i] = (float)yd[i];
 
-    // Initialize the first column of our basis with the intercept.
-    // Bo storage is f32 (sqrt_w computed in f64, downcast on store); ybo
-    // is computed in f64 with both factors lazily upcast.
-    _data->B .col(0) = sqrt_w.cast<float>();
-    _data->Bo.col(0) = sqrt_w.cast<float>();
-    _data->ybo = _data->Bo.leftCols(1).cast<double>().transpose() * _data->y.matrix().cast<double>();
+    // Initialize the first basis column (the intercept) with sqrt(w), in both
+    // B and its ortho-normalized copy Bo (both n x 1 here, so each column is
+    // contiguous). ybo is then the f64 dot of the *stored* f32 intercept with
+    // the *stored* f32 target -- each upcast on the load, matching the prior
+    // Bo.col(0).cast<double>() . y.cast<double>().
+    float *b0  = _data->B .col(0).data();
+    float *bo0 = _data->Bo.col(0).data();
+    for (int i = 0; i < n; ++i) b0[i] = bo0[i] = (float)sqrt_w[i];
 
-    // Calculate the sample variance of the target 'y' (f64 reduction).
-    _yvar = (yd - yd.mean()).square().mean();
+    double ybo0 = 0.0;
+    for (int i = 0; i < n; ++i) ybo0 += (double)bo0[i] * (double)yp[i];
+    _data->ybo.resize(1);
+    _data->ybo[0] = ybo0;
 
-    // Calculate the column norm of 'X'.
-    _data->s = (_data->X.colwise().squaredNorm()/_data->X.rows()).cwiseSqrt();
+    // Sample variance of the (normalized) target 'y' (f64 reduction).
+    double ymean_sum = 0.0;
+    for (int i = 0; i < n; ++i) ymean_sum += yd[i];
+    const double ymean = ymean_sum / n;
+    double vsum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const double dv = yd[i] - ymean;
+        vsum += dv*dv;
+    }
+    _yvar = vsum / n;
+
+    // NOTE: the per-column scale 's' is still computed via Eigen below. Unlike
+    // the f64 reductions above, X.colwise().squaredNorm() accumulates in f32
+    // (X is a float matrix), so a faithful hand translation is a numerics
+    // decision (keep f32 vs widen to f64) tied to the row-order TODO above --
+    // deferred to the storage-swap step rather than silently changed here.
+    _data->s = (_data->X.colwise().squaredNorm()/_data->n).cwiseSqrt();
     verify(_data->s.isFinite().all(), "not all columns in X are finite");
     _data->s = (_data->s > 0.f).select(1.f/_data->s, 1.f);
 }
