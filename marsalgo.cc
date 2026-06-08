@@ -175,10 +175,14 @@ struct MarsData {
     // B/Bo start at one column (the intercept) and grow one column per append()
     // so Bo's row stride tracks the live basis count; see the rationale there.
     MarsData(const float *x, int n, int m, int ldx)
-        : X (x,n,m,Stride<Dynamic,1>(ldx,1))
+        : n(n), p(m), ldX(ldx)
+        , X (x,n,m,Stride<Dynamic,1>(ldx,1))
         , B (MatrixXf ::Zero(n,1))
         , Bo(MatrixXfC::Zero(n,1)) {}
 
+    const int   n;      // rows in X / length of y / rows of B, Bo
+    const int   p;      // columns in X (candidate regressors)
+    const int   ldX;    // X column stride (outer stride of the external buffer)
     Map<const MatrixXf,Aligned,Stride<Dynamic,1>>  X;   // read-only view of the regressors
     ArrayXf     y;      // target vector (f32 storage; dot products upcast to f64)
     MatrixXf    B;      // all basis
@@ -328,7 +332,7 @@ int MarsAlgo::nbasis() const
 }
 int MarsAlgo::nrows() const
 {
-    return _data->X.rows();
+    return _data->n;
 }
 double MarsAlgo::dsse() const
 {
@@ -344,7 +348,7 @@ double MarsAlgo::yvar() const
 void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
                     int xcol, const bool *bmask, int min_span, int end_span, bool linear_only)
 {
-    verify(xcol >= 0 && xcol < _data->X.cols(), "invalid X column index");
+    verify(xcol >= 0 && xcol < _data->p, "invalid X column index");
     verify(min_span >= 1, "min_span must be >= 1");
 
     std::fill_n(linear_dsse, _m, 0.0);
@@ -364,7 +368,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         Sp = new EvalScratch();
     }
     EvalScratch &S = *Sp;
-    S.ensure(_data->X.rows(), _m);
+    S.ensure(_data->n, _m);
     const int p = nonzero(S.bcols.data(), bmask, _m);
     if (p == 0) {
         return;
@@ -376,10 +380,18 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     _mm_setcsr(csr | 0x8040);   // enable FTZ and DAZ
 #endif
 
-    const int n = _data->X.rows();
+    const int n = _data->n;
     const int m = _m;           // number of all currently existing basis
 
-    S.x = _data->X.col(xcol).array() * _data->s[xcol]; // in-place into pre-allocated scratch
+    // Scale the candidate column by its normalization constant into scratch.
+    // Bit-identical to the prior Eigen expression: elementwise f32 multiply,
+    // no FMA, S.x is already sized to exactly n (EvalScratch::ensure).
+    {
+        const float *xc     = _data->X.col(xcol).data();
+        const float  sx     = _data->s[xcol];
+        float       *sx_out = S.x.data();
+        for (int i = 0; i < n; ++i) sx_out[i] = xc[i] * sx;
+    }
     const Ref<const ArrayXf> x  = S.x;
     const Ref<MatrixXfC>     Bo = _data->Bo.leftCols(m);
 
@@ -642,7 +654,7 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
         VectorXd ybo(_m + 1);
         ybo.head(_m) = _data->ybo;
         ybo[_m] = _data->Bo.col(_m).cast<double>().dot(_data->y.matrix().cast<double>());
-        const double mse = (1. - ybo.squaredNorm()) / _data->X.rows();
+        const double mse = (1. - ybo.squaredNorm()) / _data->n;
         if (mse >= -_tol) { // gracefully handle values close to zero
             _m += 1;
             _data->ybo = ybo; // save for next iteration
