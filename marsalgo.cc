@@ -1,11 +1,12 @@
 #include "marsalgo.h"
 #include "kernels.h"
-#include <Eigen/Dense>
 #include <numeric>          // for std::iota
 #include <cfloat>           // for DBL_EPSILON
-#include <cassert>
 #include <cmath>            // for std::sqrt, std::isfinite
 #include <vector>
+#include <algorithm>        // for std::fill_n, std::max, std::stable_sort
+#include <cstdio>           // for snprintf
+#include <cstddef>          // for size_t
 #ifdef __SSE__
 #   include <immintrin.h>   // for _mm_getcsr
 #endif
@@ -23,12 +24,6 @@ inline double fma(double x, double y, double z)
 }
 #endif
 
-using namespace Eigen;
-typedef Matrix<double,Dynamic,Dynamic,RowMajor> MatrixXdC;
-typedef Matrix<float, Dynamic,Dynamic,RowMajor> MatrixXfC;
-typedef Array<int32_t,Dynamic,1> ArrayXi32;
-typedef Array<int64_t,Dynamic,1> ArrayXi64;
-typedef Array<bool,Dynamic,1> ArrayXb;
 
 /*
  *  Return sort indexes in  stable descending order. Tied X values keep their
@@ -94,16 +89,9 @@ struct cov_t {
  *      basis value at the current sorted position: `B[k[i], bcol]`.
  */
 template <bool need_sse>
-cov_t covariates_impl(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const double *y,
+cov_t covariates_impl(double *f, double *g, const float *x, const double *y,
                       double xm, double ym, double k0, float k1, int m)
 {
-    assert(f_.rows()==m+1);
-    assert(g_.rows()==m+1);
-
-    // Cast to raw pointers, as the `[]` operator is surprisingly expensive!
-    double *f = f_.data();
-    double *g = g_.data();
-
     /*
      *  f/g/y use unaligned loads/stores below, so no alignment is required of
      *  the caller. On Haswell+ loadu/storeu on aligned data is as fast as the
@@ -167,10 +155,10 @@ cov_t covariates_impl(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const do
  *  link. Internal callers should use `covariates_impl<...>` directly so the
  *  SSE-reduction path can be elided.
  */
-cov_t covariates(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const double *y,
+cov_t covariates(double *f, double *g, const float *x, const double *y,
                  double xm, double ym, double k0, float k1, int m)
 {
-    return covariates_impl<true>(f_, g_, x, y, xm, ym, k0, k1, m);
+    return covariates_impl<true>(f, g, x, y, xm, ym, k0, k1, m);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -242,17 +230,17 @@ namespace {
 struct EvalScratch {
     int       n   = 0;     // row count the n-sized buffers are sized for
     int       cap = 0;     // basis capacity the m-sized buffers are sized for
-    ArrayXf   x;           // normalized candidate column
-    ArrayXi32 k;           // sort permutation of x
-    ArrayXf   d;           // adjacent deltas of x along sort order (d[0] unused). f32 storage -- the subtraction is f32-f32 so no precision is lost vs f64; upcast to f64 at the load before the FMA chain.
-    MatrixXf  Bx;          // (n, cap) column-major — basis interacted with x, ortho-normalized (f32 storage; f64 arith)
-    ArrayXd   f;           // (cap+1) hinge projection accumulator
-    ArrayXd   g;           // (cap+1) basis-weighted ortho accumulator
-    ArrayXi   bcols;       // (cap) indexes of non-ignored basis (output of nonzero)
-    VectorXd  ybx;         // (cap) Bx^T * y, leading p entries used
-    ArrayXi   hinge_idx;   // (cap) best hinge sort position per j (leading p)
-    ArrayXd   hinge_sse;   // (cap) best hinge delta-SSE per j (leading p)
-    MatrixXd  BoTBx;       // (cap, cap) workspace for Bo^T*Bx in orthonormalize()
+    std::vector<float>   x;        // normalized candidate column (n)
+    std::vector<int32_t> k;        // sort permutation of x (n)
+    std::vector<float>   d;        // adjacent deltas of x along sort order (d[0] unused, n). f32 storage -- the subtraction is f32-f32 so no precision is lost vs f64; upcast to f64 at the load before the FMA chain.
+    std::vector<float>   Bx;       // (n, cap) column-major (col stride n) -- basis interacted with x, ortho-normalized (f32 storage; f64 arith)
+    std::vector<double>  f;        // (cap+1) hinge projection accumulator
+    std::vector<double>  g;        // (cap+1) basis-weighted ortho accumulator
+    std::vector<int>     bcols;    // (cap) indexes of non-ignored basis (output of nonzero)
+    std::vector<double>  ybx;      // (cap) Bx^T * y, leading p entries used
+    std::vector<int>     hinge_idx;// (cap) best hinge sort position per j (leading p)
+    std::vector<double>  hinge_sse;// (cap) best hinge delta-SSE per j (leading p)
+    std::vector<double>  BoTBx;    // (cap, cap) column-major (col stride cap) -- Bo^T*Bx workspace
 
     // Grow (never shrink) to hold n rows and at least m basis columns. The
     // n-sized buffers reallocate only when the row count changes (a different
@@ -269,14 +257,14 @@ struct EvalScratch {
         }
         if (m > cap) {
             cap = m > 2 * cap ? m : 2 * cap;
-            Bx.resize(n, cap);
+            Bx.resize((size_t)n * cap);
             f.resize(cap + 1);
             g.resize(cap + 1);
             bcols.resize(cap);
             ybx.resize(cap);
             hinge_idx.resize(cap);
             hinge_sse.resize(cap);
-            BoTBx.resize(cap, cap);
+            BoTBx.resize((size_t)cap * cap);
         }
     }
 };
@@ -432,7 +420,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     if (p == 0) {
         return;
     }
-    Ref<ArrayXi> bcols = S.bcols.head(p);
+    int *bcols = S.bcols.data();
 
 #ifdef __SSE__
     const unsigned csr = _mm_getcsr();
@@ -451,26 +439,26 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         float       *sx_out = S.x.data();
         for (int i = 0; i < n; ++i) sx_out[i] = xc[i] * sx;
     }
-    const Ref<const ArrayXf> x  = S.x;
+    const float *x = S.x.data();
 
     /*
      *  Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo`. BoTBx is
      *  the (m, p) workspace for the Bo^T*Bx intermediate; sized at
      *  (max_terms, max_terms) so the leading m×p block is what the kernel uses.
      */
-    Ref<MatrixXf> Bx = S.Bx.leftCols(p);
+    float  *Bx  = S.Bx.data();   // (n, cap) col-major, col stride n
     // `S.ybx` is reused as the per-column squared-norm scratch for
     // orthonormalize(); it is overwritten immediately below with Bx^T * y.
-    Ref<VectorXd> ybx = S.ybx.head(p);
+    double *ybx = S.ybx.data();
     mars::orthonormalize(
         n, m, p,
         _data->B.data(),  _data->n,
-        x.data(),
-        bcols.data(),
+        x,
+        bcols,
         _data->Bo.data(), _data->bo_cols,
-        Bx.data(),        (int)Bx.outerStride(),
-        S.BoTBx.data(),   (int)S.BoTBx.outerStride(),
-        ybx.data(),
+        Bx,               n,
+        S.BoTBx.data(),   S.cap,
+        ybx,
         _tol);
 
     // Calculate the linear delta SSE and map to the output buffer. Bx.col(j)
@@ -478,17 +466,17 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     // and accumulates in f64 (a vectorized f32->f64 dot that Eigen's
     // cast-then-redux would otherwise scalarize). See kernels.h.
     for (int j = 0; j < p; ++j) {
-        ybx[j] = mars::dot_widen(Bx.col(j).data(), _data->y.data(), n);
+        ybx[j] = mars::dot_widen(Bx + (size_t)j*n, _data->y.data(), n);
         linear_dsse[bcols[j]] = ybx[j]*ybx[j];
     }
 
     // Evaluate the delta SSE on all hinge locations
     if (linear_only == false) {
         const double *ybo = _data->ybo.data(); // dot(Bo.T,_data->y);
-        Ref<ArrayXi> hinge_idx = S.hinge_idx.head(p);
-        hinge_idx.setConstant(-1);
-        Ref<ArrayXd> hinge_sse = S.hinge_sse.head(p);
-        hinge_sse.setZero();
+        int    *hinge_idx = S.hinge_idx.data();
+        std::fill_n(hinge_idx, p, -1);
+        double *hinge_sse = S.hinge_sse.data();
+        std::fill_n(hinge_sse, p, 0.0);
 
         // Get sort indexes (into scratch)
         // TODO - we should keep a LRU cache as we usually pick from the
@@ -550,12 +538,12 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
          *  gain from the full hinge pair (h_plus and h_minus together).
          */
         for (int j = 0; j < p; ++j) {
-            Ref<ArrayXd> f = S.f.head(m+1);
-            f.setZero();
-            Ref<ArrayXd> g = S.g.head(m+1);
-            g.setZero();
+            double *f = S.f.data();
+            std::fill_n(f, m+1, 0.0);
+            double *g = S.g.data();
+            std::fill_n(g, m+1, 0.0);
             const float  *b  = B + (size_t)bcols[j]*n;
-            const float  *bx = Bx.col(j).data();        // f32 storage; upcast at the load
+            const float  *bx = Bx + (size_t)j*n;        // f32 storage; upcast at the load
 
             double b_k  = b [k[0]]; // sort and upcast to double
             double bx_k = bx[k[0]];
@@ -660,20 +648,23 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
         _data->bo_cols = _m + 1;
     }
 
-    const float        s = _data->s[xcol];
-    Map<const ArrayXf> b(_data->B.data() + (size_t)bcol*_data->n, _data->n);
-    Map<const ArrayXf> x(_data->X + (size_t)xcol*_data->ldX, _data->n);
-    Map<VectorXf>      Bm(_data->B.data() + (size_t)_m*_data->n, _data->n); // new column
+    const int    n  = _data->n;
+    const float  s  = _data->s[xcol];
+    const float *bp = _data->B.data() + (size_t)bcol*n;        // parent basis column
+    const float *xp = _data->X        + (size_t)xcol*_data->ldX; // candidate X column
+    float       *Bm = _data->B.data() + (size_t)_m*n;          // new basis column
 
+    // B[:,_m] = s * B[:,bcol] * f(X[:,xcol]); grouped (s*bp[i])*... to match the
+    // prior Eigen array expression bit-for-bit (elementwise f32, no FMA).
     switch(type) {
         case 'l':
-            Bm = (s*b*x);
+            for (int i = 0; i < n; ++i) Bm[i] = s*bp[i]*xp[i];
             break;
         case '+':
-            Bm = (s*b*(x-h).cwiseMax(0));
+            for (int i = 0; i < n; ++i) Bm[i] = s*bp[i]*std::max(xp[i]-h, 0.0f);
             break;
         case '-':
-            Bm = (s*b*(h-x).cwiseMax(0));
+            for (int i = 0; i < n; ++i) Bm[i] = s*bp[i]*std::max(h-xp[i], 0.0f);
             break;
         default:
             throw std::runtime_error("invalid basis type");
@@ -686,7 +677,6 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
      *  stay f64. The stored f32 B column is separately normalized by its own
      *  pre-projection norm (matching the prior B.col(_m) /= v.norm()).
      */
-    const int n = _data->n;
     std::vector<double> v(n);
     for (int i = 0; i < n; ++i) v[i] = (double)Bm[i];
 

@@ -34,7 +34,7 @@ struct cov_t {
 
 void argsort(int32_t *idx, const float *v, int n);
 int nonzero(int *out, const bool *mask, int n);
-cov_t covariates(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const double *y,
+cov_t covariates(double *f, double *g, const float *x, const double *y,
                  double xm, double ym, double k0, float k1, int m);
 
 
@@ -197,7 +197,7 @@ TEST(MarsTest, Covariates)
     MatrixXf  k  = MatrixXf::Random(n,4);
 
     for (int i = 0; i < X.rows(); ++i) {
-        cov_t o0 = covariates(f0, g0, X.row(i).data(), y.data(), k(i,0), k(i,1), k(i,2), k(i,3), m);
+        cov_t o0 = covariates(f0.data(), g0.data(), X.row(i).data(), y.data(), k(i,0), k(i,1), k(i,2), k(i,3), m);
         cov_t o1 = covariates_slow(f1, g1, X.row(i), y, k(i,0), k(i,1), k(i,2), k(i,3));
 
         ASSERT_NEAR((f0-f1).matrix().norm(), 0, 1e-9);
