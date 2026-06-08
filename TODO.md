@@ -2,7 +2,7 @@
 
 Ideas and notes for future performance work. Not planned for a specific release.
 
-## BF16 support for X
+## BF16 support for X (+ the AVX-512 BF16 path)
 
 **Goal:** ~2× speedup on the forward pass by halving memory bandwidth for the X
   matrix.
@@ -19,6 +19,10 @@ Ideas and notes for future performance work. Not planned for a specific release.
   on numpy dtype.
 - Most of the non-hot-loop code stays dtype-agnostic via templates. The real
   work is in `covariates()`.
+- Keep the current AVX2 kernel as the default path — portable and fast enough on
+  most hardware. Add the AVX-512 + bf16 kernel behind `#ifdef __AVX512BF16__` or
+  a runtime CPUID check; `-march=native` then picks the best the CPU supports
+  and the repo stays public-friendly.
 
 **Complications:**
 - numpy has no native bf16; need `ml_dtypes.bfloat16` or torch tensors on the
@@ -27,22 +31,12 @@ Ideas and notes for future performance work. Not planned for a specific release.
   Rapids+ or AMD Zen 4+. On older hardware, load bf16, convert to fp32 via
   widening cast, then normal FMA. Still wins on memory but not on compute.
 
-## AVX-512 path
-
-**When it makes sense:** only together with bf16, on hardware that supports
-AVX-512 BF16 natively (e.g., EPYC 9845 / Zen 5c, Sapphire Rapids+). Plain
-AVX-512 without bf16 is probably a wash because:
-- Memory bandwidth is the real bottleneck at multi-core.
-- Frequency downclocking on Skylake-X/Cascade Lake eats most of the width gain.
-- AVX-512 absent from most consumer Intel (12th–14th gen).
-
-**Design:**
-- Keep current AVX2 kernel as the default path — portable and fast enough on
-  most hardware.
-- Add an AVX-512 + bf16 kernel behind `#ifdef __AVX512BF16__` or a runtime CPUID
-  check.
-- Repo stays public-friendly: anyone can compile with `-march=native` and get
-  the best their CPU supports.
+**Why AVX-512 only pulls its weight *with* bf16:** plain AVX-512 (no bf16) is
+  probably a wash — memory bandwidth is the real bottleneck at multi-core,
+  Skylake-X/Cascade Lake downclock away most of the width gain, and AVX-512 is
+  absent from most consumer Intel (12th–14th gen). The native bf16 FMA is what
+  makes the wider path worth maintaining. Target hardware: EPYC 9845 / Zen 5c,
+  Sapphire Rapids+.
 
 **Dev note:** i7-7820X (Skylake-X) has AVX-512F but no BF16 and heavy
   downclocking, so it's dev/test only. EPYC 9845 is where performance testing
