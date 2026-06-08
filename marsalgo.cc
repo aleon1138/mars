@@ -190,7 +190,7 @@ struct MarsData {
     MatrixXf    B;      // all basis
     MatrixXfC   Bo;     // all basis, orthonormalized (f32 storage; f64 arithmetic)
     VectorXd    ybo;    // dot product of basis Bo with Y target
-    ArrayXf     s;      // normalization constant for columns of 'X'
+    std::vector<float> s; // normalization constant for columns of 'X' (1/rms)
 };
 
 /*
@@ -343,14 +343,21 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     }
     _yvar = vsum / n;
 
-    // NOTE: the per-column scale 's' is still computed via Eigen below. Unlike
-    // the f64 reductions above, X.colwise().squaredNorm() accumulates in f32
-    // (X is a float matrix), so a faithful hand translation is a numerics
-    // decision (keep f32 vs widen to f64) tied to the row-order TODO above --
-    // deferred to the storage-swap step rather than silently changed here.
-    _data->s = (_data->X.colwise().squaredNorm()/_data->n).cwiseSqrt();
-    verify(_data->s.isFinite().all(), "not all columns in X are finite");
-    _data->s = (_data->s > 0.f).select(1.f/_data->s, 1.f);
+    // Per-column scale: 1/rms(X[:,j]), or 1 for a zero/constant column. The
+    // sum of squares is accumulated in f64 then narrowed to f32 -- the prior
+    // Eigen path (X.colwise().squaredNorm() on a float matrix) accumulated in
+    // f32; widened here on purpose (de-Eigen decision 2026-06-08) since a
+    // scalar f32 sum would lose accuracy on large n. Each X column is
+    // contiguous (Map inner stride 1), so x + j*ldX walks it directly.
+    _data->s.resize(m);
+    for (int j = 0; j < m; ++j) {
+        const float *xj = x + (size_t)j*ldx;
+        double sq = 0.0;
+        for (int i = 0; i < n; ++i) sq += (double)xj[i] * (double)xj[i];
+        const double rms = std::sqrt(sq / n);
+        verify(std::isfinite(rms), "not all columns in X are finite");
+        _data->s[j] = rms > 0.0 ? (float)(1.0 / rms) : 1.0f;
+    }
 }
 
 MarsAlgo::~MarsAlgo()
