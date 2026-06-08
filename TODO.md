@@ -446,21 +446,6 @@ the hinge-basis code path working as the validation oracle.
 Collected during the DGKS re-orthogonalization review (2026-05-17 session).
 Each item is independent and small; none of them block correctness today.
 
-## `eval()`'s bootstrap covariates_impl call passes the wrong `ym`
-
-**Location:** `marsalgo.cc:476`, the first call to `covariates_impl<true>` before
-the cut sweep loop.
-
-**Issue:** The `ym` parameter is hardcoded to `ybx[0]` but should be `ybx[j]`
-(the projection of the candidate column being swept). The call is tagged
-`<true>` so it pays the cost of computing `o.ff`/`o.fy`, but the return value
-is discarded. Currently harmless because `k0 = 0` keeps `f[m]` zero and the
-SSE math reads from `o` only in the main loop body.
-
-**Fix:** Switch to `<false>` (saves the per-call SSE arithmetic) and either
-fix `ybx[0]` to `ybx[j]` or drop the argument since the result is unused.
-One-line change.
-
 ## Python scalar loop builds `bmask` each epoch
 
 **Location:** `mars.py:263-265`.

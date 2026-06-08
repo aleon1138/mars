@@ -488,7 +488,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
             double b_k  = b [k[0]]; // sort and upcast to double
             double bx_k = bx[k[0]];
             double y_k  = y [k[0]];
-            covariates_impl<true>(f,g,Bo_data + k[0]*ldBo,ybo,bx_k,ybx[0],0,b_k,m);
+            covariates_impl<false>(f,g,Bo_data + k[0]*ldBo,ybo,bx_k,ybx[j],0,b_k,m);
 
             double k0 = 0;
             double k1 = 0;
