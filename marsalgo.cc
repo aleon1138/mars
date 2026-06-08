@@ -102,10 +102,10 @@ cov_t covariates_impl(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const do
     double *f = f_.data();
     double *g = g_.data();
 
-    assert(reinterpret_cast<uintptr_t>(f) % 16 == 0);
-    assert(reinterpret_cast<uintptr_t>(g) % 16 == 0);
-    assert(reinterpret_cast<uintptr_t>(y) % 16 == 0);
-
+    // f/g/y use unaligned loads/stores below, so no alignment is required of
+    // the caller. On Haswell+ loadu/storeu on aligned data is as fast as the
+    // aligned forms, and dropping the requirement lets callers hand us plain
+    // (16-byte) std::vector storage instead of over-aligned buffers.
     cov_t o = {0,0};
 
 #ifndef __AVX__
@@ -118,21 +118,21 @@ cov_t covariates_impl(Ref<ArrayXd> f_, Ref<ArrayXd> g_, const float *x, const do
 
     int m0 = m - m%4;
     for (int i = 0; i < m0; i+=4) {
-        __m256d f0 = _mm256_load_pd(f+i);
-        __m256d g0 = _mm256_load_pd(g+i);
+        __m256d f0 = _mm256_loadu_pd(f+i);
+        __m256d g0 = _mm256_loadu_pd(g+i);
         __m256d x0 = _mm256_cvtps_pd(_mm_loadu_ps(x+i)); // `x` might be unaligned!
 
         f0 = _mm256_fmadd_pd(K0,g0,f0);
         g0 = _mm256_fmadd_pd(K1,x0,g0);
 
         if constexpr (need_sse) {
-            __m256d y0 = _mm256_load_pd(y+i);
+            __m256d y0 = _mm256_loadu_pd(y+i);
             S0 = _mm256_fmadd_pd(f0,f0,S0);
             S1 = _mm256_fmadd_pd(f0,y0,S1);
         }
 
-        _mm256_store_pd(f+i, f0);
-        _mm256_store_pd(g+i, g0);
+        _mm256_storeu_pd(f+i, f0);
+        _mm256_storeu_pd(g+i, g0);
     }
 
     if constexpr (need_sse) {
