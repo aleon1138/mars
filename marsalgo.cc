@@ -177,15 +177,14 @@ struct MarsData {
     // B/Bo start at one column (the intercept) and grow one column per append()
     // so Bo's row stride tracks the live basis count; see the rationale there.
     MarsData(const float *x, int n, int m, int ldx)
-        : n(n), p(m), ldX(ldx)
-        , X (x,n,m,Stride<Dynamic,1>(ldx,1))
+        : n(n), p(m), ldX(ldx), X(x)
         , B (MatrixXf ::Zero(n,1))
         , Bo(MatrixXfC::Zero(n,1)) {}
 
-    const int   n;      // rows in X / length of y / rows of B, Bo
-    const int   p;      // columns in X (candidate regressors)
-    const int   ldX;    // X column stride (outer stride of the external buffer)
-    Map<const MatrixXf,Aligned,Stride<Dynamic,1>>  X;   // read-only view of the regressors
+    const int    n;     // rows in X / length of y / rows of B, Bo
+    const int    p;     // columns in X (candidate regressors)
+    const int    ldX;   // X column stride (column j starts at X + j*ldX)
+    const float *X;     // read-only column-major view of the regressors
     ArrayXf     y;      // target vector (f32 storage; dot products upcast to f64)
     MatrixXf    B;      // all basis
     MatrixXfC   Bo;     // all basis, orthonormalized (f32 storage; f64 arithmetic)
@@ -425,7 +424,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     // Bit-identical to the prior Eigen expression: elementwise f32 multiply,
     // no FMA, S.x is already sized to exactly n (EvalScratch::ensure).
     {
-        const float *xc     = _data->X.col(xcol).data();
+        const float *xc     = _data->X + (size_t)xcol*_data->ldX;
         const float  sx     = _data->s[xcol];
         float       *sx_out = S.x.data();
         for (int i = 0; i < n; ++i) sx_out[i] = xc[i] * sx;
@@ -474,7 +473,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         // TODO - we should keep a LRU cache as we usually pick from the
         //        same pool of regressors in Fast-MARS.
         int32_t *k = S.k.data();
-        argsort(k, _data->X.col(xcol).data(), n);
+        argsort(k, _data->X + (size_t)xcol*_data->ldX, n);
 
         // Take the deltas of `x` (into scratch). Stored as f32: x is f32, so
         // the subtraction is f32-f32 anyway; the f64 store was just a wider
@@ -601,7 +600,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         for (int j = 0; j < p; ++j) {
             if (hinge_idx[j] >= 0) {
                 hinge_dsse[bcols[j]] = linear_dsse[bcols[j]] + hinge_sse[j];
-                hinge_cuts[bcols[j]] = _data->X(k[hinge_idx[j]],xcol);
+                hinge_cuts[bcols[j]] = _data->X[(size_t)xcol*_data->ldX + k[hinge_idx[j]]];
             }
         }
     }
@@ -639,7 +638,7 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
 
     const float        s = _data->s[xcol];
     Ref<ArrayXf>       b = _data->B.col(bcol).array();
-    Ref<const ArrayXf> x = _data->X.col(xcol).array();
+    Map<const ArrayXf> x(_data->X + (size_t)xcol*_data->ldX, _data->n);
 
     switch(type) {
         case 'l':
