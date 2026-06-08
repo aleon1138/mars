@@ -13,19 +13,9 @@ endif()
 find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
 
-# --- Eigen3 (prefer CMake config, fall back to pkg-config) -------------------
-find_package(Eigen3 3.3 CONFIG QUIET)
-if(NOT Eigen3_FOUND)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(EIGEN3 IMPORTED_TARGET eigen3)
-    endif()
-endif()
-if(NOT Eigen3_FOUND AND NOT EIGEN3_FOUND)
-    message(FATAL_ERROR
-        "Eigen3 not found. Install eigen3 (e.g. apt install libeigen3-dev, "
-        "brew install eigen) or set Eigen3_DIR / CMAKE_PREFIX_PATH.")
-endif()
+# Eigen3 is used only by the C++ unit tests (as the correctness oracle); the
+# shipped library is Eigen-free. find_package(Eigen3) lives in the BUILD_TESTING
+# block below, so a library/wheel build does not require Eigen at all.
 
 # --- OpenMP ------------------------------------------------------------------
 # On macOS, statically link Homebrew's libomp into marslib.so so the OpenMP
@@ -71,13 +61,8 @@ endif()
 add_library(mars_common INTERFACE)
 target_compile_features(mars_common INTERFACE cxx_std_17)
 target_compile_options(mars_common INTERFACE -O3 -Wall -march=native -fvisibility=hidden)
-target_compile_definitions(mars_common INTERFACE NDEBUG EIGEN_DONT_PARALLELIZE)
+target_compile_definitions(mars_common INTERFACE NDEBUG)
 target_link_libraries(mars_common INTERFACE mars_openmp)
-if(Eigen3_FOUND)
-    target_link_libraries(mars_common INTERFACE Eigen3::Eigen)
-else()
-    target_link_libraries(mars_common INTERFACE PkgConfig::EIGEN3)
-endif()
 # -march=native does not imply -mfma on x86 macOS — add it explicitly.
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
     target_compile_options(mars_common INTERFACE -mfma)
@@ -102,10 +87,32 @@ install(FILES mars.py DESTINATION .)
 # --- C++ unit tests (opt-in) -------------------------------------------------
 option(BUILD_TESTING "Build C++ unit tests" OFF)
 if(BUILD_TESTING)
+    # Eigen is the oracle the kernel/algorithm tests check against; only the
+    # tests need it (the library itself is Eigen-free).
+    find_package(Eigen3 3.3 CONFIG QUIET)
+    if(NOT Eigen3_FOUND)
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(EIGEN3 IMPORTED_TARGET eigen3)
+        endif()
+    endif()
+    if(NOT Eigen3_FOUND AND NOT EIGEN3_FOUND)
+        message(FATAL_ERROR
+            "Eigen3 not found (required for the unit tests). Install eigen3 "
+            "(e.g. apt install libeigen3-dev, brew install eigen) or set "
+            "Eigen3_DIR / CMAKE_PREFIX_PATH.")
+    endif()
+
     find_package(GTest REQUIRED)
     find_package(Threads REQUIRED)
     add_executable(unittest tests/unittest.cc tests/test_kernels.cc
                             marsalgo.cc kernels.cc)
+    target_compile_definitions(unittest PRIVATE EIGEN_DONT_PARALLELIZE)
     target_link_libraries(unittest PRIVATE
         mars_common GTest::gtest GTest::gtest_main Threads::Threads)
+    if(Eigen3_FOUND)
+        target_link_libraries(unittest PRIVATE Eigen3::Eigen)
+    else()
+        target_link_libraries(unittest PRIVATE PkgConfig::EIGEN3)
+    endif()
 endif()
