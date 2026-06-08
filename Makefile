@@ -22,4 +22,4 @@ format:
 	astyle -A4 -S -z2 -n -j *.h *.cc
 
 clean:
-	rm -rf $(BUILD_DIR) __pycache__/ mars.egg-info/ dist marslib*.so
+	rm -rf $(BUILD_DIR) __pycache__/ mars.egg-info/ dist marslib*.so .ruff_cache .pytest_cache

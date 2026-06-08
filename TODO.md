@@ -76,7 +76,7 @@ The first two sit on top of the existing hinge-basis design; the third
 in principle — you can ship (1)–(2) without touching (3) — but (2) and (3)
 compose particularly well.
 
-The underlying motivation across all four is the same observation: stock MARS
+The underlying motivation across all three is the same observation: stock MARS
 becomes numerically unreliable at interaction order $\geq 3$ on correlated
 features. The Gram matrix loses effective rank, GCV rankings become noisy,
 and the backward pass cannot be trusted to remove redundant terms. Each item
@@ -291,7 +291,7 @@ hinge basis because the support is bounded.
 This recovers Friedman's cubic-smoothing benefit (BMARS as published is
 purely $C^0$). A hinge isn't exactly representable in quadratic B-splines
 on a finite grid, but the error is a piecewise-quadratic correction that
-can be absorbed into the basis. Probably not worth doing until 4a–4c are
+can be absorbed into the basis. Probably not worth doing until 3a–3c are
 solid and you have a concrete need for $C^1$.
 
 ### Practical complications
@@ -425,7 +425,7 @@ but the basic filter is the hot one.
 
 ## `argsort` redone on every `eval()` call
 
-**Location:** `marsalgo.cc:418`.
+**Location:** the `argsort()` call in `MarsAlgo::eval()` (`marsalgo.cc`).
 
 **Issue:** Per-xcol sort order depends only on `X`, which is immutable for the
 lifetime of `MarsAlgo`. Yet `argsort()` runs again every epoch for every
