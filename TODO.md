@@ -67,6 +67,36 @@ Ideas and notes for future performance work. Not planned for a specific release.
 
 **Effort estimate:** multi-week project, not a weekend.
 
+## Phase 1 GEMM (`T = Boᵀ·Bx`) is store-port-bound
+
+**Finding:** Phase 1 of `orthonormalize()` (the `axpy_m` sweep building
+  `T = Boᵀ·Bx`) is limited by store-port throughput, not DRAM bandwidth or FMA.
+  It writes a `T` element on ~every FMA, and x86 retires only ~1 store/cycle.
+  Keeping `i` outermost gives the *optimal* DRAM pattern (`Bo`/`Bx` read exactly
+  once), but then `T` (m×p f64, ~80 KB at m=p=100) can't live in registers, so
+  the per-FMA store is unavoidable.
+
+**Fix:** A register-tiled, `i`-blocked GEMM — hold a `T` tile in YMM
+  accumulators across an `i`-panel, and block `i` into L2-sized chunks so the
+  `Bo`/`Bx` panels are re-read from L2 (cheap) instead of re-storing `T` from
+  the hot loop. That removes the store-port bottleneck.
+
+**Why it can't just call BLAS:** `Bo`/`Bx` are f32 storage but `T` must
+  accumulate in f64 (the precision contract behind narrowing the big buffers).
+  `sgemm` accumulates in f32; `dgemm` needs f64 inputs. The f32-in/f64-accumulate
+  combo has no library primitive — hence the hand-rolled widening kernels.
+
+**Why deferred:** ~100 lines of intricate AVX with three levels of edge handling
+  (i/k/j tails) plus hardware-specific tile tuning (i-panel size for L2, the
+  register tile). The AVX-512 experiment (see CLAUDE.md, 2026-05-16) showed these
+  kernels go port/setup-bound, so the win may evaporate.
+
+**Before investing:** profile Phase 1's actual share of `eval()` on the EPYC
+  server — the hinge sweep and Phase 2a are comparable O(n·p·m) costs, so Phase 1
+  may not dominate. Only worth the complexity if it's a hot fraction. If you do
+  it, validate the AVX path + tune tiles on the server; it can't be exercised on
+  the arm64 dev box.
+
 # MARS improvements — TODO
 
 Context for future-me: this is a roadmap of three improvements to the
