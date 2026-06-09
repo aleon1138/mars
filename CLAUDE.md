@@ -37,7 +37,7 @@ core is Eigen-free: all state below is plain `std::vector`/raw pointers with
 explicit BLAS-style strides (see the 2026-06-09 note). Key internal state (in
 `MarsData`):
 - `X` — read-only column-major (Fortran-order) pointer + stride `ldX` into the caller's data
-- `B` / `Bo` — the current basis and its ortho-normalized counterpart (kept in sync via Gram-Schmidt). `B` is column-major (stride `n`); `Bo` is row-major with row stride == live basis count
+- `B` / `Bo` — the current basis and its ortho-normalized counterpart (kept in sync via Gram-Schmidt). `B` is column-major (stride `n`); `Bo` is row-major with a row stride (`bo_stride`) that holds the live basis count and grows geometrically (see the 2026-06-09 note)
 - `y`, `ybo` — normalized target and its projection onto the ortho-basis
 
 Three methods drive the algorithm:
@@ -87,8 +87,12 @@ Eigen too — see the 2026-06-09 note below.)
 library. `MarsData` (`X`/`B`/`Bo`/`y`/`ybo`/`s`) and the per-thread `eval()`
 scratch are now `std::vector`/raw pointers with explicit strides. `B` is
 preallocated column-major (stride `n`, no per-append resize); `Bo` is row-major
-with row stride == live basis count, grown by an in-place back-to-front repack
-(`bo_grow_one_column`) that preserves the tight stride the sweep relies on.
+with a row stride (`bo_stride`) decoupled from the live basis count and grown
+geometrically (double, capped at `max_terms`) via an in-place back-to-front
+repack (`restride_rows`). This keeps the random Bo-row gather in the hinge sweep
+near the live count while dropping the repack cost from O(n·m²) over a fit to
+O(n·m) — the sweep takes the stride (`ldBo`) and the column count (`m`)
+separately, so it never assumes `stride == count`.
 `append()`'s Gram-Schmidt is now `mars::orthonormalize_col` (single-column
 modified GS + DGKS), validated against an Eigen oracle in the tests. The `s`
 column norms were widened f32→f64 (the prior Eigen `colwise().squaredNorm()`
