@@ -7,7 +7,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name            = "mars"
-version         = "0.10"
+version         = "0.11"
 description     = "Multivariate Adaptive Regression Splines"
 readme          = "README.md"
 authors         = [{ name = "Arnaldo Leon", email = "amleon@alum.mit.edu" }]
@@ -18,7 +18,7 @@ license         = "MIT"
 Source = "https://github.com/aleon1138/mars"
 
 [tool.scikit-build]
-minimum-version = "0.11"
+minimum-version = "0.10"
 cmake.version   = ">=3.18"
 build.verbose   = true
 wheel.packages  = []   # no packages — mars.py and marslib are installed via CMake
