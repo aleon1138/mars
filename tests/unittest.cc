@@ -506,7 +506,7 @@ TEST(MarsTest, MinSpan)
 /*
  *  eval() is called concurrently over X columns from the OpenMP region in the
  *  bindings; production never exercised that path from the test suite. This
- *  grows the basis through append() (so Bo is the tight-stride, grown matrix),
+ *  grows the basis through append() (so Bo is the geometrically-restrided matrix),
  *  then checks that splitting the per-column eval() across std::threads -- which
  *  forces the function-local thread_local scratch to be constructed on non-main
  *  threads and has many readers hit the shared Bo at once -- reproduces the

@@ -159,18 +159,21 @@ cov_t covariates(double *f, double *g, const float *x, const double *y,
 }
 
 /*
- *  Re-organize a tightly-packed row-major (n x cols) matrix in-place to cols+1
- *  columns, within a buffer of capacity >= n*(cols+1). Previously we just used
- *  strided access to each row but this was pretty slow.
+ *  Re-stride a row-major (n x old_stride) matrix in place to a larger row
+ *  stride `new_stride`, within a buffer of capacity >= n*new_stride. All
+ *  old_stride existing columns of each row are preserved; the widened tail is
+ *  left for the caller. As the stride grows the rows spread apart, so repack
+ *  back-to-front (high row first, high column first within a row). The `i-- > 0`
+ *  idiom walks a size_t counter down to 0 without an unsigned-wrap landmine and
+ *  without a cast. Cold path: with geometric stride growth this runs
+ *  O(log max_terms) times across a fit, not once per append.
  */
-void grow_one_column(float *X, size_t n, size_t cols)
+void restride_rows(float *X, size_t n, size_t old_stride, size_t new_stride)
 {
-    // Reverse sweep (high row/column first). The `i-- > 0` idiom walks a size_t
-    // counter down to 0 without an unsigned-wrap landmine and without a cast.
     for (size_t i = n; i-- > 0; ) {
-        const float *src = X + i * cols;
-        float       *dst = X + i * (cols + 1);
-        for (size_t j = cols; j-- > 0; ) {
+        const float *src = X + i * old_stride;
+        float       *dst = X + i * new_stride;
+        for (size_t j = old_stride; j-- > 0; ) {
             dst[j] = src[j];
         }
     }
@@ -186,10 +189,10 @@ struct MarsData {
     const size_t p;             // columns in X (candidate regressors)
     const size_t ldX;           // X column stride (column j starts at X + j*ldX)
     const float *X;             // read-only column-major view of the regressors
-    size_t bo_cols = 1;         // live columns of Bo == its row stride (starts at the intercept)
+    size_t bo_stride = 1;       // Bo row stride (capacity >= live count _m); grows geometrically
     std::vector<float>  y;      // target vector (f32 storage; dot products upcast to f64)
     std::vector<float>  B;      // all basis (col-major, n x max_terms preallocated; col stride n)
-    std::vector<float>  Bo;     // orthonormalized basis (ROW-major; row stride == bo_cols)
+    std::vector<float>  Bo;     // orthonormalized basis (ROW-major; row stride == bo_stride)
     std::vector<double> ybo;    // dot product of basis Bo with Y target
     std::vector<float>  s;      // normalization constant for columns of 'X' (1/rms)
 };
@@ -318,7 +321,7 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
      *  the *stored* f32 target -- each upcast on the load.
      */
     float *b0  = _data->B.data();   // col 0 of col-major B is the base
-    float *bo0 = _data->Bo.data();  // col 0 of Bo is contiguous at bo_cols==1
+    float *bo0 = _data->Bo.data();  // col 0 of Bo is contiguous at bo_stride==1
     for (size_t i = 0; i < n; ++i) {
         b0[i] = bo0[i] = (float)sqrt_w[i];
     }
@@ -445,7 +448,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         _data->B.data(),  _data->n,
         x,
         bcols,
-        _data->Bo.data(), _data->bo_cols,
+        _data->Bo.data(), _data->bo_stride,
         Bx,               n,
         S.BoTBx.data(),   S.cap,
         ybx,
@@ -497,7 +500,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
          *  a few iterations ahead.
          */
         const float *Bo_data = _data->Bo.data();
-        const size_t ldBo    = _data->bo_cols;
+        const size_t ldBo    = _data->bo_stride;
         constexpr int PREFETCH_DIST = 4;
 
         /*
@@ -632,17 +635,21 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
     }
 
     /*
-     *  Grow `Bo` by exactly one column so its row stride stays equal to the live
-     *  basis count. The `eval()` hinge sweep gathers `Bo` rows by that stride
-     *  (ldBo == cols), so a tight stride keeps each randomly-gathered row to the
-     *  minimum number of cache lines; a fixed max_terms stride would be a
-     *  TLB/cache sink at equal basis count. `B` is column-major (col stride n
-     *  regardless of column count) and preallocated to max_terms, so it needs no
-     *  resize. conservativeResize preserves Bo's existing columns.
+     *  Ensure `Bo` has room for the new column _m. The `eval()` hinge sweep
+     *  gathers `Bo` rows by the row stride, so we keep the stride near the live
+     *  basis count (a fixed max_terms stride would spread the random gather over
+     *  more pages). Rather than repack on every append (O(n*m) each, O(n*m^2)
+     *  over a fit), grow the stride geometrically -- doubling, capped at
+     *  max_terms -- so the in-place repack runs only O(log max_terms) times
+     *  (O(n*m) total), at the cost of a stride up to 2x the live count. `B` is
+     *  column-major (col stride n) and preallocated to max_terms, so it needs no
+     *  resize.
      */
-    if (_data->bo_cols < _m + 1) {
-        grow_one_column(_data->Bo.data(), _data->n, _data->bo_cols);
-        _data->bo_cols = _m + 1;
+    if (_data->bo_stride < _m + 1) {
+        const size_t new_stride =
+            std::min((size_t)_max_terms, std::max(_m + 1, 2 * _data->bo_stride));
+        restride_rows(_data->Bo.data(), _data->n, _data->bo_stride, new_stride);
+        _data->bo_stride = new_stride;
     }
 
     const size_t n  = _data->n;
@@ -693,15 +700,15 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
     }
 
     const double w = mars::orthonormalize_col(
-                         n, _m, v.data(), _data->Bo.data(), _data->bo_cols, _tol);
+                         n, _m, v.data(), _data->Bo.data(), _data->bo_stride, _tol);
 
     if (w*w > _tol) {
         /*
          *  orthonormalize_col left v as the unit residual; store it (f32) into
-         *  Bo's new column _m (row-major, stride bo_cols).
+         *  Bo's new column _m (row-major, stride bo_stride).
          */
         float       *Bo   = _data->Bo.data();
-        const size_t ldBo = _data->bo_cols;
+        const size_t ldBo = _data->bo_stride;
         for (size_t i = 0; i < n; ++i) {
             Bo[i*ldBo + _m] = (float)v[i];
         }
