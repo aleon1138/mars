@@ -183,8 +183,10 @@ static void bo_grow_one_column(float *Bo, int n, int cols)
 }
 
 struct MarsData {
-    // B/Bo start at one column (the intercept) and grow one column per append()
-    // so Bo's row stride tracks the live basis count; see the rationale there.
+    /*
+     *  B/Bo start at one column (the intercept) and grow one column per append()
+     *  so Bo's row stride tracks the live basis count; see the rationale there.
+     */
     MarsData(const float *x, int n, int m, int ldx, int max_terms)
         : n(n), p(m), ldX(ldx), X(x)
         , B ((size_t)n*max_terms, 0.0f)
@@ -244,10 +246,12 @@ struct EvalScratch {
     std::vector<double>  hinge_sse;// (cap) best hinge delta-SSE per j (leading p)
     std::vector<double>  BoTBx;    // (cap, cap) column-major (col stride cap) -- Bo^T*Bx workspace
 
-    // Grow (never shrink) to hold n rows and at least m basis columns. The
-    // n-sized buffers reallocate only when the row count changes (a different
-    // MarsAlgo reused this thread's scratch); the basis-sized buffers grow
-    // geometrically so a forward pass triggers O(log m) reallocations.
+    /*
+     *  Grow (never shrink) to hold n rows and at least m basis columns. The
+     *  n-sized buffers reallocate only when the row count changes (a different
+     *  MarsAlgo reused this thread's scratch); the basis-sized buffers grow
+     *  geometrically so a forward pass triggers O(log m) reallocations.
+     */
     void ensure(int n_, int m)
     {
         if (n_ != n) {
@@ -279,15 +283,17 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     _max_terms = p;
     verify(!std::isfinite(NAN), "NAN check is disabled, recompile without --fast-math");
 
-    // Build the weighted, normalized target in f64, then store it as f32 (see
-    // the store below). The per-row weighting and the norm/variance reductions
-    // stay in f64 for precision; only the stored target narrows. Every dot
-    // product against _data->y downstream upcasts on the load, so it still
-    // accumulates in f64.
-    // Build the weighted target in f64. For WLS we scale each row by sqrt(w)
-    // so the OLS objective on the transformed problem equals the weighted RSS
-    // on the original. A non-finite target zeros both factors for that row,
-    // before the weighting multiply (matches the prior filter-then-multiply).
+    /*
+     *  Build the weighted, normalized target in f64, then store it as f32 (see
+     *  the store below). The per-row weighting and the norm/variance reductions
+     *  stay in f64 for precision; only the stored target narrows. Every dot
+     *  product against _data->y downstream upcasts on the load, so it still
+     *  accumulates in f64.
+     *  Build the weighted target in f64. For WLS we scale each row by sqrt(w)
+     *  so the OLS objective on the transformed problem equals the weighted RSS
+     *  on the original. A non-finite target zeros both factors for that row,
+     *  before the weighting multiply (matches the prior filter-then-multiply).
+     */
     std::vector<double> yd(n), sqrt_w(n);
     for (int i = 0; i < n; ++i) {
         double yi  = (double)y[i];
@@ -299,13 +305,15 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
         yd[i]     = yi * swi; // apply sqrt(w) to target
     }
 
-    // TODO - these row-order reductions (y_norm, w_norm, _yvar below, and
-    // the column norms in _data->s) are sensitive to the input row order:
-    // structured inputs (sorted, time-correlated, grouped) accumulate biased
-    // running sums and lose precision vs. shuffled inputs. The downstream
-    // greedy search amplifies these tiny perturbations into different basis
-    // selections. Switching to compensated/pairwise summation here would make
-    // the algorithm row-order-invariant; see tests/repro_shuffle.py.
+    /*
+     *  TODO - these row-order reductions (y_norm, w_norm, _yvar below, and
+     *  the column norms in _data->s) are sensitive to the input row order:
+     *  structured inputs (sorted, time-correlated, grouped) accumulate biased
+     *  running sums and lose precision vs. shuffled inputs. The downstream
+     *  greedy search amplifies these tiny perturbations into different basis
+     *  selections. Switching to compensated/pairwise summation here would make
+     *  the algorithm row-order-invariant; see tests/repro_shuffle.py.
+     */
     double y_sq = 0.0, w_sq = 0.0;
     for (int i = 0; i < n; ++i) {
         y_sq += yd[i]*yd[i];
@@ -320,20 +328,24 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
         sqrt_w[i] /= w_norm;
     }
 
-    // Store the normalized target as f32. This halves the footprint of the
-    // random y[k[i]] gather in the eval() hinge sweep; every dot product
-    // against it upcasts on the load so the accumulation stays f64.
+    /*
+     *  Store the normalized target as f32. This halves the footprint of the
+     *  random y[k[i]] gather in the eval() hinge sweep; every dot product
+     *  against it upcasts on the load so the accumulation stays f64.
+     */
     _data->y.resize(n);
     float *yp = _data->y.data();
     for (int i = 0; i < n; ++i) {
         yp[i] = (float)yd[i];
     }
 
-    // Initialize the first basis column (the intercept) with sqrt(w), in both
-    // B and its ortho-normalized copy Bo (both n x 1 here, so each column is
-    // contiguous). ybo is then the f64 dot of the *stored* f32 intercept with
-    // the *stored* f32 target -- each upcast on the load, matching the prior
-    // Bo.col(0).cast<double>() . y.cast<double>().
+    /*
+     *  Initialize the first basis column (the intercept) with sqrt(w), in both
+     *  B and its ortho-normalized copy Bo (both n x 1 here, so each column is
+     *  contiguous). ybo is then the f64 dot of the *stored* f32 intercept with
+     *  the *stored* f32 target -- each upcast on the load, matching the prior
+     *  Bo.col(0).cast<double>() . y.cast<double>().
+     */
     float *b0  = _data->B.data();   // col 0 of col-major B is the base
     float *bo0 = _data->Bo.data();  // col 0 of Bo is contiguous at bo_cols==1
     for (int i = 0; i < n; ++i) {
@@ -347,7 +359,7 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     _data->ybo.resize(1);
     _data->ybo[0] = ybo0;
 
-    // Sample variance of the (normalized) target 'y' (f64 reduction).
+    /* Sample variance of the (normalized) target 'y' (f64 reduction). */
     double ymean_sum = 0.0;
     for (int i = 0; i < n; ++i) {
         ymean_sum += yd[i];
@@ -360,12 +372,14 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     }
     _yvar = vsum / n;
 
-    // Per-column scale: 1/rms(X[:,j]), or 1 for a zero/constant column. The
-    // sum of squares is accumulated in f64 then narrowed to f32 -- the prior
-    // Eigen path (X.colwise().squaredNorm() on a float matrix) accumulated in
-    // f32; widened here on purpose (de-Eigen decision 2026-06-08) since a
-    // scalar f32 sum would lose accuracy on large n. Each X column is
-    // contiguous (Map inner stride 1), so x + j*ldX walks it directly.
+    /*
+     *  Per-column scale: 1/rms(X[:,j]), or 1 for a zero/constant column. The
+     *  sum of squares is accumulated in f64 then narrowed to f32 -- the prior
+     *  Eigen path (X.colwise().squaredNorm() on a float matrix) accumulated in
+     *  f32; widened here on purpose (de-Eigen decision 2026-06-08) since a
+     *  scalar f32 sum would lose accuracy on large n. Each X column is
+     *  contiguous (Map inner stride 1), so x + j*ldX walks it directly.
+     */
     _data->s.resize(m);
     for (int j = 0; j < m; ++j) {
         const float *xj = x + (size_t)j*ldx;
@@ -416,14 +430,16 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     std::fill_n(hinge_dsse,  _m, 0.0);
     std::fill_n(hinge_cuts,  _m, NAN);
 
-    // Per-thread working memory, grown on demand and reused across calls. The
-    // thread_local is a *pointer* with a constant initializer (no lazy-init
-    // guard, no thread-exit destructor registration); the buffer is heap-
-    // allocated on first touch. A non-trivial thread_local object would instead
-    // be constructed the first time a thread reaches this line, and that
-    // construction crashes on an OpenMP worker thread under the statically
-    // linked libomp on macOS. The per-thread EvalScratch is intentionally
-    // leaked -- worker threads live for the process and there are <= `threads`.
+    /*
+     *  Per-thread working memory, grown on demand and reused across calls. The
+     *  thread_local is a *pointer* with a constant initializer (no lazy-init
+     *  guard, no thread-exit destructor registration); the buffer is heap-
+     *  allocated on first touch. A non-trivial thread_local object would instead
+     *  be constructed the first time a thread reaches this line, and that
+     *  construction crashes on an OpenMP worker thread under the statically
+     *  linked libomp on macOS. The per-thread EvalScratch is intentionally
+     *  leaked -- worker threads live for the process and there are <= `threads`.
+     */
     thread_local EvalScratch *Sp = nullptr;
     if (!Sp) {
         Sp = new EvalScratch();
@@ -444,9 +460,11 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     const int n = _data->n;
     const int m = _m;           // number of all currently existing basis
 
-    // Scale the candidate column by its normalization constant into scratch.
-    // Bit-identical to the prior Eigen expression: elementwise f32 multiply,
-    // no FMA, S.x is already sized to exactly n (EvalScratch::ensure).
+    /*
+     *  Scale the candidate column by its normalization constant into scratch.
+     *  Bit-identical to the prior Eigen expression: elementwise f32 multiply,
+     *  no FMA, S.x is already sized to exactly n (EvalScratch::ensure).
+     */
     {
         const float *xc     = _data->X + (size_t)xcol*_data->ldX;
         const float  sx     = _data->s[xcol];
@@ -463,8 +481,10 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
      *  (max_terms, max_terms) so the leading m×p block is what the kernel uses.
      */
     float  *Bx  = S.Bx.data();   // (n, cap) col-major, col stride n
-    // `S.ybx` is reused as the per-column squared-norm scratch for
-    // orthonormalize(); it is overwritten immediately below with Bx^T * y.
+    /*
+     *  `S.ybx` is reused as the per-column squared-norm scratch for
+     *  orthonormalize(); it is overwritten immediately below with Bx^T * y.
+     */
     double *ybx = S.ybx.data();
     mars::orthonormalize(
         n, m, p,
@@ -477,16 +497,18 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         ybx,
         _tol);
 
-    // Calculate the linear delta SSE and map to the output buffer. Bx.col(j)
-    // and y are both contiguous f32; mars::dot_widen upcasts each at the load
-    // and accumulates in f64 (a vectorized f32->f64 dot that Eigen's
-    // cast-then-redux would otherwise scalarize). See kernels.h.
+    /*
+     *  Calculate the linear delta SSE and map to the output buffer. Bx.col(j)
+     *  and y are both contiguous f32; mars::dot_widen upcasts each at the load
+     *  and accumulates in f64 (a vectorized f32->f64 dot that Eigen's
+     *  cast-then-redux would otherwise scalarize). See kernels.h.
+     */
     for (int j = 0; j < p; ++j) {
         ybx[j] = mars::dot_widen(Bx + (size_t)j*n, _data->y.data(), n);
         linear_dsse[bcols[j]] = ybx[j]*ybx[j];
     }
 
-    // Evaluate the delta SSE on all hinge locations
+    /* Evaluate the delta SSE on all hinge locations */
     if (linear_only == false) {
         const double *ybo = _data->ybo.data(); // dot(Bo.T,_data->y);
         int    *hinge_idx = S.hinge_idx.data();
@@ -494,15 +516,19 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         double *hinge_sse = S.hinge_sse.data();
         std::fill_n(hinge_sse, p, 0.0);
 
-        // Get sort indexes (into scratch)
-        // TODO - we should keep a LRU cache as we usually pick from the
-        //        same pool of regressors in Fast-MARS.
+        /*
+         *  Get sort indexes (into scratch)
+         *  TODO - we should keep a LRU cache as we usually pick from the
+         *         same pool of regressors in Fast-MARS.
+         */
         int32_t *k = S.k.data();
         argsort(k, _data->X + (size_t)xcol*_data->ldX, n);
 
-        // Take the deltas of `x` (into scratch). Stored as f32: x is f32, so
-        // the subtraction is f32-f32 anyway; the f64 store was just a wider
-        // copy. Upcast happens at every read site below.
+        /*
+         *  Take the deltas of `x` (into scratch). Stored as f32: x is f32, so
+         *  the subtraction is f32-f32 anyway; the f64 store was just a wider
+         *  copy. Upcast happens at every read site below.
+         */
         float *d = S.d.data(); // d[0] unused; valid indices are 1..n-1
         for (int i = 1; i < n; ++i) {
             d[i] = x[k[i-1]] - x[k[i]];
@@ -583,13 +609,17 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
              *  consumed at on-grid positions.
              */
             for (int i = 1; i < tail; ++i) {
-                // Prefetch the Bo row we'll need PREFETCH_DIST iterations
-                // ahead; the HW prefetcher fills the rest of the row once
-                // we touch the first cache line.
+                /*
+                 *  Prefetch the Bo row we'll need PREFETCH_DIST iterations
+                 *  ahead; the HW prefetcher fills the rest of the row once
+                 *  we touch the first cache line.
+                 */
                 if (i + PREFETCH_DIST < n) {
-                    // __builtin_prefetch(addr, rw=0 read, locality=3 high) lowers
-                    // to prefetcht0 on x86 (identical to _mm_prefetch + _MM_HINT_T0)
-                    // and is portable to non-x86 (arm64) where xmmintrin.h is absent.
+                    /*
+                     *  __builtin_prefetch(addr, rw=0 read, locality=3 high) lowers
+                     *  to prefetcht0 on x86 (identical to _mm_prefetch + _MM_HINT_T0)
+                     *  and is portable to non-x86 (arm64) where xmmintrin.h is absent.
+                     */
                     __builtin_prefetch(Bo_data + k[i + PREFETCH_DIST] * ldBo, 0, 3);
                 }
 
@@ -623,7 +653,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
             }
         }
 
-        // Map the results to the output arrays
+        /* Map the results to the output arrays */
         for (int j = 0; j < p; ++j) {
             if (hinge_idx[j] >= 0) {
                 hinge_dsse[bcols[j]] = linear_dsse[bcols[j]] + hinge_sse[j];
@@ -670,8 +700,10 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
     const float *xp = _data->X        + (size_t)xcol*_data->ldX; // candidate X column
     float       *Bm = _data->B.data() + (size_t)_m*n;          // new basis column
 
-    // B[:,_m] = s * B[:,bcol] * f(X[:,xcol]); grouped (s*bp[i])*... to match the
-    // prior Eigen array expression bit-for-bit (elementwise f32, no FMA).
+    /*
+     *  B[:,_m] = s * B[:,bcol] * f(X[:,xcol]); grouped (s*bp[i])*... to match the
+     *  prior Eigen array expression bit-for-bit (elementwise f32, no FMA).
+     */
     switch(type) {
         case 'l':
             for (int i = 0; i < n; ++i) {
@@ -717,8 +749,10 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
                          n, _m, v.data(), _data->Bo.data(), _data->bo_cols, _tol);
 
     if (w*w > _tol) {
-        // orthonormalize_col left v as the unit residual; store it (f32) into
-        // Bo's new column _m (row-major, stride bo_cols).
+        /*
+         *  orthonormalize_col left v as the unit residual; store it (f32) into
+         *  Bo's new column _m (row-major, stride bo_cols).
+         */
         float    *Bo   = _data->Bo.data();
         const int ldBo = _data->bo_cols;
         for (int i = 0; i < n; ++i) {

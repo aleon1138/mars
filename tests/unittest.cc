@@ -7,12 +7,14 @@
 #include <cmath>
 constexpr double EPS = 1e-14;
 
-// Hinge-sweep delta-SSE goes through covariates_impl(). With AVX the f/g
-// reduction accumulates 4-wide via FMA; without it (e.g. arm64) the scalar
-// fallback sums in a different order, drifting the ill-conditioned
-// (small-denominator) cuts by a few e-6 on dsse/N -- reduction order, not a
-// real accuracy loss. Hold the AVX path to the tight f32-storage floor; relax
-// only the scalar path. Gated on the same macro covariates_impl() selects on.
+/*
+ *  Hinge-sweep delta-SSE goes through covariates_impl(). With AVX the f/g
+ *  reduction accumulates 4-wide via FMA; without it (e.g. arm64) the scalar
+ *  fallback sums in a different order, drifting the ill-conditioned
+ *  (small-denominator) cuts by a few e-6 on dsse/N -- reduction order, not a
+ *  real accuracy loss. Hold the AVX path to the tight f32-storage floor; relax
+ *  only the scalar path. Gated on the same macro covariates_impl() selects on.
+ */
 #if defined(__AVX__)
 constexpr double HINGE_DSSE_TOL = 1e-6;
 #else
@@ -45,10 +47,10 @@ int argmax(const ArrayXd &x)
     return i;
 }
 
-//
-// Return the delta sum of squared errors (SSE), discarding the Y variance.
-//   sse  = y' * y - beta' * (X' * y)
-//
+/*
+ *  Return the delta sum of squared errors (SSE), discarding the Y variance.
+ *    sse  = y' * y - beta' * (X' * y)
+ */
 double slow_dsse(Ref<const MatrixXd> X, VectorXd y)
 {
     VectorXd xy = X.transpose() * y;
@@ -65,7 +67,7 @@ double slow_mse(MatrixXd X, VectorXd y)
     return mse / y.squaredNorm();
 }
 
-// Closed-form WLS: minimizes sum(w * (y - X b)²); returns sum(w*e²)/n / sum(w*y²).
+/* Closed-form WLS: minimizes sum(w * (y - X b)²); returns sum(w*e²)/n / sum(w*y²). */
 double slow_mse_w(MatrixXd X, VectorXd y, VectorXd w)
 {
     ArrayXd  sw = w.array().sqrt();
@@ -247,9 +249,7 @@ TEST(MarsTest, DeltaSSE)
     ALL_B.col(0).array() = 1;
     int b_cols = 1; // number of valid columns in B
 
-    //-------------------------------------------------------------------------
-    // Pick the first linear basis
-    //-------------------------------------------------------------------------
+    /* Pick the first linear basis */
     {
         const int xcol = 3; // just pick one
         Result res(algo, xcol, mask.head(b_cols), 1);
@@ -265,9 +265,7 @@ TEST(MarsTest, DeltaSSE)
         ASSERT_NEAR(mse1, mse2, 1e-8);
     }
 
-    //-------------------------------------------------------------------------
-    // Try adding another linear basis
-    //-------------------------------------------------------------------------
+    /* Try adding another linear basis */
     {
         const int xcol = 9; // pick another column
         Result res(algo, xcol, mask.head(b_cols), 1);
@@ -283,9 +281,7 @@ TEST(MarsTest, DeltaSSE)
         ASSERT_NEAR(mse1, mse2, 1e-8);
     }
 
-    //-------------------------------------------------------------------------
-    // Ok, now add the interaction
-    //-------------------------------------------------------------------------
+    /* Ok, now add the interaction */
     {
         const int xcol = 9;
         const int bcol = 1; // use x3 as interaction
@@ -303,9 +299,7 @@ TEST(MarsTest, DeltaSSE)
         ASSERT_NEAR(mse1, mse2, 1e-8);
     }
 
-    //-------------------------------------------------------------------------
-    // Try adding the hinge at x7
-    //-------------------------------------------------------------------------
+    /* Try adding the hinge at x7 */
     double last_mse;
     {
         const int xcol = 7;
@@ -319,15 +313,15 @@ TEST(MarsTest, DeltaSSE)
         ALL_B.col(b_cols  ) = (x7 - CUT).cwiseMax(0);
         ALL_B.col(b_cols+1) = (CUT - x7).cwiseMax(0);
         dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
-        // Tolerances relaxed from 1e-7..1e-8 to 1e-6 after narrowing Bx to f32
-        // storage; hinge SSE noise floor is dominated by the per-step f32
-        // round in the inner sweep accumulators (sqrt(N)*eps_f32 on dsse/N).
-        // HINGE_DSSE_TOL relaxes further on the non-AVX scalar path (see top).
+        /*
+         *  Tolerances relaxed from 1e-7..1e-8 to 1e-6 after narrowing Bx to f32
+         *  storage; hinge SSE noise floor is dominated by the per-step f32
+         *  round in the inner sweep accumulators (sqrt(N)*eps_f32 on dsse/N).
+         *  HINGE_DSSE_TOL relaxes further on the non-AVX scalar path (see top).
+         */
         ASSERT_NEAR(dsse1/N, dsse2/N, HINGE_DSSE_TOL);
 
-        //---------------------------------------------------------------------
-        // Test all permutations
-        //---------------------------------------------------------------------
+        /* Test all permutations */
         ALL_B.col(b_cols  ) = ALL_B.col(0).array() * (x7 - res.hinge_cut[0]).cwiseMax(0);
         ALL_B.col(b_cols+1) = ALL_B.col(0).array() * (res.hinge_cut[0] - x7).cwiseMax(0);
         dsse1 = res.base_dsse+res.hinge_dsse[0];
@@ -352,9 +346,7 @@ TEST(MarsTest, DeltaSSE)
         dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
         ASSERT_NEAR(dsse1/N, dsse2/N, HINGE_DSSE_TOL);
 
-        //---------------------------------------------------------------------
-        // Append the hinges
-        //---------------------------------------------------------------------
+        /* Append the hinges */
         mse1 = algo.append('+', xcol, bcol, CUT);
         ALL_B.col(b_cols) = (x7 - CUT).cwiseMax(0);
         mask[b_cols++] = true;
@@ -370,9 +362,7 @@ TEST(MarsTest, DeltaSSE)
         last_mse = mse1; // save for later
     }
 
-    //-------------------------------------------------------------------------
-    // Try adding an empty data column
-    //-------------------------------------------------------------------------
+    /* Try adding an empty data column */
     {
         const int xcol = 10;
         Result res(algo, xcol, mask.head(b_cols), 0);
@@ -382,9 +372,7 @@ TEST(MarsTest, DeltaSSE)
         ASSERT_TRUE(res.hinge_dsse. head(b_cols).isConstant(0));
     }
 
-    //-------------------------------------------------------------------------
-    // Try adding a mask
-    //-------------------------------------------------------------------------
+    /* Try adding a mask */
     {
         const int xcol = 2;
         const int bcol = 3;
@@ -413,9 +401,11 @@ TEST(MarsTest, DeltaSSE)
 
 ///////////////////////////////////////////////////////////////////////////////
 
-// Verify that MarsAlgo reproduces the closed-form WLS solution under
-// non-uniform observation weights. This exercises the sqrt(w) scaling
-// in the constructor.
+/*
+ *  Verify that MarsAlgo reproduces the closed-form WLS solution under
+ *  non-uniform observation weights. This exercises the sqrt(w) scaling
+ *  in the constructor.
+ */
 TEST(MarsTest, WeightedLS)
 {
     srand(0);
@@ -430,7 +420,7 @@ TEST(MarsTest, WeightedLS)
     VectorXd y = (x1 * 0.5 + x2 * 0.3).matrix();
     y += VectorXd::Random(N) * 0.1;
 
-    // Non-uniform weights spanning ~3 orders of magnitude
+    /* Non-uniform weights spanning ~3 orders of magnitude */
     VectorXd w(N);
     for (int i = 0; i < N; ++i) {
         w[i] = 0.01 + 10.0 * std::abs(X(i, 0));
@@ -445,13 +435,13 @@ TEST(MarsTest, WeightedLS)
     MatrixXd ALL_B(N, 3);
     ALL_B.col(0) = VectorXd::Ones(N);
 
-    // Add x1 as a linear basis and compare to closed-form WLS
+    /* Add x1 as a linear basis and compare to closed-form WLS */
     double mse1 = algo.append('l', 1, 0, 0);
     ALL_B.col(1) = x1.matrix();
     double mse2 = slow_mse_w(ALL_B.leftCols(2), y, w);
     ASSERT_NEAR(mse1, mse2, 1e-7);
 
-    // Add x2 and re-check
+    /* Add x2 and re-check */
     mse1 = algo.append('l', 2, 0, 0);
     ALL_B.col(2) = x2.matrix();
     mse2 = slow_mse_w(ALL_B.leftCols(3), y, w);
@@ -460,12 +450,14 @@ TEST(MarsTest, WeightedLS)
 
 ///////////////////////////////////////////////////////////////////////////////
 
-// Verify the min_span gating: with min_span=S the inner loop only checks SSE
-// at every S-th sorted position. The f/g/k0/k1/w/b2/vb/bd accumulators must
-// still update every iteration, so the hinge_dsse at any position evaluated
-// with min_span=S must equal what the same position would yield with
-// min_span=1 (i.e., min_span only restricts which cuts are *considered*, not
-// the math at the considered cuts).
+/*
+ *  Verify the min_span gating: with min_span=S the inner loop only checks SSE
+ *  at every S-th sorted position. The f/g/k0/k1/w/b2/vb/bd accumulators must
+ *  still update every iteration, so the hinge_dsse at any position evaluated
+ *  with min_span=S must equal what the same position would yield with
+ *  min_span=1 (i.e., min_span only restricts which cuts are *considered*, not
+ *  the math at the considered cuts).
+ */
 TEST(MarsTest, MinSpan)
 {
     srand(0);
@@ -490,31 +482,37 @@ TEST(MarsTest, MinSpan)
     Result r2 (algo, 0, mask, /*linear_only=*/0, /*min_span=*/2);
     Result r10(algo, 0, mask, /*linear_only=*/0, /*min_span=*/10);
 
-    // The strided runs evaluate a strict subset of the cuts the min_span=1
-    // run does, so their best hinge_dsse cannot exceed it.
+    /*
+     *  The strided runs evaluate a strict subset of the cuts the min_span=1
+     *  run does, so their best hinge_dsse cannot exceed it.
+     */
     EXPECT_GE(r1.hinge_dsse[0], r2 .hinge_dsse[0]);
     EXPECT_GE(r2.hinge_dsse[0], r10.hinge_dsse[0]);
 
-    // linear_dsse is independent of cut placement; min_span must not affect it.
+    /* linear_dsse is independent of cut placement; min_span must not affect it. */
     ASSERT_NEAR(r1.linear_dsse[0], r2 .linear_dsse[0], 1e-12);
     ASSERT_NEAR(r1.linear_dsse[0], r10.linear_dsse[0], 1e-12);
 
-    // The chosen cut should land near the true CUT for all min_span values.
-    // With N=2000 samples on [-1,1] the average sorted gap is ~1e-3, so even
-    // with min_span=10 the nearest grid point is well within 0.05.
+    /*
+     *  The chosen cut should land near the true CUT for all min_span values.
+     *  With N=2000 samples on [-1,1] the average sorted gap is ~1e-3, so even
+     *  with min_span=10 the nearest grid point is well within 0.05.
+     */
     EXPECT_NEAR(r1 .hinge_cut[0], CUT, 0.05);
     EXPECT_NEAR(r2 .hinge_cut[0], CUT, 0.05);
     EXPECT_NEAR(r10.hinge_cut[0], CUT, 0.05);
 }
 
-// eval() is called concurrently over X columns from the OpenMP region in the
-// bindings; production never exercised that path from the test suite. This
-// grows the basis through append() (so Bo is the tight-stride, grown matrix),
-// then checks that splitting the per-column eval() across std::threads -- which
-// forces the function-local thread_local scratch to be constructed on non-main
-// threads and has many readers hit the shared Bo at once -- reproduces the
-// single-threaded result bit-for-bit. std::thread keeps this independent of the
-// OpenMP runtime.
+/*
+ *  eval() is called concurrently over X columns from the OpenMP region in the
+ *  bindings; production never exercised that path from the test suite. This
+ *  grows the basis through append() (so Bo is the tight-stride, grown matrix),
+ *  then checks that splitting the per-column eval() across std::threads -- which
+ *  forces the function-local thread_local scratch to be constructed on non-main
+ *  threads and has many readers hit the shared Bo at once -- reproduces the
+ *  single-threaded result bit-for-bit. std::thread keeps this independent of the
+ *  OpenMP runtime.
+ */
 TEST(MarsTest, ConcurrentEval)
 {
     srand(0);
@@ -533,7 +531,7 @@ TEST(MarsTest, ConcurrentEval)
 
     MarsAlgo algo(X32.data(), y32.data(), w32.data(), N, M, /*max_terms=*/40, N);
 
-    // Grow the basis via append(): linears, a mirror hinge pair, an interaction.
+    /* Grow the basis via append(): linears, a mirror hinge pair, an interaction. */
     algo.append('l', 0, 0, 0);
     algo.append('l', 1, 0, 0);
     algo.append('+', 2, 0, 0.0f);

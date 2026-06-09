@@ -77,8 +77,10 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
             pthread_setname_np(pthread_self(), name);
 #endif
 
-            // eval() uses a function-local thread_local scratch, grown on
-            // demand and reused across calls -- no caller-supplied buffer.
+            /*
+             *  eval() uses a function-local thread_local scratch, grown on
+             *  demand and reused across calls -- no caller-supplied buffer.
+             */
             #pragma omp for schedule(static)
             for (int i = 0; i < mask_rows; ++i) {
                 if (ok.load(std::memory_order_relaxed)) {
