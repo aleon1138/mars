@@ -14,6 +14,20 @@
 namespace mars {
 namespace {
 
+#if defined(__AVX__)
+// Horizontal sum of the four f64 lanes.
+inline double hsum256_pd(__m256d v)
+{
+    return (v[0] + v[1]) + (v[2] + v[3]);
+}
+
+// Widen 4 contiguous f32 to an f64 vector (cvtps_pd on an unaligned load).
+inline __m256d loadu_ps_pd(const float *p)
+{
+    return _mm256_cvtps_pd(_mm_loadu_ps(p));
+}
+#endif
+
 /*
  *  Inner kernels along the basis dimension k. AVX2 unrolls 4-wide; the
  *  scalar tail covers the leftover. Hot on every column of orthonormalize().
@@ -28,7 +42,7 @@ inline void axpy_m(double *tc, const float *bo_row, double scalar, int m)
     __m256d bcast = _mm256_set1_pd(scalar);
     for (; k + 4 <= m; k += 4) {
         __m256d t  = _mm256_loadu_pd(tc + k);
-        __m256d bo = _mm256_cvtps_pd(_mm_loadu_ps(bo_row + k));
+        __m256d bo = loadu_ps_pd(bo_row + k);
         _mm256_storeu_pd(tc + k, _mm256_fmadd_pd(bo, bcast, t));
     }
 #endif
@@ -37,18 +51,23 @@ inline void axpy_m(double *tc, const float *bo_row, double scalar, int m)
     }
 }
 
-// dot((double)bo_row[:m], tc[:m]).  Bo is f32, tc is f64.
+// dot((double)bo_row[:m], tc[:m]).  Bo is f32, tc is f64. Two accumulators
+// break the FMA latency chain (one chain caps at ~1/4 FMA throughput).
 inline double dot_bo(const float *bo_row, const double *tc, int m)
 {
     int k = 0;
 #if defined(__AVX__)
-    __m256d acc4 = _mm256_setzero_pd();
-    for (; k + 4 <= m; k += 4) {
-        __m256d bo = _mm256_cvtps_pd(_mm_loadu_ps(bo_row + k));
-        __m256d t  = _mm256_loadu_pd(tc + k);
-        acc4 = _mm256_fmadd_pd(bo, t, acc4);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    for (; k + 8 <= m; k += 8) {
+        acc0 = _mm256_fmadd_pd(loadu_ps_pd(bo_row + k),     _mm256_loadu_pd(tc + k),     acc0);
+        acc1 = _mm256_fmadd_pd(loadu_ps_pd(bo_row + k + 4), _mm256_loadu_pd(tc + k + 4), acc1);
     }
-    double acc = (acc4[0] + acc4[1]) + (acc4[2] + acc4[3]);
+    if (k + 4 <= m) {
+        acc0 = _mm256_fmadd_pd(loadu_ps_pd(bo_row + k), _mm256_loadu_pd(tc + k), acc0);
+        k += 4;
+    }
+    double acc = hsum256_pd(_mm256_add_pd(acc0, acc1));
 #else
     double acc = 0.0;
 #endif
@@ -59,20 +78,64 @@ inline double dot_bo(const float *bo_row, const double *tc, int m)
 }
 
 /*
+ *  Four dot_bo() reductions sharing the bo_row load+widen: out[c] =
+ *  dot((double)bo_row[:m], t{c}[:m]). The four independent accumulators also
+ *  break the FMA latency chain. Hot in orthonormalize() Phase 2a, where the
+ *  same bo_row is projected against every candidate column's T-coefficients.
+ */
+inline void dot_bo4(const float *bo_row,
+                    const double *t0, const double *t1,
+                    const double *t2, const double *t3,
+                    int m, double out[4])
+{
+    int k = 0;
+#if defined(__AVX__)
+    __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
+    __m256d a2 = _mm256_setzero_pd(), a3 = _mm256_setzero_pd();
+    for (; k + 4 <= m; k += 4) {
+        __m256d bo = loadu_ps_pd(bo_row + k);
+        a0 = _mm256_fmadd_pd(bo, _mm256_loadu_pd(t0 + k), a0);
+        a1 = _mm256_fmadd_pd(bo, _mm256_loadu_pd(t1 + k), a1);
+        a2 = _mm256_fmadd_pd(bo, _mm256_loadu_pd(t2 + k), a2);
+        a3 = _mm256_fmadd_pd(bo, _mm256_loadu_pd(t3 + k), a3);
+    }
+    double s0 = hsum256_pd(a0), s1 = hsum256_pd(a1);
+    double s2 = hsum256_pd(a2), s3 = hsum256_pd(a3);
+#else
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+#endif
+    for (; k < m; ++k) {
+        const double bo = (double)bo_row[k];
+        s0 += bo * t0[k];
+        s1 += bo * t1[k];
+        s2 += bo * t2[k];
+        s3 += bo * t3[k];
+    }
+    out[0] = s0;
+    out[1] = s1;
+    out[2] = s2;
+    out[3] = s3;
+}
+
+/*
  *  dot(a[:m], b[:m]) for f64*f64. Used only for the DGKS gate (tc dot tc),
- *  where both operands are the f64 T workspace.
+ *  where both operands are the f64 T workspace. Two accumulators as in dot_bo.
  */
 inline double dot_m(const double *a, const double *b, int m)
 {
     int k = 0;
 #if defined(__AVX__)
-    __m256d acc4 = _mm256_setzero_pd();
-    for (; k + 4 <= m; k += 4) {
-        __m256d av = _mm256_loadu_pd(a + k);
-        __m256d bv = _mm256_loadu_pd(b + k);
-        acc4 = _mm256_fmadd_pd(av, bv, acc4);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    for (; k + 8 <= m; k += 8) {
+        acc0 = _mm256_fmadd_pd(_mm256_loadu_pd(a + k),     _mm256_loadu_pd(b + k),     acc0);
+        acc1 = _mm256_fmadd_pd(_mm256_loadu_pd(a + k + 4), _mm256_loadu_pd(b + k + 4), acc1);
     }
-    double acc = (acc4[0] + acc4[1]) + (acc4[2] + acc4[3]);
+    if (k + 4 <= m) {
+        acc0 = _mm256_fmadd_pd(_mm256_loadu_pd(a + k), _mm256_loadu_pd(b + k), acc0);
+        k += 4;
+    }
+    double acc = hsum256_pd(_mm256_add_pd(acc0, acc1));
 #else
     double acc = 0.0;
 #endif
@@ -121,6 +184,32 @@ inline void compute_BoT_bx_col(
     }
 }
 
+/*
+ *  One modified Gram-Schmidt sweep of the single column v against the m
+ *  orthonormal columns of Bo (row-major, row stride ldBo): each projection
+ *  updates v before the next is computed. Column j of row i is at
+ *  Bo[i*ldBo + j], so the per-column walk is strided (cold path -- once per
+ *  append). Returns the projected energy sum_j c_j^2 (feeds the DGKS gate).
+ */
+inline double mgs_project_col(
+    int n, int m,
+    double *v,
+    const float *Bo, int ldBo)
+{
+    double proj_norm2 = 0.0;
+    for (int j = 0; j < m; ++j) {
+        double c = 0.0;
+        for (int i = 0; i < n; ++i) {
+            c += (double)Bo[(size_t)i*ldBo + j] * v[i];
+        }
+        for (int i = 0; i < n; ++i) {
+            v[i] -= c * (double)Bo[(size_t)i*ldBo + j];
+        }
+        proj_norm2 += c * c;
+    }
+    return proj_norm2;
+}
+
 } // namespace
 
 double dot_widen(const float *a, const float *b, int n)
@@ -134,13 +223,10 @@ double dot_widen(const float *a, const float *b, int n)
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
     for (; i + 8 <= n; i += 8) {
-        acc0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(a + i)),
-                               _mm256_cvtps_pd(_mm_loadu_ps(b + i)), acc0);
-        acc1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(a + i + 4)),
-                               _mm256_cvtps_pd(_mm_loadu_ps(b + i + 4)), acc1);
+        acc0 = _mm256_fmadd_pd(loadu_ps_pd(a + i),     loadu_ps_pd(b + i),     acc0);
+        acc1 = _mm256_fmadd_pd(loadu_ps_pd(a + i + 4), loadu_ps_pd(b + i + 4), acc1);
     }
-    const __m256d acc = _mm256_add_pd(acc0, acc1);
-    double s = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    double s = hsum256_pd(_mm256_add_pd(acc0, acc1));
 #else
     double s = 0.0;
 #endif
@@ -160,20 +246,9 @@ double orthonormalize_col(
     /*
      *  Modified Gram-Schmidt against the m orthonormal columns of Bo, matching
      *  MarsAlgo::append(): each projection updates v before the next, and the
-     *  projected energy feeds the DGKS gate. Column j of row i is at
-     *  Bo[i*ldBo + j] (row-major); the per-column walk is therefore strided.
+     *  projected energy feeds the DGKS gate. See mgs_project_col.
      */
-    double proj_norm2 = 0.0;
-    for (int j = 0; j < m; ++j) {
-        double c = 0.0;
-        for (int i = 0; i < n; ++i) {
-            c += (double)Bo[(size_t)i*ldBo + j] * v[i];
-        }
-        for (int i = 0; i < n; ++i) {
-            v[i] -= c * (double)Bo[(size_t)i*ldBo + j];
-        }
-        proj_norm2 += c * c;
-    }
+    const double proj_norm2 = mgs_project_col(n, m, v, Bo, ldBo);
 
     double v_norm2 = 0.0;
     for (int i = 0; i < n; ++i) {
@@ -182,21 +257,14 @@ double orthonormalize_col(
 
     /*
      *  DGKS retry: re-orthogonalize once when the residual energy is small
-     *  relative to what was projected out.
+     *  relative to what was projected out. (The retry's own projected energy
+     *  is tiny by construction and discarded.)
      */
     if (v_norm2 > tol && v_norm2 * DGKS_GATE_RATIO_SQ < proj_norm2) {
         if (dgks_counter) {
             dgks_counter->fetch_add(1, std::memory_order_relaxed);
         }
-        for (int j = 0; j < m; ++j) {
-            double c = 0.0;
-            for (int i = 0; i < n; ++i) {
-                c += (double)Bo[(size_t)i*ldBo + j] * v[i];
-            }
-            for (int i = 0; i < n; ++i) {
-                v[i] -= c * (double)Bo[(size_t)i*ldBo + j];
-            }
-        }
+        mgs_project_col(n, m, v, Bo, ldBo);
         v_norm2 = 0.0;
         for (int i = 0; i < n; ++i) {
             v_norm2 += v[i] * v[i];
@@ -280,7 +348,24 @@ void orthonormalize(
     std::fill_n(s_buf, p, 0.0);
     for (int i = 0; i < n; ++i) {
         const float *bo_row = Bo + i * ldBo;
-        for (int j = 0; j < p; ++j) {
+        int j = 0;
+        // Blocks of 4 columns share the bo_row load+widen (see dot_bo4).
+        for (; j + 4 <= p; j += 4) {
+            double proj[4];
+            dot_bo4(bo_row,
+                    T + (j + 0) * ldT, T + (j + 1) * ldT,
+                    T + (j + 2) * ldT, T + (j + 3) * ldT,
+                    m, proj);
+            for (int c = 0; c < 4; ++c) {
+                float       *bx    = Bx + (j + c) * ldBx;
+                const double v     = (double)bx[i] - proj[c];
+                const float  v_f32 = (float)v;
+                bx[i]    = v_f32;
+                const double v_back = (double)v_f32;
+                s_buf[j + c] += v_back * v_back;
+            }
+        }
+        for (; j < p; ++j) {
             const double *tc    = T  + j * ldT;
             float        *bx    = Bx + j * ldBx;
             const double  v     = (double)bx[i] - dot_bo(bo_row, tc, m);
