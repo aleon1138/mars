@@ -459,19 +459,42 @@ def gram(A, B=None, chunk_size=128):
 # -----------------------------------------------------------------------------
 
 
-def _init_inverse_state(XX, XY, YY, active_idx):
-    """Build (H, β, SSE) for the active subset via a fresh Cholesky."""
+def _init_inverse_state(XX, XY, YY, active_idx, ridge=0.0):
+    """Build (H, β, SSE) for the active subset via a fresh Cholesky.
+
+    The real output is H, the *explicit inverse* of the (loaded) Gram matrix —
+    not just a solve. The backward pass downdates H by rank-1 Schur complements
+    and needs β_j²/H_jj for each column (see _backward_eliminate), so it needs a
+    genuine inverse, not a least-squares solution. XX_sub = BᵀB is symmetric
+    positive semi-definite, so Cholesky is the right factorization (fastest for
+    SPD; one factor serves both the β solve and the inverse).
+
+    Diagonal loading is applied two ways, both as `A + cI`:
+      * `ridge` — the caller's regularization, on the standardized scale, so
+        selection here regularizes identically to the final solve in prune().
+      * jitter — a last-resort safety net. A Cholesky LinAlgError is an exact
+        signal that A is not numerically PD (collinear columns, e.g. overlapping
+        hinges); loading the diagonal restores a true inverse so the rank-1
+        downdate identity stays valid. (A pseudo-inverse would not — which is
+        why we load rather than fall back to pinv/lstsq.)
+
+    With ridge==0 on a well-conditioned subset both are no-ops, so the default
+    path is unchanged. SSE is the penalized objective YY − XYᵀβ that the sweep
+    telescopes; for stabilizer-sized ridge it differs from the raw RSS by λ‖β‖².
+    """
     m = len(active_idx)
     if m == 0:
         return np.zeros((0, 0)), np.zeros(0), float(YY)
 
     XX_sub = XX[np.ix_(active_idx, active_idx)]
     XY_sub = XY[active_idx]
+
+    A = XX_sub + ridge * np.eye(m) if ridge > 0 else XX_sub
     try:
-        L = np.linalg.cholesky(XX_sub)
+        L = np.linalg.cholesky(A)
     except np.linalg.LinAlgError:
-        jitter = 1e-8 * (np.trace(XX_sub) / m + 1.0)
-        L = np.linalg.cholesky(XX_sub + jitter * np.eye(m))
+        jitter = 1e-8 * (np.trace(A) / m + 1.0)
+        L = np.linalg.cholesky(A + jitter * np.eye(m))
 
     cho = (L, True)
     beta = scipy.linalg.cho_solve(cho, XY_sub)
@@ -480,12 +503,13 @@ def _init_inverse_state(XX, XY, YY, active_idx):
     return H, beta, SSE
 
 
-def _backward_eliminate(XX, XY, YY, mask, penalty, n_true):
+def _backward_eliminate(XX, XY, YY, mask, penalty, n_true, ridge=0.0):
     """
     Backward stepwise selection via Schur-complement updates.
 
-    Maintains H = XX_active⁻¹ and β = H · XY_active; at each step drops the
-    candidate with smallest ΔSSE_j = β_j² / H_jj and updates H, β by rank-1.
+    Maintains H = (XX_active + ridge·I)⁻¹ and β = H · XY_active; at each step
+    drops the candidate with smallest ΔSSE_j = β_j² / H_jj and updates H, β by
+    rank-1.
     O(M³) total, vs. O(M⁵) for a full re-solve per candidate. Periodic
     Cholesky refresh bounds drift; the intercept (global column 0) is pinned.
     """
@@ -495,7 +519,7 @@ def _backward_eliminate(XX, XY, YY, mask, penalty, n_true):
     if m == 0:
         return mask.copy()
 
-    H, beta, SSE = _init_inverse_state(XX, XY, YY, active_idx)
+    H, beta, SSE = _init_inverse_state(XX, XY, YY, active_idx, ridge)
 
     def _gcv(sse, mm):
         dof = mm + penalty * (mm - 1)
@@ -538,7 +562,7 @@ def _backward_eliminate(XX, XY, YY, mask, penalty, n_true):
 
         since_refresh += 1
         if since_refresh >= refresh_every and m > 0:
-            H, beta, SSE = _init_inverse_state(XX, XY, YY, active_idx)
+            H, beta, SSE = _init_inverse_state(XX, XY, YY, active_idx, ridge)
             since_refresh = 0
 
         gcv = _gcv(SSE, m)
@@ -621,12 +645,15 @@ def prune(B, y, w=None, n_true=None, penalty=3, ridge=0, mask=None):
     XY = XY / d_safe
 
     # Backward elimination returns the GCV-best subset; we re-solve from
-    # scratch below so the returned coefficients are free of any drift.
+    # scratch below so the returned coefficients are free of any drift. `ridge`
+    # flows into selection (diagonal loading in _init_inverse_state) so the
+    # subset is chosen under the same regularization the final solve uses.
     mask = np.array(mask) if mask is not None else np.ones(M, dtype="bool")
     mask = mask & active
-    best_mask = _backward_eliminate(XX, XY, YY, mask, penalty, n_true)
+    best_mask = _backward_eliminate(XX, XY, YY, mask, penalty, n_true, ridge)
 
     if ridge > 0:
+        # Same diagonal loading as selection, now on the full active Gram.
         XX = XX + np.eye(len(XX)) * ridge
     beta = np.zeros(M)
     if best_mask.any():
