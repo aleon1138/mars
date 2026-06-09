@@ -27,7 +27,7 @@ inline double fma(double x, double y, double z)
 /*
  *  Return sort indexes in stable descending order.
  */
-void argsort(int32_t *idx, const float *v, int n)
+void argsort(int32_t *idx, const float *v, size_t n)
 {
     std::iota(idx, idx+n, 0);
     std::stable_sort(idx, idx+n, [&v](size_t i, size_t j) {
@@ -39,10 +39,10 @@ void argsort(int32_t *idx, const float *v, int n)
  *  Return the indexes (and count) of true entries in `mask` (length `n`).
  *  `out` must have capacity for at least `n` entries.
  */
-int nonzero(int *out, const bool *mask, int n)
+size_t nonzero(int *out, const bool *mask, size_t n)
 {
-    int count = 0;
-    for (int i = 0; i < n; ++i) {
+    size_t count = 0;
+    for (size_t i = 0; i < n; ++i) {
         if (mask[i]) {
             out[count++] = i;
         }
@@ -87,7 +87,7 @@ struct cov_t {
  */
 template <bool need_sse>
 cov_t covariates_impl(double *f, double *g, const float *x, const double *y,
-                      double xm, double ym, double k0, float k1, int m)
+                      double xm, double ym, double k0, float k1, size_t m)
 {
     /*
      *  f/g/y use unaligned loads/stores below, so no alignment is required of
@@ -98,15 +98,15 @@ cov_t covariates_impl(double *f, double *g, const float *x, const double *y,
     cov_t o = {0,0};
 
 #ifndef __AVX__
-    int m0 = 0;
+    size_t m0 = 0;
 #else
     __m256d K0 = _mm256_set1_pd(k0);
     __m256d K1 = _mm256_set1_pd(k1);
     __m256d S0 = _mm256_setzero_pd();
     __m256d S1 = _mm256_setzero_pd();
 
-    int m0 = m - m%4;
-    for (int i = 0; i < m0; i+=4) {
+    size_t m0 = m - m%4;
+    for (size_t i = 0; i < m0; i+=4) {
         __m256d f0 = _mm256_loadu_pd(f+i);
         __m256d g0 = _mm256_loadu_pd(g+i);
         __m256d x0 = _mm256_cvtps_pd(_mm_loadu_ps(x+i));
@@ -130,7 +130,7 @@ cov_t covariates_impl(double *f, double *g, const float *x, const double *y,
     }
 #endif
 
-    for (int i = m0; i < m; ++i) {
+    for (size_t i = m0; i < m; ++i) {
         f[i] = fma(k0,g[i],f[i]);
         g[i] = fma(k1,x[i],g[i]);
         if constexpr (need_sse) {
@@ -153,7 +153,7 @@ cov_t covariates_impl(double *f, double *g, const float *x, const double *y,
  *  SSE-reduction path can be elided.
  */
 cov_t covariates(double *f, double *g, const float *x, const double *y,
-                 double xm, double ym, double k0, float k1, int m)
+                 double xm, double ym, double k0, float k1, size_t m)
 {
     return covariates_impl<true>(f, g, x, y, xm, ym, k0, k1, m);
 }
@@ -163,28 +163,30 @@ cov_t covariates(double *f, double *g, const float *x, const double *y,
  *  columns, within a buffer of capacity >= n*(cols+1). Previously we just used
  *  strided access to each row but this was pretty slow.
  */
-void grow_one_column(float *X, int n, int cols)
+void grow_one_column(float *X, size_t n, size_t cols)
 {
-    for (int i = n - 1; i >= 0; --i) {
+    // Reverse sweep (high row/column first). The `i-- > 0` idiom walks a size_t
+    // counter down to 0 without an unsigned-wrap landmine and without a cast.
+    for (size_t i = n; i-- > 0; ) {
         const float *src = X + i * cols;
         float       *dst = X + i * (cols + 1);
-        for (int j = cols - 1; j >= 0; --j) {
+        for (size_t j = cols; j-- > 0; ) {
             dst[j] = src[j];
         }
     }
 }
 
 struct MarsData {
-    MarsData(const float *x, int n, int m, int ldx, int max_terms)
+    MarsData(const float *x, size_t n, size_t m, size_t ldx, size_t max_terms)
         : n(n), p(m), ldX(ldx), X(x)
         , B (n*max_terms, 0.0f)
         , Bo(n*max_terms, 0.0f) {}
 
-    const int    n;             // rows in X / length of y / rows of B, Bo
-    const int    p;             // columns in X (candidate regressors)
-    const int    ldX;           // X column stride (column j starts at X + j*ldX)
+    const size_t n;             // rows in X / length of y / rows of B, Bo
+    const size_t p;             // columns in X (candidate regressors)
+    const size_t ldX;           // X column stride (column j starts at X + j*ldX)
     const float *X;             // read-only column-major view of the regressors
-    int bo_cols = 1;            // live columns of Bo == its row stride (starts at the intercept)
+    size_t bo_cols = 1;         // live columns of Bo == its row stride (starts at the intercept)
     std::vector<float>  y;      // target vector (f32 storage; dot products upcast to f64)
     std::vector<float>  B;      // all basis (col-major, n x max_terms preallocated; col stride n)
     std::vector<float>  Bo;     // orthonormalized basis (ROW-major; row stride == bo_cols)
@@ -213,8 +215,8 @@ struct MarsData {
  *      a software prefetch a few iterations ahead.
  */
 struct Scratch {
-    int n   = 0;                   // row count the n-sized buffers are sized for
-    int cap = 0;                   // basis capacity the m-sized buffers are sized for
+    size_t n   = 0;                // row count the n-sized buffers are sized for
+    size_t cap = 0;                // basis capacity the m-sized buffers are sized for
     std::vector<float>   x;        // normalized candidate column (n)
     std::vector<int32_t> k;        // sort permutation of x (n)
     std::vector<float>   d;        // adjacent deltas of x along sort order (n), d[0] unused
@@ -232,7 +234,7 @@ struct Scratch {
      *  n-sized buffers reallocate only when the row count changes. The buffers
      *  grow geometrically so a forward pass triggers O(log m) reallocations.
      */
-    void ensure(int n_, int m)
+    void ensure(size_t n_, size_t m)
     {
         if (n_ != n) {
             n = n_;
@@ -243,19 +245,19 @@ struct Scratch {
         }
         if (m > cap) {
             cap = m > 2 * cap ? m : 2 * cap;
-            Bx.resize((size_t)n * cap);
+            Bx.resize(n * cap);
             f.resize(cap + 1);
             g.resize(cap + 1);
             bcols.resize(cap);
             ybx.resize(cap);
             hinge_idx.resize(cap);
             hinge_sse.resize(cap);
-            BoTBx.resize((size_t)cap * cap);
+            BoTBx.resize(cap * cap);
         }
     }
 };
 
-MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m, int p, int ldx)
+MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, size_t m, size_t p, size_t ldx)
     : _data(new MarsData(x, n, m, ldx, p))
     , _tol((n*0.02)*DBL_EPSILON) // rough guess
 {
@@ -268,7 +270,7 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
      *  RSS on the original.
      */
     std::vector<double> yd(n), sqrt_w(n);
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         double yi  = (double)y[i];
         double swi = std::sqrt((double)w[i]);
         if (!std::isfinite(yi)) {
@@ -285,7 +287,7 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
      *  running sums and lose precision versus shuffled inputs.
      */
     double y_sq = 0.0, w_sq = 0.0;
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         y_sq += yd[i]*yd[i];
         w_sq += sqrt_w[i]*sqrt_w[i];
     }
@@ -293,7 +295,7 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
     const double w_norm = std::sqrt(w_sq);
     verify(y_norm > 0.0 && w_norm > 0.0, "target Y is all zero or NANs");
 
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         yd[i]     /= y_norm;
         sqrt_w[i] /= w_norm;
     }
@@ -305,7 +307,7 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
      */
     _data->y.resize(n);
     float *yp = _data->y.data();
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         yp[i] = (float)yd[i];
     }
 
@@ -317,12 +319,12 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
      */
     float *b0  = _data->B.data();   // col 0 of col-major B is the base
     float *bo0 = _data->Bo.data();  // col 0 of Bo is contiguous at bo_cols==1
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         b0[i] = bo0[i] = (float)sqrt_w[i];
     }
 
     double ybo0 = 0.0;
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         ybo0 += (double)bo0[i] * (double)yp[i]; // TODO - avoid the round-trip f64->f32->f64?
     }
     _data->ybo.resize(1);
@@ -332,12 +334,12 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
      *  Compute the sample variance of the (normalized) target 'y'.
      */
     double ymean_sum = 0.0;
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         ymean_sum += yd[i];
     }
     const double ymean = ymean_sum / n;
     double vsum = 0.0;
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         const double dv = yd[i] - ymean;
         vsum += dv*dv;
     }
@@ -349,10 +351,10 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, int n, int m,
      *  column is contiguous, so x + j*ldX walks it directly.
      */
     _data->s.resize(m);
-    for (int j = 0; j < m; ++j) {
+    for (size_t j = 0; j < m; ++j) {
         const float *xj = x + j*ldx;
         double sq = 0.0;
-        for (int i = 0; i < n; ++i) {
+        for (size_t i = 0; i < n; ++i) {
             sq += (double)xj[i] * (double)xj[i];
         }
         const double rms = std::sqrt(sq / n);
@@ -389,7 +391,9 @@ double MarsAlgo::yvar() const
 void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
                     int xcol, const bool *bmask, int min_span, int end_span, bool linear_only)
 {
-    verify(xcol >= 0 && xcol < _data->p, "invalid X column index");
+    // xcol is a signed caller-supplied index; the >= 0 guard makes the
+    // (size_t) compare against the column count well-defined.
+    verify(xcol >= 0 && (size_t)xcol < _data->p, "invalid X column index");
     verify(min_span >= 1, "min_span must be >= 1");
 
     std::fill_n(linear_dsse, _m, 0.0);
@@ -402,12 +406,12 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     }
     Scratch &S = *Sp;
     S.ensure(_data->n, _m);
-    const int p = nonzero(S.bcols.data(), bmask, _m);
+    const size_t p = nonzero(S.bcols.data(), bmask, _m);
     if (p == 0) {
         return;
     }
     int *bcols = S.bcols.data();
-    const int n = _data->n;
+    const size_t n = _data->n;
 
 #ifdef __SSE__
     const unsigned csr = _mm_getcsr();
@@ -419,7 +423,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
      */
     const float *xc = _data->X + xcol*_data->ldX;
     const float  sx = _data->s[xcol];
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         S.x[i] = xc[i] * sx;
     }
     const float *x = S.x.data();
@@ -452,7 +456,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
      *  and y are both contiguous f32; mars::dot_widen upcasts each at the load
      *  and accumulates in f64. See kernels.h.
      */
-    for (int j = 0; j < p; ++j) {
+    for (size_t j = 0; j < p; ++j) {
         ybx[j] = mars::dot_widen(Bx + j*n, _data->y.data(), n);
         linear_dsse[bcols[j]] = ybx[j]*ybx[j];
     }
@@ -477,12 +481,12 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
          *  Take the deltas of `x` (into scratch).
          */
         float *d = S.d.data(); // d[0] unused; valid indices are 1..n-1
-        for (int i = 1; i < n; ++i) {
+        for (size_t i = 1; i < n; ++i) {
             d[i] = x[k[i-1]] - x[k[i]];
         }
 
-        const int head = end_span;
-        const int tail = n-end_span;
+        const size_t head = end_span;
+        const size_t tail = n-end_span;
         const float *B = _data->B.data(); // col-major, col stride n
         const float *y = _data->y.data(); // f32 storage; each y[k[i]] upcasts into double y_k below
 
@@ -493,7 +497,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
          *  a few iterations ahead.
          */
         const float *Bo_data = _data->Bo.data();
-        const int    ldBo    = _data->bo_cols;
+        const size_t ldBo    = _data->bo_cols;
         constexpr int PREFETCH_DIST = 4;
 
         /*
@@ -526,13 +530,13 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
          *  The final hinge_dsse = linear_dsse + hinge_sse captures the combined
          *  gain from the full hinge pair (h_plus and h_minus together).
          */
-        for (int j = 0; j < p; ++j) {
+        for (size_t j = 0; j < p; ++j) {
             double *f = S.f.data();
             std::fill_n(f, _m+1, 0.0);
             double *g = S.g.data();
             std::fill_n(g, _m+1, 0.0);
-            const float  *b  = B + (size_t)bcols[j]*n;
-            const float  *bx = Bx + (size_t)j*n;
+            const float  *b  = B + bcols[j]*n;
+            const float  *bx = Bx + j*n;
 
             double b_k  = b [k[0]];
             double bx_k = bx[k[0]];
@@ -557,8 +561,8 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
              *  points (head+1, head+1+min_span, ...) so the per-sample test is
              *  an equality, not a modulo.
              */
-            int next_grid = head + 1;
-            for (int i = 1; i < tail; ++i) {
+            size_t next_grid = head + 1;
+            for (size_t i = 1; i < tail; ++i) {
                 /*
                  *  Prefetch the Bo row we'll need PREFETCH_DIST iterations
                  *  ahead; the HW prefetcher fills the rest of the row once
@@ -601,10 +605,10 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
             }
         }
 
-        for (int j = 0; j < p; ++j) {
+        for (size_t j = 0; j < p; ++j) {
             if (hinge_idx[j] >= 0) {
                 hinge_dsse[bcols[j]] = linear_dsse[bcols[j]] + hinge_sse[j];
-                hinge_cuts[bcols[j]] = _data->X[(size_t)xcol*_data->ldX + k[hinge_idx[j]]];
+                hinge_cuts[bcols[j]] = _data->X[xcol*_data->ldX + k[hinge_idx[j]]];
             }
         }
     }
@@ -619,7 +623,9 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
     if (_m >= _max_terms) {
         throw std::runtime_error("basis matrix is full");
     }
-    if (bcol < 0 || bcol >= _m) {
+    // bcol is a signed caller-supplied index; the >= 0 guard makes the
+    // (size_t) compare against the live basis count well-defined.
+    if (bcol < 0 || (size_t)bcol >= _m) {
         char msg[80];
         snprintf(msg, sizeof(msg), "invalid basis column number: %d", bcol);
         throw std::runtime_error(msg);
@@ -639,7 +645,7 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
         _data->bo_cols = _m + 1;
     }
 
-    const int    n  = _data->n;
+    const size_t n  = _data->n;
     const float  s  = _data->s[xcol];
     const float *bp = _data->B.data() + bcol*n;             // parent basis column
     const float *xp = _data->X        + xcol*_data->ldX;    // candidate X column
@@ -647,17 +653,17 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
 
     switch(type) {
         case 'l':
-            for (int i = 0; i < n; ++i) {
+            for (size_t i = 0; i < n; ++i) {
                 Bm[i] = s*bp[i]*xp[i];
             }
             break;
         case '+':
-            for (int i = 0; i < n; ++i) {
+            for (size_t i = 0; i < n; ++i) {
                 Bm[i] = s*bp[i]*std::max(xp[i]-h, 0.0f);
             }
             break;
         case '-':
-            for (int i = 0; i < n; ++i) {
+            for (size_t i = 0; i < n; ++i) {
                 Bm[i] = s*bp[i]*std::max(h-xp[i], 0.0f);
             }
             break;
@@ -673,16 +679,16 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
      *  pre-projection norm (matching the prior B.col(_m) /= v.norm()).
      */
     std::vector<double> v(n);
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         v[i] = (double)Bm[i];
     }
 
     double v_raw_norm2 = 0.0;
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         v_raw_norm2 += v[i] * v[i];
     }
     const float v_raw_norm = (float)std::sqrt(v_raw_norm2);
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         Bm[i] /= v_raw_norm;
     }
 
@@ -694,10 +700,10 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
          *  orthonormalize_col left v as the unit residual; store it (f32) into
          *  Bo's new column _m (row-major, stride bo_cols).
          */
-        float    *Bo   = _data->Bo.data();
-        const int ldBo = _data->bo_cols;
-        for (int i = 0; i < n; ++i) {
-            Bo[(size_t)i*ldBo + _m] = (float)v[i];
+        float       *Bo   = _data->Bo.data();
+        const size_t ldBo = _data->bo_cols;
+        for (size_t i = 0; i < n; ++i) {
+            Bo[i*ldBo + _m] = (float)v[i];
         }
 
         /*
@@ -708,8 +714,8 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
          */
         const float *y = _data->y.data();
         double ybo_m = 0.0;
-        for (int i = 0; i < n; ++i) {
-            ybo_m += (double)Bo[(size_t)i*ldBo + _m] * (double)y[i];
+        for (size_t i = 0; i < n; ++i) {
+            ybo_m += (double)Bo[i*ldBo + _m] * (double)y[i];
         }
         double ybo_sq = ybo_m * ybo_m;
         for (double e : _data->ybo) {

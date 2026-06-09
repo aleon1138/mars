@@ -35,9 +35,9 @@ inline __m256d loadu_ps_pd(const float *p)
  */
 
 // tc[k] += scalar * (double)bo_row[k] for k in 0..m.
-inline void axpy_m(double *tc, const float *bo_row, double scalar, int m)
+inline void axpy_m(double *tc, const float *bo_row, double scalar, size_t m)
 {
-    int k = 0;
+    size_t k = 0;
 #if defined(__AVX__)
     __m256d bcast = _mm256_set1_pd(scalar);
     for (; k + 4 <= m; k += 4) {
@@ -53,9 +53,9 @@ inline void axpy_m(double *tc, const float *bo_row, double scalar, int m)
 
 // dot((double)bo_row[:m], tc[:m]).  Bo is f32, tc is f64. Two accumulators
 // break the FMA latency chain (one chain caps at ~1/4 FMA throughput).
-inline double dot_bo(const float *bo_row, const double *tc, int m)
+inline double dot_bo(const float *bo_row, const double *tc, size_t m)
 {
-    int k = 0;
+    size_t k = 0;
 #if defined(__AVX__)
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
@@ -86,9 +86,9 @@ inline double dot_bo(const float *bo_row, const double *tc, int m)
 inline void dot_bo4(const float *bo_row,
                     const double *t0, const double *t1,
                     const double *t2, const double *t3,
-                    int m, double out[4])
+                    size_t m, double out[4])
 {
-    int k = 0;
+    size_t k = 0;
 #if defined(__AVX__)
     __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
     __m256d a2 = _mm256_setzero_pd(), a3 = _mm256_setzero_pd();
@@ -121,9 +121,9 @@ inline void dot_bo4(const float *bo_row,
  *  dot(a[:m], b[:m]) for f64*f64. Used only for the DGKS gate (tc dot tc),
  *  where both operands are the f64 T workspace. Two accumulators as in dot_bo.
  */
-inline double dot_m(const double *a, const double *b, int m)
+inline double dot_m(const double *a, const double *b, size_t m)
 {
-    int k = 0;
+    size_t k = 0;
 #if defined(__AVX__)
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
@@ -152,13 +152,13 @@ inline double dot_m(const double *a, const double *b, int m)
  *  quantity that's actually in memory.
  */
 inline double project_subtract_and_norm(
-    int n, int m,
-    const float *Bo, int ldBo,
+    size_t n, size_t m,
+    const float *Bo, size_t ldBo,
     const double *tc,
     float *bx)
 {
     double s = 0.0;
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         const double v = (double)bx[i] - dot_bo(Bo + i * ldBo, tc, m);
         const float  v_f32 = (float)v;
         bx[i] = v_f32;
@@ -173,13 +173,13 @@ inline double project_subtract_and_norm(
  *  inside axpy_m / at the bx[i] load.
  */
 inline void compute_BoT_bx_col(
-    int n, int m,
-    const float *Bo, int ldBo,
+    size_t n, size_t m,
+    const float *Bo, size_t ldBo,
     const float *bx,
     double *tc)
 {
     std::fill_n(tc, m, 0.0);
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         axpy_m(tc, Bo + i * ldBo, (double)bx[i], m);
     }
 }
@@ -192,18 +192,18 @@ inline void compute_BoT_bx_col(
  *  append). Returns the projected energy sum_j c_j^2 (feeds the DGKS gate).
  */
 inline double mgs_project_col(
-    int n, int m,
+    size_t n, size_t m,
     double *v,
-    const float *Bo, int ldBo)
+    const float *Bo, size_t ldBo)
 {
     double proj_norm2 = 0.0;
-    for (int j = 0; j < m; ++j) {
+    for (size_t j = 0; j < m; ++j) {
         double c = 0.0;
-        for (int i = 0; i < n; ++i) {
-            c += (double)Bo[(size_t)i*ldBo + j] * v[i];
+        for (size_t i = 0; i < n; ++i) {
+            c += (double)Bo[i*ldBo + j] * v[i];
         }
-        for (int i = 0; i < n; ++i) {
-            v[i] -= c * (double)Bo[(size_t)i*ldBo + j];
+        for (size_t i = 0; i < n; ++i) {
+            v[i] -= c * (double)Bo[i*ldBo + j];
         }
         proj_norm2 += c * c;
     }
@@ -212,9 +212,9 @@ inline double mgs_project_col(
 
 } // namespace
 
-double dot_widen(const float *a, const float *b, int n)
+double dot_widen(const float *a, const float *b, size_t n)
 {
-    int i = 0;
+    size_t i = 0;
 #if defined(__AVX__)
     /*
      *  Two accumulators so the two FMAs per iteration are independent; the
@@ -237,9 +237,9 @@ double dot_widen(const float *a, const float *b, int n)
 }
 
 double orthonormalize_col(
-    int n, int m,
+    size_t n, size_t m,
     double       *v,
-    const float  *Bo,   int ldBo,
+    const float  *Bo,   size_t ldBo,
     double tol,
     std::atomic<long> *dgks_counter)
 {
@@ -251,7 +251,7 @@ double orthonormalize_col(
     const double proj_norm2 = mgs_project_col(n, m, v, Bo, ldBo);
 
     double v_norm2 = 0.0;
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         v_norm2 += v[i] * v[i];
     }
 
@@ -266,14 +266,14 @@ double orthonormalize_col(
         }
         mgs_project_col(n, m, v, Bo, ldBo);
         v_norm2 = 0.0;
-        for (int i = 0; i < n; ++i) {
+        for (size_t i = 0; i < n; ++i) {
             v_norm2 += v[i] * v[i];
         }
     }
 
     const double w = std::sqrt(v_norm2);
     if (w * w > tol) {
-        for (int i = 0; i < n; ++i) {
+        for (size_t i = 0; i < n; ++i) {
             v[i] /= w;
         }
     }
@@ -281,13 +281,13 @@ double orthonormalize_col(
 }
 
 void orthonormalize(
-    int n, int m, int p,
-    const float  *B,    int ldB,
+    size_t n, size_t m, size_t p,
+    const float  *B,    size_t ldB,
     const float  *x,
     const int    *mask,
-    const float  *Bo,   int ldBo,
-    float        *Bx,   int ldBx,
-    double       *T,    int ldT,
+    const float  *Bo,   size_t ldBo,
+    float        *Bx,   size_t ldBx,
+    double       *T,    size_t ldT,
     double       *s_buf,
     double tol,
     std::atomic<long> *dgks_counter)
@@ -295,10 +295,10 @@ void orthonormalize(
     /*
      *  Bx[i, j] = B[i, mask[j]] * x[i]  -- f32 * f32 stored as f32
      */
-    for (int j = 0; j < p; ++j) {
+    for (size_t j = 0; j < p; ++j) {
         const float *b  = B  + mask[j] * ldB;
         float       *bx = Bx + j       * ldBx;
-        int i = 0;
+        size_t i = 0;
 #if defined(__AVX__)
         for (; i + 8 <= n; i += 8) {
             __m256 b8 = _mm256_loadu_ps(b + i);
@@ -324,12 +324,12 @@ void orthonormalize(
      *  small because `Bo` and `Bx` have good access patterns so the cache/TLB
      *  benefits of packing are muted compared to square GEMMs.
      */
-    for (int j = 0; j < p; ++j) {
+    for (size_t j = 0; j < p; ++j) {
         std::fill_n(T + j * ldT, m, 0.0);
     }
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         const float *bo_row = Bo + i * ldBo;
-        for (int j = 0; j < p; ++j) {
+        for (size_t j = 0; j < p; ++j) {
             axpy_m(T + j * ldT, bo_row, (double)Bx[i + j * ldBx], m);
         }
     }
@@ -346,9 +346,9 @@ void orthonormalize(
      *  that's in memory.
      */
     std::fill_n(s_buf, p, 0.0);
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         const float *bo_row = Bo + i * ldBo;
-        int j = 0;
+        size_t j = 0;
         // Blocks of 4 columns share the bo_row load+widen (see dot_bo4).
         for (; j + 4 <= p; j += 4) {
             double proj[4];
@@ -381,7 +381,7 @@ void orthonormalize(
      *  landed inside span(Bo). The tol check skips columns we'd discard as
      *  degenerate anyway. See DGKS_GATE_RATIO_SQ in kernels.h.
      */
-    for (int j = 0; j < p; ++j) {
+    for (size_t j = 0; j < p; ++j) {
         double *tc = T  + j * ldT;
         float  *bx = Bx + j * ldBx;
         const double t_norm2 = dot_m(tc, tc, m);
@@ -398,11 +398,11 @@ void orthonormalize(
      *  Phase 2c: normalize. f32 multiply; the scale stays f64 only until the
      *  store cast, since the column is already f32-bounded.
      */
-    for (int j = 0; j < p; ++j) {
+    for (size_t j = 0; j < p; ++j) {
         float       *bx    = Bx + j * ldBx;
         const double s     = s_buf[j];
         const float  scale = (s > tol) ? (float)(1.0 / std::sqrt(s + tol)) : 0.0f;
-        int i = 0;
+        size_t i = 0;
 #if defined(__AVX__)
         __m256 s8 = _mm256_set1_ps(scale);
         for (; i + 8 <= n; i += 8) {

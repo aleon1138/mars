@@ -34,10 +34,10 @@ struct cov_t {
     double fy;
 };
 
-void argsort(int32_t *idx, const float *v, int n);
-int nonzero(int *out, const bool *mask, int n);
+void argsort(int32_t *idx, const float *v, size_t n);
+size_t nonzero(int *out, const bool *mask, size_t n);
 cov_t covariates(double *f, double *g, const float *x, const double *y,
-                 double xm, double ym, double k0, float k1, int m);
+                 double xm, double ym, double k0, float k1, size_t m);
 
 
 int argmax(const ArrayXd &x)

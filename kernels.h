@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>  // size_t
 
 namespace mars {
 
@@ -49,13 +50,13 @@ constexpr double DGKS_GATE_RATIO_SQ = 9.0;
  *  numerical cancellation frequency without coupling to a global.
  */
 void orthonormalize(
-    int n, int m, int p,
-    const float  *B,    int ldB,
+    size_t n, size_t m, size_t p,
+    const float  *B,    size_t ldB,
     const float  *x,
     const int    *mask,
-    const float  *Bo,   int ldBo,
-    float        *Bx,   int ldBx,
-    double       *T,    int ldT,
+    const float  *Bo,   size_t ldBo,
+    float        *Bx,   size_t ldBx,
+    double       *T,    size_t ldT,
     double       *s_buf,
     double tol,
     std::atomic<long> *dgks_counter = nullptr);
@@ -88,9 +89,9 @@ void orthonormalize(
  *  dgks_counter (optional): atomically incremented if the DGKS retry fires.
  */
 double orthonormalize_col(
-    int n, int m,
+    size_t n, size_t m,
     double       *v,
-    const float  *Bo,   int ldBo,
+    const float  *Bo,   size_t ldBo,
     double tol,
     std::atomic<long> *dgks_counter = nullptr);
 
@@ -107,6 +108,6 @@ double orthonormalize_col(
  *
  *      a, b : (n) contiguous float
  */
-double dot_widen(const float *a, const float *b, int n);
+double dot_widen(const float *a, const float *b, size_t n);
 
 } // namespace mars

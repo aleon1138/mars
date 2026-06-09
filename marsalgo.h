@@ -1,4 +1,5 @@
 #include <stdexcept>
+#include <cstddef>  // size_t
 
 inline void verify(bool check, const char *msg)
 {
@@ -9,8 +10,8 @@ inline void verify(bool check, const char *msg)
 
 class MarsAlgo {
     struct MarsData *_data = nullptr;
-    int     _m         = 1;  // number of basis found
-    int     _max_terms = 0;  // capacity cap: B/Bo grow up to this many columns
+    size_t  _m         = 1;  // number of basis found
+    size_t  _max_terms = 0;  // capacity cap: B/Bo grow up to this many columns
     double  _yvar      = 0;  // variance of 'y'
     double  _tol       = 0;  // numerical error tolerance
 
@@ -24,7 +25,7 @@ public:
      *
      *  Uniform weights (w=1) recover ordinary least squares.
      */
-    MarsAlgo(const float *x, const float *y, const float *w, int n, int m, int p, int ldx);
+    MarsAlgo(const float *x, const float *y, const float *w, size_t n, size_t m, size_t p, size_t ldx);
     ~MarsAlgo();
 
     int nbasis() const;
