@@ -100,6 +100,20 @@ accumulated in f32). `marsalgo.cc`/`marslib.cc`/`kernels.{h,cc}` are Eigen-free;
 `find_package(Eigen3)` is scoped to the `BUILD_TESTING` block, so a library/wheel
 build doesn't need Eigen. Eigen survives only as the unit-test oracle.
 
+**Performance note (2026-06-09) — REJECTED, do not retry:** We tried narrowing
+the hinge-sweep accumulators `f`/`g` in `covariates_impl()` from f64 to f32
+(f32 8-wide recurrence, reductions still f64) to halve the load/store traffic on
+the bandwidth-bound off-grid path. It corrupts hinge-cut selection and must not
+be done. The per-cut score is `sse = uw² / den` with `den = (k0+k1) − o.ff`, a
+cancellation: once `f` is f32, `o.ff = Σf[i]²` carries f32-level relative error,
+and at marginal/extreme cuts where `den` is small that error is amplified into
+spurious ΔSSE peaks that win the argmax → wrong knots. Keeping the reductions in
+f64 does **not** save it — `f` itself being f32 is the source. On the x86/AVX
+server the chosen-cut ΔSSE was off ~53% (2.36e-4 vs 1.54e-4 oracle) and `MinSpan`
+localized a planted knot at −0.96 instead of 0.25. (The macOS *scalar* path
+masked this — it stayed under the 1e-5 scalar `HINGE_DSSE_TOL`; only the AVX
+server at 1e-6 exposed it, so validate numerics on the server.) `f`/`g` stay f64.
+
 **Data requirements:** `X` must be `float32`, **column-major** (Fortran order).
 `y` and `w` must be `float32` column-major 1D arrays. The bindings assert these
 layouts explicitly.
