@@ -5,7 +5,6 @@
 #include <random>
 #include <thread>
 #include <cmath>
-constexpr double EPS = 1e-14;
 
 /*
  *  Hinge-sweep delta-SSE goes through covariates_impl(). With AVX the f/g
