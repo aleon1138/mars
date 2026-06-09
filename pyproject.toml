@@ -18,7 +18,7 @@ license         = "MIT"
 Source = "https://github.com/aleon1138/mars"
 
 [tool.scikit-build]
-minimum-version = "0.10"
+minimum-version = "0.11"
 cmake.version   = ">=3.18"
 build.verbose   = true
 wheel.packages  = []   # no packages — mars.py and marslib are installed via CMake
