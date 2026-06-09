@@ -56,9 +56,11 @@ pairs to evaluate (Fast-MARS cache).
 on top of `marslib`. Uses `numba` for `expand()`. Key public API:
 - `fit(X, y, ...)` → structured numpy array `model` of basis nodes
 - `expand(X, model)` → basis matrix `B` for a new dataset
-- `prune(B, y, ...)` → backward pass / GCV pruning (returns a coefficient vector)
-- `compact(model, beta)` → drop pruned nodes, remap parent pointers
-- `pprint(model, beta)` → human-readable model formula
+- `prune(B, y, ...)` → backward pass / GCV pruning (returns a coefficient vector,
+  typically stored back as `model["beta"] = prune(...)`)
+- `compact(model)` → drop pruned nodes (those with `model["beta"] == 0`), remap
+  parent pointers; reads/writes the coefficient via the model's `beta` field
+- `pprint(model)` → human-readable model formula (coefficients from `model["beta"]`)
 
 **Performance note (2026-04-12):** We benchmarked replacing the hand-written AVX
 intrinsics in `covariates()` with `#pragma omp simd`. The pragma version was ~22%
@@ -124,6 +126,7 @@ type   S1   — b'i' intercept, b'l' linear, b'+'/b'-' hinges
 basis  i4   — index of parent basis node
 input  i4   — column index into X
 hinge  f8   — hinge cut point (NaN for linear/intercept)
+beta   f4   — fitted coefficient; NaN until prune() fills it in
 r2     f4
 r2_cv  f4   — GCV-adjusted R²
 order  i4   — polynomial degree

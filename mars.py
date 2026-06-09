@@ -159,6 +159,7 @@ def fit(X, y, w=None, **kwargs):
             basis  i4  -- index of parent basis row
             input  i4  -- column index into X
             hinge  f8  -- hinge cut point (NaN for linear/intercept)
+            beta   f4  -- fitted coefficient; NaN until prune() fills it in
             r2     f4  -- in-sample R² when this row was added
             r2_cv  f4  -- GCV-adjusted R² (out-of-sample estimate)
             order  i4  -- polynomial degree
@@ -249,13 +250,14 @@ def fit(X, y, w=None, **kwargs):
             ("basis", "i4"),
             ("input", "i4"),
             ("hinge", "f8"),
+            ("beta",  "f4"),
             ("r2",    "f4"),
             ("r2_cv", "f4"),
             ("order", "i4"),
             ("time",  "f4"),
         ],
     )
-    model[0] = ("i", 0, 0, np.nan, 0, 0, 0, 0)  # add the intercept
+    model[0] = ("i", 0, 0, np.nan, np.nan, 0, 0, 0, 0)  # add the intercept
     # fmt: on
 
     _dump_header(logger)
@@ -352,6 +354,7 @@ def fit(X, y, w=None, **kwargs):
                     bcol,                               # basis
                     xcol,                               # input
                     hcut,                               # hinge
+                    np.nan,                             # beta (NaN until prune fills it)
                     1.0 - mse / var_y,                  # r2
                     1.0 - gcv_adj(mse, m + 1) / var_y,  # r2_cv
                     len(basis[-1]),                     # order
@@ -667,32 +670,27 @@ def prune(B, y, w=None, n_true=None, penalty=3, ridge=0, mask=None):
 # -----------------------------------------------------------------------------
 
 
-def compact(model, beta):
+def compact(model):
     """
-    Remove pruned basis nodes and return a smaller model and beta.
+    Remove pruned basis nodes and return a smaller model.
 
-    Nodes with non-zero beta are kept, along with any ancestors required to
-    maintain parent-child relationships. Ancestors added back purely for
-    structural reasons get a beta of zero.
+    Nodes with a non-zero `beta` (the fitted coefficient stored on the model,
+    typically filled in by `prune()`) are kept, along with any ancestors
+    required to maintain parent-child relationships. Ancestors added back purely
+    for structural reasons keep their `beta` of zero.
 
     Parameters
     ----------
     model : structured array
-        Model array as returned by `fit()`.
-
-    beta : array (M,)
-        Coefficient vector as returned by `prune()`.
+        Model array as returned by `fit()`, with `model["beta"]` populated
+        (e.g. `model["beta"] = prune(expand(X, model), y)`).
 
     Returns
     -------
     model : structured array
-        Compacted model with pruned nodes removed.
-
-    beta : array
-        Corresponding coefficient vector.
+        Compacted model with pruned nodes removed and parent pointers remapped.
     """
-    beta = np.asarray(beta)
-    keep = beta != 0
+    keep = model["beta"] != 0
 
     # Parents always have a lower index than their children, so one reverse
     # sweep propagates the ancestor flag all the way up the chain.
@@ -705,9 +703,8 @@ def compact(model, beta):
     new_idx[keep] = np.arange(keep.sum())
 
     new_model = model[keep].copy()
-    new_beta = beta[keep].copy()
     new_model["basis"] = new_idx[new_model["basis"]]
-    return new_model, new_beta
+    return new_model
 
 
 # -----------------------------------------------------------------------------
@@ -716,7 +713,12 @@ def compact(model, beta):
 def pprint(model, beta=None, labels=None):
     """
     Pretty-print the model. Useful for debugging.
+
+    Coefficients are taken from `model["beta"]` by default; pass `beta` to
+    override with an explicit coefficient vector.
     """
+    if beta is None:
+        beta = model["beta"]
 
     def xcol(i):
         if labels is not None:

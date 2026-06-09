@@ -95,12 +95,12 @@ y = np.array(y, dtype='f')
 # Fit the model
 import mars
 model = mars.fit(X, y, max_terms=17, tail_span=0, linear_only=True)
-B     = mars.expand(X, model) # expand the basis
-beta  = np.linalg.lstsq(B, y, rcond=None)[0]
-y_hat = B @ beta
+B     = mars.expand(X, model)                         # expand the basis
+model["beta"] = np.linalg.lstsq(B, y, rcond=None)[0]  # store coefficients on the model
+y_hat = B @ model["beta"]
 
 # Pretty-print the model
-mars.pprint(model, beta)
+mars.pprint(model)
 ```
 
 Depending on the random seed, the result should look similar to this:
