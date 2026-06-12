@@ -61,3 +61,11 @@ def test_bf16_recovers_linear_signal():
 
     # r2 over that prefix tracks to the bf16 storage floor (~few e-3).
     assert abs(float(mf["r2"][:k][-1]) - float(mb["r2"][:k][-1])) < 5e-3
+
+    # No degenerate collapse: with the bf16-aware degeneracy floor, bf16 must
+    # not re-pick an already-present (redundant) column, and must keep searching
+    # past the real signal like f32 instead of stalling out early. (Before the
+    # floor fix, bf16 re-picked a degenerate column and stopped at ~8 terms.)
+    bterms = list(zip(mb["type"], mb["basis"], mb["input"]))
+    assert len(bterms) == len(set(bterms)), "bf16 re-picked a degenerate column"
+    assert len(mb) >= len(mf) - 1, "bf16 collapsed early (degeneracy floor too high?)"

@@ -44,14 +44,15 @@ Ideas and notes for future performance work. Not planned for a specific release.
    `IMarsAlgo` base; runtime `basis_dtype` flag; bf16 gated to `linear_only`.
    Validated: on well-conditioned linear fits bf16 recovers the same real terms
    as f32 (selection order bit-matches while signal dominates), r2 within ~few
-   e-3. **Finding / open item:** the degeneracy gate `w*w > _tol` with
-   `_tol ≈ n·0.02·DBL_EPSILON` is scaled for the f32 floor. bf16's coarse
-   orthogonality (O(eps_bf16) ≈ 4e-3 vs O(eps_f32) ≈ 1e-7) means degenerate
-   columns never get that small, so past the real signal a redundant column
-   passes the gate and the greedy search derails / stops early. Next: a
-   bf16-aware degeneracy floor (~`n·eps_BT²`) and a re-examined
-   `DGKS_GATE_RATIO_SQ`. Then add the AVX2 bf16 widen-load (currently bf16 runs
-   the scalar fallback, so no speedup yet — Phase 1 is a correctness milestone).
+   e-3. **Degeneracy floor (done):** `_tol` is now storage-type-dependent
+   (`degeneracy_tol<BT>()`). f32 keeps its historical value (bit-identical);
+   bf16 floors at the bf16 roundoff energy `~eps_bf16²` (basis-derived columns
+   are ~unit norm, so no n factor). This stops the past-signal derail (bf16 no
+   longer re-picks degenerate columns; searches on like f32). `DGKS_GATE_RATIO_SQ`
+   is a ratio, left unchanged, holds up under bf16. **Still open:** the AVX2
+   bf16 widen-load — bf16 currently runs the scalar fallback, so the bandwidth
+   speedup isn't realized yet (earlier ad-hoc tests suggest a win even on the
+   scalar path; measure on the EPYC server).
 3. **Phase 2 — bf16 on the hinge sweep (`covariates_impl`).** `f`/`g` MUST stay
    f64 (see CLAUDE.md 2026-06-09 REJECTED note). Add the optional `VDPBF16PS`
    path and consider narrowing the sorted-X scratch. Validate cut-selection

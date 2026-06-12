@@ -135,20 +135,28 @@ inner loops are guarded `if constexpr (BT == float)`; **bf16 currently runs the
 scalar fallback** (the SIMD bf16 widen-load is deferred), so bf16 is for
 correctness/conditioning validation now, not yet speed.
 
-**bf16 Phase 1 (2026-06-12) — linear_only only; conditioning finding:** bf16 is
-gated to `linear_only` fits (`eval()` throws otherwise; `mars.fit` raises) — the
-hinge sweep is Phase 2 (`f`/`g` stay f64, see the 2026-06-09 REJECTED note).
-Finding: on a well-conditioned linear fit, bf16 widens to f32 before every
-computation, so it **recovers the same real terms as f32, bit-matching the
-selection order while signal dominates**, with r2 tracking to the bf16 storage
-floor (~few e-3; see `Bf16LinearTracksF32` and `tests/test_bf16.py`). But the
-degeneracy gate `w*w > _tol` with `_tol ≈ n·0.02·DBL_EPSILON` is scaled for the
-*f32* storage floor; bf16's coarse orthogonality (O(eps_bf16) ≈ 4e-3 vs
-O(eps_f32) ≈ 1e-7) means a redundant/degenerate column's residual never gets
-that small, so once the real signal is exhausted a degenerate column passes the
-gate, gets appended, and the greedy search derails / stops early. **Open:** a
-bf16-aware `_tol` (and likely `DGKS_GATE_RATIO_SQ`) — scale the degeneracy floor
-to ~`n·eps_BT²` rather than the fixed f64 constant. See `TODO.md`.
+**bf16 Phase 1 (2026-06-12) — linear_only only:** bf16 is gated to `linear_only`
+fits (`eval()` throws otherwise; `mars.fit` raises) — the hinge sweep is Phase 2
+(`f`/`g` stay f64, see the 2026-06-09 REJECTED note). bf16 widens to f32 before
+every computation, so on a well-conditioned linear fit it **recovers the same
+real terms as f32, bit-matching the selection order while signal dominates**,
+with r2 tracking to the bf16 storage floor (~few e-3; see `Bf16LinearTracksF32`
+and `tests/test_bf16.py`).
+
+The degeneracy floor `_tol` is storage-type-dependent (`degeneracy_tol<BT>()`).
+A column whose post-projection residual *energy* falls below it is treated as
+linearly dependent: `orthonormalize()` zeros it (scale 0 → dsse 0, never picked)
+and `append()` rejects it. The basis-derived columns are **~unit norm** (a
+unit-normalized parent basis × the rms-scaled candidate — the n's cancel), so
+the floor is an absolute fraction of unit energy and does **not** scale with n.
+f32 keeps its historical `n·0.02·DBL_EPSILON` (bit-identical). bf16 floors at the
+bf16 roundoff energy `~eps_bf16²` (with a few-bit margin): a redundant column
+rounded to bf16 keeps ~eps_bf16² residual that is *correlated with y* (it's the
+low bits of a signal-bearing column), so without this floor it scores a spurious
+dsse and the greedy search derails / stops early once real signal is exhausted.
+With the floor, bf16 searches past the signal like f32 (no degenerate re-pick).
+`DGKS_GATE_RATIO_SQ` (a ratio, not an absolute energy) was left unchanged and
+holds up under bf16 in validation.
 
 **Data requirements:** `X` must be `float32`, **column-major** (Fortran order).
 `y` and `w` must be `float32` column-major 1D arrays. The bindings assert these

@@ -8,6 +8,7 @@
 #include <algorithm>        // for std::fill_n, std::max, std::stable_sort
 #include <cstdio>           // for snprintf
 #include <cstddef>          // for size_t
+#include <type_traits>      // for is_same_v
 #ifdef __SSE__
 #   include <immintrin.h>   // for _mm_getcsr
 #endif
@@ -269,10 +270,47 @@ struct Scratch {
     }
 };
 
+/*
+ *  Degeneracy / numerical floor for the basis storage type BT. A candidate
+ *  column whose post-projection residual *energy* (squared norm) falls below
+ *  this is treated as linearly dependent: orthonormalize() zeros it (scale = 0
+ *  -> dsse = 0, so the search never picks it) and append() rejects it.
+ *
+ *  The basis-derived columns are ~unit norm (a unit-normalized parent basis
+ *  times the rms-scaled candidate, the n's cancel), so the floor is an absolute
+ *  fraction of unit energy -- it does NOT scale with n.
+ *
+ *  float: the historical value (n * 0.02 * eps_f64). It is tiny, but the f32
+ *  path never derails on it (an f32-degenerate column scores ~0 dsse on its
+ *  own), and keeping it verbatim makes the f32 path bit-for-bit unchanged.
+ *
+ *  bf16: the storage floor is large enough to matter. A redundant column
+ *  rounded to bf16 keeps ~eps_bf16^2 of residual energy that is *correlated
+ *  with y* (it is the low bits of a signal-bearing column), so without a real
+ *  floor it scores a spurious dsse and the greedy search derails past the real
+ *  signal. Floor at the bf16 roundoff energy (~eps_bf16^2) with a few-bit
+ *  margin: this rejects only columns collinear to within bf16 precision
+ *  (genuinely unresolvable at this storage precision) while a real, independent
+ *  column keeps ~unit residual energy, far above the floor.
+ */
+template <class BT>
+static double degeneracy_tol(size_t n)
+{
+    if constexpr (std::is_same_v<BT, float>) {
+        return (n*0.02)*DBL_EPSILON; // historical f32 value; keep bit-identical
+    }
+    else {
+        constexpr double EPS    = 0x1p-8; // bf16 unit roundoff (7 mantissa bits)
+        constexpr double MARGIN = 16.0;   // a few bits above the rounding floor
+        (void)n;
+        return (EPS*EPS) * MARGIN;
+    }
+}
+
 template <class BT>
 MarsAlgo<BT>::MarsAlgo(const float *x, const float *y, const float *w, size_t n, size_t ncols, size_t max_terms, size_t ldx)
     : _data(new MarsData<BT>(x, n, ncols, ldx, max_terms))
-    , _tol((n*0.02)*DBL_EPSILON) // rough guess
+    , _tol(degeneracy_tol<BT>(n))
 {
     _max_terms = max_terms;
     verify(!std::isfinite(NAN), "NAN check is disabled, recompile without --fast-math");
