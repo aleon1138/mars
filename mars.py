@@ -576,7 +576,7 @@ def _backward_eliminate(XX, XY, YY, mask, penalty, n_true, ridge=0.0):
     return best_mask
 
 
-def prune(B, y, w=None, n_true=None, penalty=3, ridge=0, mask=None):
+def prune(B, y, w=None, n_true=None, penalty=3.0, ridge=0.0, mask=None):
     """
     Solve for the linear coefficients using backward stepwise selection
     (GCV pruning), following Friedman (1991) §3.4.
