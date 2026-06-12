@@ -80,7 +80,7 @@ double slow_mse_w(MatrixXd X, VectorXd y, VectorXd w)
 }
 
 struct Result {
-    Result(MarsAlgo &algo, int xcol, const ArrayXb &mask, bool linear, int min_span = 1)
+    Result(MarsAlgo<float> &algo, int xcol, const ArrayXb &mask, bool linear, int min_span = 1)
     {
         linear_dsse = ArrayXd(mask.rows());
         hinge_dsse  = ArrayXd(mask.rows());
@@ -240,7 +240,7 @@ TEST(MarsTest, DeltaSSE)
 
     ArrayXb mask = ArrayXb::Zero(M);
     mask[0] = true;
-    MarsAlgo algo(X32.data(), y32.data(), w32.data(), X.rows(), X.cols(), X.cols()/2, X.rows());
+    MarsAlgo<float> algo(X32.data(), y32.data(), w32.data(), X.rows(), X.cols(), X.cols()/2, X.rows());
 
     MatrixXd ALL_B_full = MatrixXd::Zero(N,16);
     auto     ALL_B      = ALL_B_full.leftCols(M);
@@ -401,6 +401,50 @@ TEST(MarsTest, DeltaSSE)
 ///////////////////////////////////////////////////////////////////////////////
 
 /*
+ *  bf16 basis storage on the well-conditioned (real-signal) linear path: the
+ *  same sequence of linear appends in MarsAlgo<bf16> tracks MarsAlgo<float> to
+ *  the bf16 storage floor (eps_bf16 ~ 4e-3), while being genuinely lower
+ *  precision (not silently aliasing the f32 path). The degenerate-column
+ *  region -- where bf16's coarse orthogonality breaks the f32-scaled _tol gate
+ *  -- is intentionally avoided here; only real terms are appended.
+ */
+TEST(MarsTest, Bf16LinearTracksF32)
+{
+    srand(1);
+    const int N = 6000;
+    const int M = 8;
+
+    MatrixXd X(MatrixXd::Random(N,M));
+    VectorXd y = (X.col(0)*1.5 - X.col(2)*0.8 + X.col(4)*0.6).matrix();
+    y += 0.05 * VectorXd::Random(N);
+
+    MatrixXf X32 = X.cast<float>();
+    VectorXf y32 = y.cast<float>();
+    ArrayXf  w32 = ArrayXf::Ones(N);
+
+    MarsAlgo<float>      af(X32.data(), y32.data(), w32.data(), N, M, M, N);
+    MarsAlgo<mars::bf16> ab(X32.data(), y32.data(), w32.data(), N, M, M, N);
+
+    const int cols[] = {0, 2, 4};   // the real linear terms (all on the intercept)
+    double max_dmse = 0.0, max_ddsse = 0.0;
+    for (int c : cols) {
+        double mf = af.append('l', c, 0, 0);
+        double mb = ab.append('l', c, 0, 0);
+        ASSERT_GE(mf, 0.0);
+        ASSERT_GE(mb, 0.0);
+        max_dmse  = std::max(max_dmse,  std::abs(mf - mb));
+        max_ddsse = std::max(max_ddsse, std::abs(af.dsse() - ab.dsse()));
+    }
+    // bf16 tracks f32 to the storage floor on well-conditioned linear appends...
+    EXPECT_LT(max_ddsse, 5e-3);
+    EXPECT_LT(max_dmse,  5e-3);
+    // ...but is genuinely lower precision (confirms bf16 is exercised, not aliased to f32).
+    EXPECT_GT(max_ddsse, 0.0);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+/*
  *  Verify that MarsAlgo reproduces the closed-form WLS solution under
  *  non-uniform observation weights. This exercises the sqrt(w) scaling
  *  in the constructor.
@@ -429,7 +473,7 @@ TEST(MarsTest, WeightedLS)
     VectorXf y32 = y.cast<float>();
     ArrayXf  w32 = w.cast<float>();
 
-    MarsAlgo algo(X32.data(), y32.data(), w32.data(), N, M, M, N);
+    MarsAlgo<float> algo(X32.data(), y32.data(), w32.data(), N, M, M, N);
 
     MatrixXd ALL_B(N, 3);
     ALL_B.col(0) = VectorXd::Ones(N);
@@ -474,7 +518,7 @@ TEST(MarsTest, MinSpan)
     VectorXf y32 = y.cast<float>();
     ArrayXf  w32 = ArrayXf::Ones(N);
 
-    MarsAlgo algo(X32.data(), y32.data(), w32.data(), N, M, M*2, N);
+    MarsAlgo<float> algo(X32.data(), y32.data(), w32.data(), N, M, M*2, N);
     ArrayXb  mask = ArrayXb::Ones(1); // just the intercept basis
 
     Result r1 (algo, 0, mask, /*linear_only=*/0, /*min_span=*/1);
@@ -528,7 +572,7 @@ TEST(MarsTest, ConcurrentEval)
     VectorXf y32 = y.cast<float>();
     ArrayXf  w32 = ArrayXf::Ones(N);
 
-    MarsAlgo algo(X32.data(), y32.data(), w32.data(), N, M, /*max_terms=*/40, N);
+    MarsAlgo<float> algo(X32.data(), y32.data(), w32.data(), N, M, /*max_terms=*/40, N);
 
     /* Grow the basis via append(): linears, a mirror hinge pair, an interaction. */
     algo.append('l', 0, 0, 0);

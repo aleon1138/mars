@@ -2,7 +2,7 @@
 
 #include <atomic>
 #include <cstddef>  // size_t
-#include "basis_dtype.h"  // basis_t, widen, narrow
+#include "basis_dtype.h"  // bf16, widen, store
 
 namespace mars {
 
@@ -26,39 +26,41 @@ constexpr double DGKS_GATE_RATIO_SQ = 9.0;
  *      s        = ||Bx[:,j]||^2                            // f64 accumulator over post-store f32
  *      Bx[:,j] *= (s > tol) ? 1/sqrt(s + tol) : 0          // normalize, zero degenerate
  *
- *  Bo and Bx are both stored as f32 to halve the largest buffers; all
- *  arithmetic (projection, dot products, norms) stays in f64 -- Bo and Bx
- *  entries are upcast at the load. The cancellation in (Bx -= Bo*Bo^T*Bx)
- *  is bounded by the DGKS retry, so the rounded f32 storage keeps
- *  O(eps_f32) orthogonality against Bo -- see DGKS_GATE_RATIO_SQ below.
+ *  B/Bo/Bx are stored as `BT` (f32 or bf16) to shrink the largest buffers; all
+ *  arithmetic (projection, dot products, norms) stays in f64 -- entries are
+ *  widened at the load and rounded back on store. The cancellation in
+ *  (Bx -= Bo*Bo^T*Bx) is bounded by the DGKS retry, so the rounded storage keeps
+ *  O(eps_BT) orthogonality against Bo -- see DGKS_GATE_RATIO_SQ below.
  *
  *  Layouts (caller's responsibility):
- *      B     : (n, *) col-major float;  col stride ldB.   Only columns mask[j] are read.
- *      x     : (n)    float
+ *      B     : (n, *) col-major BT;     col stride ldB.   Only columns mask[j] are read.
+ *      x     : (n)    float             (the f32 normalized candidate column)
  *      mask  : (p)    int32, indexes into columns of B
- *      Bo    : (n, m) row-major float;  row stride ldBo
- *      Bx    : (n, p) col-major float;  col stride ldBx       [output]
+ *      Bo    : (n, m) row-major BT;     row stride ldBo
+ *      Bx    : (n, p) col-major BT;     col stride ldBx       [output]
  *      T     : (m, p) col-major double; col stride ldT        [workspace; overwritten]
  *      s_buf : (p)    double                                  [workspace; overwritten]
  *      tol   : tolerance for treating a column as degenerate;
- *              should be ~O(n * eps_f32^2) for the f32 storage floor.
+ *              should be ~O(n * eps_BT^2) for the storage floor.
  *
- *  Uses AVX2 + FMA in the inner loops when available, scalar fallback otherwise.
- *  No heap allocations.
+ *  Uses AVX2 + FMA in the inner loops for the f32 storage path; bf16 uses the
+ *  scalar fallback for now (the SIMD bf16 widen-load comes later). No heap
+ *  allocations.
  *
  *  dgks_counter (optional): if non-null, atomically incremented each time the
  *  DGKS re-orthogonalization branch fires for a column. Lets callers measure
  *  numerical cancellation frequency without coupling to a global.
  */
+template <class BT>
 void orthonormalize(
     size_t n, size_t m, size_t p,
-    const basis_t *B,    size_t ldB,
-    const float   *x,
-    const int     *mask,
-    const basis_t *Bo,   size_t ldBo,
-    basis_t       *Bx,   size_t ldBx,
-    double        *T,    size_t ldT,
-    double        *s_buf,
+    const BT  *B,    size_t ldB,
+    const float *x,
+    const int   *mask,
+    const BT  *Bo,   size_t ldBo,
+    BT        *Bx,   size_t ldBx,
+    double    *T,    size_t ldT,
+    double    *s_buf,
     double tol,
     std::atomic<long> *dgks_counter = nullptr);
 
@@ -89,10 +91,11 @@ void orthonormalize(
  *
  *  dgks_counter (optional): atomically incremented if the DGKS retry fires.
  */
+template <class BT>
 double orthonormalize_col(
     size_t n, size_t m,
-    double        *v,
-    const basis_t *Bo,   size_t ldBo,
+    double   *v,
+    const BT *Bo,   size_t ldBo,
     double tol,
     std::atomic<long> *dgks_counter = nullptr);
 
@@ -114,6 +117,7 @@ double orthonormalize_col(
  *      a : (n) contiguous basis column
  *      b : (n) contiguous f32 target
  */
-double dot_widen(const basis_t *a, const float *b, size_t n);
+template <class BT>
+double dot_widen(const BT *a, const float *b, size_t n);
 
 } // namespace mars

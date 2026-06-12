@@ -4,9 +4,10 @@
  *  outer (leading) strides that genuinely vary between callers.
  */
 #include "kernels.h"
-#include <algorithm>  // fill_n
-#include <cmath>      // sqrt
-#include <cstddef>    // size_t
+#include <algorithm>    // fill_n
+#include <cmath>        // sqrt
+#include <cstddef>      // size_t
+#include <type_traits>  // is_same_v
 #if defined(__AVX__)
 #  include <immintrin.h>
 #endif
@@ -35,15 +36,18 @@ inline __m256d loadu_ps_pd(const float *p)
  */
 
 // tc[k] += scalar * (double)bo_row[k] for k in 0..m.
-inline void axpy_m(double *tc, const basis_t *bo_row, double scalar, size_t m)
+template <class BT>
+inline void axpy_m(double *tc, const BT *bo_row, double scalar, size_t m)
 {
     size_t k = 0;
 #if defined(__AVX__)
-    __m256d bcast = _mm256_set1_pd(scalar);
-    for (; k + 4 <= m; k += 4) {
-        __m256d t  = _mm256_loadu_pd(tc + k);
-        __m256d bo = loadu_ps_pd(bo_row + k);
-        _mm256_storeu_pd(tc + k, _mm256_fmadd_pd(bo, bcast, t));
+    if constexpr (std::is_same_v<BT, float>) {
+        __m256d bcast = _mm256_set1_pd(scalar);
+        for (; k + 4 <= m; k += 4) {
+            __m256d t  = _mm256_loadu_pd(tc + k);
+            __m256d bo = loadu_ps_pd(bo_row + k);
+            _mm256_storeu_pd(tc + k, _mm256_fmadd_pd(bo, bcast, t));
+        }
     }
 #endif
     for (; k < m; ++k) {
@@ -53,23 +57,25 @@ inline void axpy_m(double *tc, const basis_t *bo_row, double scalar, size_t m)
 
 // dot((double)bo_row[:m], tc[:m]).  Bo is f32, tc is f64. Two accumulators
 // break the FMA latency chain (one chain caps at ~1/4 FMA throughput).
-inline double dot_bo(const basis_t *bo_row, const double *tc, size_t m)
+template <class BT>
+inline double dot_bo(const BT *bo_row, const double *tc, size_t m)
 {
     size_t k = 0;
-#if defined(__AVX__)
-    __m256d acc0 = _mm256_setzero_pd();
-    __m256d acc1 = _mm256_setzero_pd();
-    for (; k + 8 <= m; k += 8) {
-        acc0 = _mm256_fmadd_pd(loadu_ps_pd(bo_row + k),     _mm256_loadu_pd(tc + k),     acc0);
-        acc1 = _mm256_fmadd_pd(loadu_ps_pd(bo_row + k + 4), _mm256_loadu_pd(tc + k + 4), acc1);
-    }
-    if (k + 4 <= m) {
-        acc0 = _mm256_fmadd_pd(loadu_ps_pd(bo_row + k), _mm256_loadu_pd(tc + k), acc0);
-        k += 4;
-    }
-    double acc = hsum256_pd(_mm256_add_pd(acc0, acc1));
-#else
     double acc = 0.0;
+#if defined(__AVX__)
+    if constexpr (std::is_same_v<BT, float>) {
+        __m256d acc0 = _mm256_setzero_pd();
+        __m256d acc1 = _mm256_setzero_pd();
+        for (; k + 8 <= m; k += 8) {
+            acc0 = _mm256_fmadd_pd(loadu_ps_pd(bo_row + k),     _mm256_loadu_pd(tc + k),     acc0);
+            acc1 = _mm256_fmadd_pd(loadu_ps_pd(bo_row + k + 4), _mm256_loadu_pd(tc + k + 4), acc1);
+        }
+        if (k + 4 <= m) {
+            acc0 = _mm256_fmadd_pd(loadu_ps_pd(bo_row + k), _mm256_loadu_pd(tc + k), acc0);
+            k += 4;
+        }
+        acc = hsum256_pd(_mm256_add_pd(acc0, acc1));
+    }
 #endif
     for (; k < m; ++k) {
         acc += widen(bo_row[k]) * tc[k];
@@ -83,26 +89,30 @@ inline double dot_bo(const basis_t *bo_row, const double *tc, size_t m)
  *  break the FMA latency chain. Hot in orthonormalize() Phase 2a, where the
  *  same bo_row is projected against every candidate column's T-coefficients.
  */
-inline void dot_bo4(const basis_t *bo_row,
+template <class BT>
+inline void dot_bo4(const BT *bo_row,
                     const double *t0, const double *t1,
                     const double *t2, const double *t3,
                     size_t m, double out[4])
 {
     size_t k = 0;
-#if defined(__AVX__)
-    __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
-    __m256d a2 = _mm256_setzero_pd(), a3 = _mm256_setzero_pd();
-    for (; k + 4 <= m; k += 4) {
-        __m256d bo = loadu_ps_pd(bo_row + k);
-        a0 = _mm256_fmadd_pd(bo, _mm256_loadu_pd(t0 + k), a0);
-        a1 = _mm256_fmadd_pd(bo, _mm256_loadu_pd(t1 + k), a1);
-        a2 = _mm256_fmadd_pd(bo, _mm256_loadu_pd(t2 + k), a2);
-        a3 = _mm256_fmadd_pd(bo, _mm256_loadu_pd(t3 + k), a3);
-    }
-    double s0 = hsum256_pd(a0), s1 = hsum256_pd(a1);
-    double s2 = hsum256_pd(a2), s3 = hsum256_pd(a3);
-#else
     double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+#if defined(__AVX__)
+    if constexpr (std::is_same_v<BT, float>) {
+        __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
+        __m256d a2 = _mm256_setzero_pd(), a3 = _mm256_setzero_pd();
+        for (; k + 4 <= m; k += 4) {
+            __m256d bo = loadu_ps_pd(bo_row + k);
+            a0 = _mm256_fmadd_pd(bo, _mm256_loadu_pd(t0 + k), a0);
+            a1 = _mm256_fmadd_pd(bo, _mm256_loadu_pd(t1 + k), a1);
+            a2 = _mm256_fmadd_pd(bo, _mm256_loadu_pd(t2 + k), a2);
+            a3 = _mm256_fmadd_pd(bo, _mm256_loadu_pd(t3 + k), a3);
+        }
+        s0 = hsum256_pd(a0);
+        s1 = hsum256_pd(a1);
+        s2 = hsum256_pd(a2);
+        s3 = hsum256_pd(a3);
+    }
 #endif
     for (; k < m; ++k) {
         const double bo = widen(bo_row[k]);
@@ -151,16 +161,17 @@ inline double dot_m(const double *a, const double *b, size_t m)
  *  norm, not the pre-round value -- so downstream normalize() uses the same
  *  quantity that's actually in memory.
  */
+template <class BT>
 inline double project_subtract_and_norm(
     size_t n, size_t m,
-    const basis_t *Bo, size_t ldBo,
+    const BT *Bo, size_t ldBo,
     const double *tc,
-    basis_t *bx)
+    BT *bx)
 {
     double s = 0.0;
     for (size_t i = 0; i < n; ++i) {
         const double v = widen(bx[i]) - dot_bo(Bo + i * ldBo, tc, m);
-        bx[i] = narrow(v);
+        store(bx[i], v);
         const double v_back = widen(bx[i]);
         s += v_back * v_back;
     }
@@ -171,10 +182,11 @@ inline double project_subtract_and_norm(
  *  tc = Bo^T * bx (single column). Bo and bx are both f32, upcast to f64
  *  inside axpy_m / at the bx[i] load.
  */
+template <class BT>
 inline void compute_BoT_bx_col(
     size_t n, size_t m,
-    const basis_t *Bo, size_t ldBo,
-    const basis_t *bx,
+    const BT *Bo, size_t ldBo,
+    const BT *bx,
     double *tc)
 {
     std::fill_n(tc, m, 0.0);
@@ -190,10 +202,11 @@ inline void compute_BoT_bx_col(
  *  Bo[i*ldBo + j], so the per-column walk is strided (cold path -- once per
  *  append). Returns the projected energy sum_j c_j^2 (feeds the DGKS gate).
  */
+template <class BT>
 inline double mgs_project_col(
     size_t n, size_t m,
     double *v,
-    const basis_t *Bo, size_t ldBo)
+    const BT *Bo, size_t ldBo)
 {
     double proj_norm2 = 0.0;
     for (size_t j = 0; j < m; ++j) {
@@ -211,23 +224,25 @@ inline double mgs_project_col(
 
 } // namespace
 
-double dot_widen(const basis_t *a, const float *b, size_t n)
+template <class BT>
+double dot_widen(const BT *a, const float *b, size_t n)
 {
     size_t i = 0;
-#if defined(__AVX__)
-    /*
-     *  Two accumulators so the two FMAs per iteration are independent; the
-     *  f32->f64 widening (cvtps_pd) keeps the sum at the eps_f32 input floor.
-     */
-    __m256d acc0 = _mm256_setzero_pd();
-    __m256d acc1 = _mm256_setzero_pd();
-    for (; i + 8 <= n; i += 8) {
-        acc0 = _mm256_fmadd_pd(loadu_ps_pd(a + i),     loadu_ps_pd(b + i),     acc0);
-        acc1 = _mm256_fmadd_pd(loadu_ps_pd(a + i + 4), loadu_ps_pd(b + i + 4), acc1);
-    }
-    double s = hsum256_pd(_mm256_add_pd(acc0, acc1));
-#else
     double s = 0.0;
+#if defined(__AVX__)
+    if constexpr (std::is_same_v<BT, float>) {
+        /*
+         *  Two accumulators so the two FMAs per iteration are independent; the
+         *  f32->f64 widening (cvtps_pd) keeps the sum at the eps_f32 input floor.
+         */
+        __m256d acc0 = _mm256_setzero_pd();
+        __m256d acc1 = _mm256_setzero_pd();
+        for (; i + 8 <= n; i += 8) {
+            acc0 = _mm256_fmadd_pd(loadu_ps_pd(a + i),     loadu_ps_pd(b + i),     acc0);
+            acc1 = _mm256_fmadd_pd(loadu_ps_pd(a + i + 4), loadu_ps_pd(b + i + 4), acc1);
+        }
+        s = hsum256_pd(_mm256_add_pd(acc0, acc1));
+    }
 #endif
     for (; i < n; ++i) {
         s += widen(a[i]) * (double)b[i];
@@ -235,10 +250,11 @@ double dot_widen(const basis_t *a, const float *b, size_t n)
     return s;
 }
 
+template <class BT>
 double orthonormalize_col(
     size_t n, size_t m,
-    double        *v,
-    const basis_t *Bo,   size_t ldBo,
+    double   *v,
+    const BT *Bo,   size_t ldBo,
     double tol,
     std::atomic<long> *dgks_counter)
 {
@@ -279,15 +295,16 @@ double orthonormalize_col(
     return w;
 }
 
+template <class BT>
 void orthonormalize(
     size_t n, size_t m, size_t p,
-    const basis_t *B,    size_t ldB,
-    const float   *x,
-    const int     *mask,
-    const basis_t *Bo,   size_t ldBo,
-    basis_t       *Bx,   size_t ldBx,
-    double        *T,    size_t ldT,
-    double        *s_buf,
+    const BT  *B,    size_t ldB,
+    const float *x,
+    const int   *mask,
+    const BT  *Bo,   size_t ldBo,
+    BT        *Bx,   size_t ldBx,
+    double    *T,    size_t ldT,
+    double    *s_buf,
     double tol,
     std::atomic<long> *dgks_counter)
 {
@@ -295,18 +312,20 @@ void orthonormalize(
      *  Bx[i, j] = B[i, mask[j]] * x[i]  -- basis * f32 candidate, stored as basis
      */
     for (size_t j = 0; j < p; ++j) {
-        const basis_t *b  = B  + mask[j] * ldB;
-        basis_t       *bx = Bx + j       * ldBx;
+        const BT *b  = B  + mask[j] * ldB;
+        BT       *bx = Bx + j       * ldBx;
         size_t i = 0;
 #if defined(__AVX__)
-        for (; i + 8 <= n; i += 8) {
-            __m256 b8 = _mm256_loadu_ps(b + i);
-            __m256 x8 = _mm256_loadu_ps(x + i);
-            _mm256_storeu_ps(bx + i, _mm256_mul_ps(b8, x8));
+        if constexpr (std::is_same_v<BT, float>) {
+            for (; i + 8 <= n; i += 8) {
+                __m256 b8 = _mm256_loadu_ps(b + i);
+                __m256 x8 = _mm256_loadu_ps(x + i);
+                _mm256_storeu_ps(bx + i, _mm256_mul_ps(b8, x8));
+            }
         }
 #endif
         for (; i < n; ++i) {
-            bx[i] = narrow(widen(b[i]) * x[i]);
+            store(bx[i], widen(b[i]) * x[i]);
         }
     }
 
@@ -327,7 +346,7 @@ void orthonormalize(
         std::fill_n(T + j * ldT, m, 0.0);
     }
     for (size_t i = 0; i < n; ++i) {
-        const basis_t *bo_row = Bo + i * ldBo;
+        const BT *bo_row = Bo + i * ldBo;
         for (size_t j = 0; j < p; ++j) {
             axpy_m(T + j * ldT, bo_row, widen(Bx[i + j * ldBx]), m);
         }
@@ -346,7 +365,7 @@ void orthonormalize(
      */
     std::fill_n(s_buf, p, 0.0);
     for (size_t i = 0; i < n; ++i) {
-        const basis_t *bo_row = Bo + i * ldBo;
+        const BT *bo_row = Bo + i * ldBo;
         size_t j = 0;
         // Blocks of 4 columns share the bo_row load+widen (see dot_bo4).
         for (; j + 4 <= p; j += 4) {
@@ -356,18 +375,18 @@ void orthonormalize(
                     T + (j + 2) * ldT, T + (j + 3) * ldT,
                     m, proj);
             for (int c = 0; c < 4; ++c) {
-                basis_t      *bx    = Bx + (j + c) * ldBx;
+                BT           *bx    = Bx + (j + c) * ldBx;
                 const double  v     = widen(bx[i]) - proj[c];
-                bx[i]    = narrow(v);
+                store(bx[i], v);
                 const double v_back = widen(bx[i]);
                 s_buf[j + c] += v_back * v_back;
             }
         }
         for (; j < p; ++j) {
             const double *tc    = T  + j * ldT;
-            basis_t      *bx    = Bx + j * ldBx;
+            BT           *bx    = Bx + j * ldBx;
             const double  v     = widen(bx[i]) - dot_bo(bo_row, tc, m);
-            bx[i]    = narrow(v);
+            store(bx[i], v);
             const double v_back = widen(bx[i]);
             s_buf[j] += v_back * v_back;
         }
@@ -379,8 +398,8 @@ void orthonormalize(
      *  degenerate anyway. See DGKS_GATE_RATIO_SQ in kernels.h.
      */
     for (size_t j = 0; j < p; ++j) {
-        double  *tc = T  + j * ldT;
-        basis_t *bx = Bx + j * ldBx;
+        double *tc = T  + j * ldT;
+        BT     *bx = Bx + j * ldBx;
         const double t_norm2 = dot_m(tc, tc, m);
         if (s_buf[j] > tol && s_buf[j] * DGKS_GATE_RATIO_SQ < t_norm2) {
             if (dgks_counter) {
@@ -396,21 +415,46 @@ void orthonormalize(
      *  store cast, since the column is already f32-bounded.
      */
     for (size_t j = 0; j < p; ++j) {
-        basis_t     *bx    = Bx + j * ldBx;
+        BT          *bx    = Bx + j * ldBx;
         const double s     = s_buf[j];
         const float  scale = (s > tol) ? (float)(1.0 / std::sqrt(s + tol)) : 0.0f;
         size_t i = 0;
 #if defined(__AVX__)
-        __m256 s8 = _mm256_set1_ps(scale);
-        for (; i + 8 <= n; i += 8) {
-            __m256 bx8 = _mm256_loadu_ps(bx + i);
-            _mm256_storeu_ps(bx + i, _mm256_mul_ps(bx8, s8));
+        if constexpr (std::is_same_v<BT, float>) {
+            __m256 s8 = _mm256_set1_ps(scale);
+            for (; i + 8 <= n; i += 8) {
+                __m256 bx8 = _mm256_loadu_ps(bx + i);
+                _mm256_storeu_ps(bx + i, _mm256_mul_ps(bx8, s8));
+            }
         }
 #endif
         for (; i < n; ++i) {
-            bx[i] = narrow(widen(bx[i]) * scale);
+            store(bx[i], widen(bx[i]) * scale);
         }
     }
 }
+
+/*
+ *  Explicit instantiations for the supported basis storage types. The f32 path
+ *  keeps the AVX2 kernels; the bf16 path runs scalar for now (see the
+ *  if constexpr guards above). Adding a type here is all it takes to support a
+ *  new basis storage precision.
+ */
+template void orthonormalize<float>(
+    size_t, size_t, size_t, const float*, size_t, const float*, const int*,
+    const float*, size_t, float*, size_t, double*, size_t, double*, double,
+    std::atomic<long>*);
+template void orthonormalize<bf16>(
+    size_t, size_t, size_t, const bf16*, size_t, const float*, const int*,
+    const bf16*, size_t, bf16*, size_t, double*, size_t, double*, double,
+    std::atomic<long>*);
+
+template double orthonormalize_col<float>(
+    size_t, size_t, double*, const float*, size_t, double, std::atomic<long>*);
+template double orthonormalize_col<bf16>(
+    size_t, size_t, double*, const bf16*, size_t, double, std::atomic<long>*);
+
+template double dot_widen<float>(const float*, const float*, size_t);
+template double dot_widen<bf16>(const bf16*, const float*, size_t);
 
 } // namespace mars

@@ -116,25 +116,39 @@ localized a planted knot at −0.96 instead of 0.25. (The macOS *scalar* path
 masked this — it stayed under the 1e-5 scalar `HINGE_DSSE_TOL`; only the AVX
 server at 1e-6 exposed it, so validate numerics on the server.) `f`/`g` stay f64.
 
-**Architecture note (2026-06-12):** Introduced a precision-conversion *seam*
-(`basis_dtype.h`) to pave the way for storing the basis matrices `B`/`Bo`/`Bx` in
-bf16 (halving the load volume of the bandwidth-bound forward pass). `basis_dtype.h`
-defines `using basis_t = float` plus `widen(basis_t)->float` (decode to working
-precision) and `narrow(double)->basis_t` (round to storage). `B`/`Bo`/`Bx` and the
-kernels that touch them (`orthonormalize*`, `dot_widen`, `covariates_impl`, the
-internal `kernels.cc` helpers) are typed on `basis_t`, and every read of a stored
-basis element goes through `widen()`, every store through `narrow()`. For
-`basis_t == float` both are the identity (float↔double round-trips are exact and
-the optimizer elides them), so this is a bit-for-bit no-op (validated against the
-unittest/pytest suite and before/after `fit` snapshots). The AVX inner loops still
-operate on `float` — only the scalar paths were routed through the seam this round;
-the SIMD bf16 load/store helpers come with the bf16 build. **Scope:** bf16 is for
-the *internal basis matrices only* — the public X/y/w API stays f32 (the hot loops
-never read X in the inner loop). The bf16 build flips `basis_t` to a template
-parameter, instantiates the kernels for {float, bf16}, and selects precision via a
-runtime flag; staged linear_only-first (validate orthonormalize conditioning under
-eps_bf16) then the hinge sweep (`f`/`g` stay f64 — see the 2026-06-09 REJECTED
-note). See `TODO.md` for the full plan.
+**Architecture note (2026-06-12):** The basis matrices `B`/`Bo`/`Bx` can be
+stored in bf16 (half the bytes, to cut the load volume of the bandwidth-bound
+forward pass) via a precision-conversion *seam* in `basis_dtype.h`:
+`widen(BT)->float` (decode a stored element to working precision) and
+`store(BT&, double)` (encode a working value; round-to-nearest-even for bf16).
+`MarsAlgo<BT>` (and the kernels `orthonormalize*`/`dot_widen`/`covariates_impl`
+plus the internal `kernels.cc` helpers) are templated on the storage type
+`BT ∈ {float, bf16}`; every read of a stored basis element goes through
+`widen()`, every store through `store()`. The pybind layer holds the dtype-erased
+base `IMarsAlgo`; `make_mars_algo()` (and `mars.fit(..., basis_dtype="bf16")`)
+pick the instantiation at runtime — the default is `f32`. **Scope:** bf16 is for
+the *internal basis matrices only*; the public X/y/w API stays f32 (the hot loops
+never read X in the inner loop). For `BT == float` `widen`/`store` are the
+identity and the AVX2 kernels run unchanged, so the f32 path is a bit-for-bit
+no-op (validated against the suite + before/after `fit` snapshots). The AVX2
+inner loops are guarded `if constexpr (BT == float)`; **bf16 currently runs the
+scalar fallback** (the SIMD bf16 widen-load is deferred), so bf16 is for
+correctness/conditioning validation now, not yet speed.
+
+**bf16 Phase 1 (2026-06-12) — linear_only only; conditioning finding:** bf16 is
+gated to `linear_only` fits (`eval()` throws otherwise; `mars.fit` raises) — the
+hinge sweep is Phase 2 (`f`/`g` stay f64, see the 2026-06-09 REJECTED note).
+Finding: on a well-conditioned linear fit, bf16 widens to f32 before every
+computation, so it **recovers the same real terms as f32, bit-matching the
+selection order while signal dominates**, with r2 tracking to the bf16 storage
+floor (~few e-3; see `Bf16LinearTracksF32` and `tests/test_bf16.py`). But the
+degeneracy gate `w*w > _tol` with `_tol ≈ n·0.02·DBL_EPSILON` is scaled for the
+*f32* storage floor; bf16's coarse orthogonality (O(eps_bf16) ≈ 4e-3 vs
+O(eps_f32) ≈ 1e-7) means a redundant/degenerate column's residual never gets
+that small, so once the real signal is exhausted a degenerate column passes the
+gate, gets appended, and the greedy search derails / stops early. **Open:** a
+bf16-aware `_tol` (and likely `DGKS_GATE_RATIO_SQ`) — scale the degeneracy floor
+to ~`n·eps_BT²` rather than the fixed f64 constant. See `TODO.md`.
 
 **Data requirements:** `X` must be `float32`, **column-major** (Fortran order).
 `y` and `w` must be `float32` column-major 1D arrays. The bindings assert these

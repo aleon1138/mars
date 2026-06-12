@@ -1,5 +1,6 @@
 #include <stdexcept>
 #include <cstddef>  // size_t
+#include "basis_dtype.h"  // bf16 (basis storage element types)
 
 inline void verify(bool check, const char *msg)
 {
@@ -8,8 +9,44 @@ inline void verify(bool check, const char *msg)
     }
 }
 
-class MarsAlgo {
-    struct MarsData *_data = nullptr;
+/*
+ *  Runtime selector for the precision the basis matrices B/Bo/Bx are stored in.
+ *  f32 is full precision (the default); bf16 halves the basis-buffer footprint
+ *  to cut the load volume of the bandwidth-bound forward pass. The choice is a
+ *  runtime flag rather than the input dtype -- X/y/w stay f32.
+ */
+enum class BasisDType { f32, bf16 };
+
+/*
+ *  Dtype-erased interface to the algorithm. The concrete implementation is a
+ *  template on the basis storage type (MarsAlgo<BT> below); this base lets the
+ *  pybind layer -- and any caller that doesn't care about the storage precision
+ *  -- hold a single type. Build one with make_mars_algo().
+ */
+class IMarsAlgo {
+public:
+    virtual ~IMarsAlgo() {}
+    virtual int nbasis() const = 0;
+    virtual int nrows() const = 0;
+    virtual double dsse() const = 0;
+    virtual double yvar() const = 0;
+    virtual void eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
+                      int xcol, const bool *bmask, int min_span, int end_span, bool linear_only) = 0;
+    virtual double append(char type, int xcol, int bcol, float h) = 0;
+};
+
+// Per-instantiation state; defined in marsalgo.cc.
+template <class BT> struct MarsData;
+
+/*
+ *  MARS forward-pass engine over training data (x, y) with per-row weights w.
+ *  The template parameter BT is the storage type of the basis matrices B/Bo/Bx
+ *  (float or bf16); all arithmetic stays f32/f64 regardless. X/y/w are always
+ *  f32. Instantiated for {float, bf16} in marsalgo.cc.
+ */
+template <class BT>
+class MarsAlgo : public IMarsAlgo {
+    MarsData<BT> *_data = nullptr;
     size_t  _m         = 1;  // number of basis found
     size_t  _max_terms = 0;  // capacity cap: B/Bo grow up to this many columns
     double  _yvar      = 0;  // variance of 'y'
@@ -26,12 +63,12 @@ public:
      *  Uniform weights (w=1) recover ordinary least squares.
      */
     MarsAlgo(const float *x, const float *y, const float *w, size_t n, size_t ncols, size_t max_terms, size_t ldx);
-    ~MarsAlgo();
+    ~MarsAlgo() override;
 
-    int nbasis() const;
-    int nrows() const;
-    double dsse() const;
-    double yvar() const;
+    int nbasis() const override;
+    int nrows() const override;
+    double dsse() const override;
+    double yvar() const override;
 
     /*
      *  Returns the delta SSE (sum of squared errors) given the existing basis
@@ -66,9 +103,10 @@ public:
      *  linear_only : bool
      *      do not attempt to find any hinge cuts, only build a linear model.
      *      This will ignore the output values of `hinge_dsse` and `hinge_cuts`.
+     *      Required when BT == bf16 (the hinge sweep is not yet bf16-validated).
      */
     void eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
-              int xcol, const bool *bmask, int min_span, int end_span, bool linear_only);
+              int xcol, const bool *bmask, int min_span, int end_span, bool linear_only) override;
 
     /*
      *  Append a new basis function and update the orthonormalized state.
@@ -87,5 +125,13 @@ public:
      *  h : float
      *      hinge cut point (ignored for linear basis).
      */
-    double append(char type, int xcol, int bcol, float h);
+    double append(char type, int xcol, int bcol, float h) override;
 };
+
+/*
+ *  Build a MarsAlgo with the requested basis storage precision, returned as the
+ *  dtype-erased IMarsAlgo. Arguments mirror the MarsAlgo constructor.
+ */
+IMarsAlgo *make_mars_algo(BasisDType dtype,
+                          const float *x, const float *y, const float *w,
+                          size_t n, size_t ncols, size_t max_terms, size_t ldx);

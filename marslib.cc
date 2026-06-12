@@ -1,16 +1,29 @@
 #include "marsalgo.h"
 #include <omp.h>
+#include <string>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 namespace py = pybind11;
 
 ///////////////////////////////////////////////////////////////////////////////
 
-MarsAlgo * new_algo(
+static BasisDType parse_basis_dtype(const std::string &s)
+{
+    if (s == "f32" || s == "float32") {
+        return BasisDType::f32;
+    }
+    if (s == "bf16" || s == "bfloat16") {
+        return BasisDType::bf16;
+    }
+    throw std::runtime_error("basis_dtype must be 'f32' or 'bf16'");
+}
+
+IMarsAlgo * new_algo(
     py::array_t<float> X_array,
     py::array_t<float> y_array,
     py::array_t<float> w_array,
-    int max_terms)
+    int max_terms,
+    const std::string &basis_dtype)
 {
     py::buffer_info X = X_array.request();
     py::buffer_info y = y_array.request();
@@ -26,16 +39,17 @@ MarsAlgo * new_algo(
     verify(X.shape[0] == w.shape[0], "invalid dimension for w");
 
     ssize_t outer_stride = X.strides[1] / sizeof(float);
-    return new MarsAlgo(static_cast<const float*>(X.ptr),
-                        static_cast<const float*>(y.ptr),
-                        static_cast<const float*>(w.ptr),
-                        X.shape[0], X.shape[1],
-                        max_terms, outer_stride);
+    return make_mars_algo(parse_basis_dtype(basis_dtype),
+                          static_cast<const float*>(X.ptr),
+                          static_cast<const float*>(y.ptr),
+                          static_cast<const float*>(w.ptr),
+                          X.shape[0], X.shape[1],
+                          max_terms, outer_stride);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
-py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
+py::tuple eval(IMarsAlgo &algo, py::array_t<bool> mask_array,
                int min_span, int endspan, bool linear, int threads)
 {
     py::buffer_info mask_info = mask_array.request();
@@ -115,12 +129,13 @@ PYBIND11_MODULE(marslib, m)
     m.doc() = "Multivariate Adaptive Regression Splines";
     m.attr("__version__") = "0.11";
 
-    py::class_<MarsAlgo>(m, "MarsAlgo")
+    py::class_<IMarsAlgo>(m, "MarsAlgo")
     .def(py::init(&new_algo)
          , py::arg("X").noconvert()
          , py::arg("y").noconvert()
          , py::arg("w").noconvert()
          , py::arg("max_terms")
+         , py::arg("basis_dtype") = "f32"
          , py::keep_alive<1, 2>()   // keep `X` in scope
         )
     .def("eval",&eval
@@ -130,8 +145,8 @@ PYBIND11_MODULE(marslib, m)
          , py::arg("linear_only")
          , py::arg("threads")
         )
-    .def("nbasis",       &MarsAlgo::nbasis)
-    .def("yvar",         &MarsAlgo::yvar)
-    .def("append",       &MarsAlgo::append)
+    .def("nbasis",       &IMarsAlgo::nbasis)
+    .def("yvar",         &IMarsAlgo::yvar)
+    .def("append",       &IMarsAlgo::append)
     ;
 }

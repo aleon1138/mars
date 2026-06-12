@@ -1,6 +1,6 @@
 #include "marsalgo.h"
 #include "kernels.h"
-#include "basis_dtype.h"    // basis_t, widen, narrow
+#include "basis_dtype.h"    // bf16, widen, store
 #include <numeric>          // for std::iota
 #include <cfloat>           // for DBL_EPSILON
 #include <cmath>            // for std::sqrt, std::isfinite
@@ -12,9 +12,9 @@
 #   include <immintrin.h>   // for _mm_getcsr
 #endif
 
-using mars::basis_t;
+using mars::bf16;
 using mars::widen;
-using mars::narrow;
+using mars::store;
 
 /*
  *  Fused Multiply-Add (FMA) incurs only half the error of computing them
@@ -90,8 +90,8 @@ struct cov_t {
  *  k1 : float
  *      basis value at the current sorted position: `B[k[i], bcol]`.
  */
-template <bool need_sse>
-cov_t covariates_impl(double *f, double *g, const basis_t *x, const double *y,
+template <bool need_sse, class BT>
+cov_t covariates_impl(double *f, double *g, const BT *x, const double *y,
                       double xm, double ym, double k0, float k1, size_t m)
 {
     /*
@@ -102,36 +102,37 @@ cov_t covariates_impl(double *f, double *g, const basis_t *x, const double *y,
      */
     cov_t o = {0,0};
 
-#ifndef __AVX__
     size_t m0 = 0;
-#else
-    __m256d K0 = _mm256_set1_pd(k0);
-    __m256d K1 = _mm256_set1_pd(k1);
-    __m256d S0 = _mm256_setzero_pd();
-    __m256d S1 = _mm256_setzero_pd();
+#if defined(__AVX__)
+    if constexpr (std::is_same_v<BT, float>) {
+        __m256d K0 = _mm256_set1_pd(k0);
+        __m256d K1 = _mm256_set1_pd(k1);
+        __m256d S0 = _mm256_setzero_pd();
+        __m256d S1 = _mm256_setzero_pd();
 
-    size_t m0 = m - m%4;
-    for (size_t i = 0; i < m0; i+=4) {
-        __m256d f0 = _mm256_loadu_pd(f+i);
-        __m256d g0 = _mm256_loadu_pd(g+i);
-        __m256d x0 = _mm256_cvtps_pd(_mm_loadu_ps(x+i));
+        m0 = m - m%4;
+        for (size_t i = 0; i < m0; i+=4) {
+            __m256d f0 = _mm256_loadu_pd(f+i);
+            __m256d g0 = _mm256_loadu_pd(g+i);
+            __m256d x0 = _mm256_cvtps_pd(_mm_loadu_ps(x+i));
 
-        f0 = _mm256_fmadd_pd(K0,g0,f0);
-        g0 = _mm256_fmadd_pd(K1,x0,g0);
+            f0 = _mm256_fmadd_pd(K0,g0,f0);
+            g0 = _mm256_fmadd_pd(K1,x0,g0);
 
-        if constexpr (need_sse) {
-            __m256d y0 = _mm256_loadu_pd(y+i);
-            S0 = _mm256_fmadd_pd(f0,f0,S0);
-            S1 = _mm256_fmadd_pd(f0,y0,S1);
+            if constexpr (need_sse) {
+                __m256d y0 = _mm256_loadu_pd(y+i);
+                S0 = _mm256_fmadd_pd(f0,f0,S0);
+                S1 = _mm256_fmadd_pd(f0,y0,S1);
+            }
+
+            _mm256_storeu_pd(f+i, f0);
+            _mm256_storeu_pd(g+i, g0);
         }
 
-        _mm256_storeu_pd(f+i, f0);
-        _mm256_storeu_pd(g+i, g0);
-    }
-
-    if constexpr (need_sse) {
-        o.ff = (S0[0]+S0[1])+(S0[2]+S0[3]);
-        o.fy = (S1[0]+S1[1])+(S1[2]+S1[3]);
+        if constexpr (need_sse) {
+            o.ff = (S0[0]+S0[1])+(S0[2]+S0[3]);
+            o.fy = (S1[0]+S1[1])+(S1[2]+S1[3]);
+        }
     }
 #endif
 
@@ -154,13 +155,13 @@ cov_t covariates_impl(double *f, double *g, const basis_t *x, const double *y,
 
 /*
  *  Non-template wrapper preserving the original symbol used by the unit test
- *  link. Internal callers should use `covariates_impl<...>` directly so the
- *  SSE-reduction path can be elided.
+ *  link (f32 path). Internal callers should use `covariates_impl<...>` directly
+ *  so the SSE-reduction path can be elided.
  */
-cov_t covariates(double *f, double *g, const basis_t *x, const double *y,
+cov_t covariates(double *f, double *g, const float *x, const double *y,
                  double xm, double ym, double k0, float k1, size_t m)
 {
-    return covariates_impl<true>(f, g, x, y, xm, ym, k0, k1, m);
+    return covariates_impl<true, float>(f, g, x, y, xm, ym, k0, k1, m);
 }
 
 /*
@@ -173,33 +174,35 @@ cov_t covariates(double *f, double *g, const basis_t *x, const double *y,
  *  without a cast. Cold path: with geometric stride growth this runs
  *  O(log max_terms) times across a fit, not once per append.
  */
-void restride_rows(basis_t *X, size_t n, size_t old_stride, size_t new_stride)
+template <class BT>
+void restride_rows(BT *X, size_t n, size_t old_stride, size_t new_stride)
 {
     for (size_t i = n; i-- > 0; ) {
-        const basis_t *src = X + i * old_stride;
-        basis_t       *dst = X + i * new_stride;
+        const BT *src = X + i * old_stride;
+        BT       *dst = X + i * new_stride;
         for (size_t j = old_stride; j-- > 0; ) {
             dst[j] = src[j];
         }
     }
 }
 
+template <class BT>
 struct MarsData {
     MarsData(const float *x, size_t n, size_t ncols, size_t ldx, size_t max_terms)
         : n(n), p(ncols), ldX(ldx), X(x)
-        , B (n*max_terms, 0.0f)
-        , Bo(n*max_terms, 0.0f) {}
+        , B (n*max_terms)       // value-initialized to BT zero (0.0f / bf16{0})
+        , Bo(n*max_terms) {}
 
     const size_t n;             // rows in X / length of y / rows of B, Bo
     const size_t p;             // columns in X (candidate regressors)
     const size_t ldX;           // X column stride (column j starts at X + j*ldX)
     const float *X;             // read-only column-major view of the regressors (f32 input)
     size_t bo_stride = 1;       // Bo row stride (capacity >= live count _m); grows geometrically
-    std::vector<float>   y;     // target vector (f32 storage; dot products upcast to f64)
-    std::vector<basis_t> B;     // all basis (col-major, n x max_terms preallocated; col stride n)
-    std::vector<basis_t> Bo;    // orthonormalized basis (ROW-major; row stride == bo_stride)
-    std::vector<double>  ybo;   // dot product of basis Bo with Y target
-    std::vector<float>   s;     // normalization constant for columns of 'X' (1/rms)
+    std::vector<float>  y;      // target vector (f32 storage; dot products upcast to f64)
+    std::vector<BT>     B;      // all basis (col-major, n x max_terms preallocated; col stride n)
+    std::vector<BT>     Bo;     // orthonormalized basis (ROW-major; row stride == bo_stride)
+    std::vector<double> ybo;    // dot product of basis Bo with Y target
+    std::vector<float>  s;      // normalization constant for columns of 'X' (1/rms)
 };
 
 /*
@@ -222,13 +225,14 @@ struct MarsData {
  *      are gathered on the fly via Bo_data + k[i]*ldBo (ldBo == live m now) with
  *      a software prefetch a few iterations ahead.
  */
+template <class BT>
 struct Scratch {
     size_t n   = 0;                // row count the n-sized buffers are sized for
     size_t cap = 0;                // basis capacity the m-sized buffers are sized for
     std::vector<float>   x;        // normalized candidate column (n) -- derived from f32 X
     std::vector<int32_t> k;        // sort permutation of x (n)
     std::vector<float>   d;        // adjacent deltas of x along sort order (n), d[0] unused
-    std::vector<basis_t> Bx;       // (n, cap) column-major (col stride n), B*x, ortho-normalized
+    std::vector<BT>      Bx;       // (n, cap) column-major (col stride n), B*x, ortho-normalized
     std::vector<double>  f;        // (cap+1) hinge projection accumulator
     std::vector<double>  g;        // (cap+1) basis-weighted ortho-accumulator
     std::vector<int>     bcols;    // (cap) indexes of non-ignored basis (output of nonzero)
@@ -265,8 +269,9 @@ struct Scratch {
     }
 };
 
-MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, size_t ncols, size_t max_terms, size_t ldx)
-    : _data(new MarsData(x, n, ncols, ldx, max_terms))
+template <class BT>
+MarsAlgo<BT>::MarsAlgo(const float *x, const float *y, const float *w, size_t n, size_t ncols, size_t max_terms, size_t ldx)
+    : _data(new MarsData<BT>(x, n, ncols, ldx, max_terms))
     , _tol((n*0.02)*DBL_EPSILON) // rough guess
 {
     _max_terms = max_terms;
@@ -325,10 +330,11 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
      *  contiguous). ybo is then the f64 dot of the *stored* f32 intercept with
      *  the *stored* f32 target -- each upcast on the load.
      */
-    basis_t *b0  = _data->B.data();   // col 0 of col-major B is the base
-    basis_t *bo0 = _data->Bo.data();  // col 0 of Bo is contiguous at bo_stride==1
+    BT *b0  = _data->B.data();   // col 0 of col-major B is the base
+    BT *bo0 = _data->Bo.data();  // col 0 of Bo is contiguous at bo_stride==1
     for (size_t i = 0; i < n; ++i) {
-        b0[i] = bo0[i] = narrow(sqrt_w[i]);
+        store(b0[i], sqrt_w[i]);
+        store(bo0[i], sqrt_w[i]);
     }
 
     double ybo0 = 0.0;
@@ -371,19 +377,23 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
     }
 }
 
-MarsAlgo::~MarsAlgo()
+template <class BT>
+MarsAlgo<BT>::~MarsAlgo()
 {
     delete _data;
 }
-int MarsAlgo::nbasis() const
+template <class BT>
+int MarsAlgo<BT>::nbasis() const
 {
     return _m;
 }
-int MarsAlgo::nrows() const
+template <class BT>
+int MarsAlgo<BT>::nrows() const
 {
     return _data->n;
 }
-double MarsAlgo::dsse() const
+template <class BT>
+double MarsAlgo<BT>::dsse() const
 {
     double s = 0.0;
     for (double v : _data->ybo) {
@@ -391,28 +401,36 @@ double MarsAlgo::dsse() const
     }
     return s;
 }
-double MarsAlgo::yvar() const
+template <class BT>
+double MarsAlgo<BT>::yvar() const
 {
     return _yvar;
 }
 
-void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
-                    int xcol, const bool *bmask, int min_span, int end_span, bool linear_only)
+template <class BT>
+void MarsAlgo<BT>::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
+                        int xcol, const bool *bmask, int min_span, int end_span, bool linear_only)
 {
     // xcol is a signed caller-supplied index; the >= 0 guard makes the
     // (size_t) compare against the column count well-defined.
     verify(xcol >= 0 && (size_t)xcol < _data->p, "invalid X column index");
     verify(min_span >= 1, "min_span must be >= 1");
 
+    // The hinge sweep is not yet validated for bf16 basis storage (Phase 2);
+    // bf16 fits must request linear_only until then.
+    if constexpr (std::is_same_v<BT, bf16>) {
+        verify(linear_only, "bf16 basis storage currently supports only linear_only fits");
+    }
+
     std::fill_n(linear_dsse, _m, 0.0);
     std::fill_n(hinge_dsse,  _m, 0.0);
     std::fill_n(hinge_cuts,  _m, NAN);
 
-    thread_local Scratch *Sp = nullptr;
+    thread_local Scratch<BT> *Sp = nullptr;
     if (!Sp) {
-        Sp = new Scratch();
+        Sp = new Scratch<BT>();
     }
-    Scratch &S = *Sp;
+    Scratch<BT> &S = *Sp;
     S.ensure(_data->n, _m);
     const size_t p = nonzero(S.bcols.data(), bmask, _m);
     if (p == 0) {
@@ -441,7 +459,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
      *  the (m, p) workspace for the Boᵀ*Bx intermediate; sized at
      *  (max_terms, max_terms) so the leading m×p block is what the kernel uses.
      */
-    basis_t *Bx  = S.Bx.data();   // (n, cap) col-major, col stride n
+    BT *Bx  = S.Bx.data();   // (n, cap) col-major, col stride n
 
     /*
      *  `S.ybx` is reused as the per-column squared-norm scratch for
@@ -495,8 +513,8 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
 
         const size_t head = end_span;
         const size_t tail = n-end_span;
-        const basis_t *B = _data->B.data(); // col-major, col stride n
-        const float   *y = _data->y.data(); // f32 storage; each y[k[i]] upcasts into double y_k below
+        const BT    *B = _data->B.data(); // col-major, col stride n
+        const float *y = _data->y.data(); // f32 storage; each y[k[i]] upcasts into double y_k below
 
         /*
          *  Bo rows are now gathered on the fly inside the inner sweep(no Bok
@@ -504,8 +522,8 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
          *  access pattern forfeits HW prefetch, so we issue software prefetch
          *  a few iterations ahead.
          */
-        const basis_t *Bo_data = _data->Bo.data();
-        const size_t   ldBo    = _data->bo_stride;
+        const BT     *Bo_data = _data->Bo.data();
+        const size_t  ldBo    = _data->bo_stride;
         constexpr int PREFETCH_DIST = 4;
 
         /*
@@ -543,13 +561,13 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
             std::fill_n(f, _m+1, 0.0);
             double *g = S.g.data();
             std::fill_n(g, _m+1, 0.0);
-            const basis_t *b  = B + bcols[j]*n;
-            const basis_t *bx = Bx + j*n;
+            const BT *b  = B + bcols[j]*n;
+            const BT *bx = Bx + j*n;
 
             double b_k  = widen(b [k[0]]);
             double bx_k = widen(bx[k[0]]);
             double y_k  = y [k[0]];
-            covariates_impl<false>(f,g,Bo_data + k[0]*ldBo,ybo,bx_k,ybx[j],0,b_k,_m);
+            covariates_impl<false, BT>(f,g,Bo_data + k[0]*ldBo,ybo,bx_k,ybx[j],0,b_k,_m);
 
             double k0 = 0;
             double k1 = 0;
@@ -589,10 +607,10 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
                 if (on_grid) {
                     next_grid += min_span;
                 }
-                const basis_t *bo_row = Bo_data + k[i]*ldBo;
+                const BT *bo_row = Bo_data + k[i]*ldBo;
                 cov_t o = on_grid
-                          ? covariates_impl<true >(f,g,bo_row,ybo,bx_k,ybx[j],di,b_k,_m)
-                          : covariates_impl<false>(f,g,bo_row,ybo,bx_k,ybx[j],di,b_k,_m);
+                          ? covariates_impl<true, BT>(f,g,bo_row,ybo,bx_k,ybx[j],di,b_k,_m)
+                          : covariates_impl<false, BT>(f,g,bo_row,ybo,bx_k,ybx[j],di,b_k,_m);
 
                 k0 = fma(di*di,b2,k0);  // build up ||h_plus||^2 incrementally
                 k1 = fma(di*2,bd,k1);
@@ -626,7 +644,8 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
 #endif
 }
 
-double MarsAlgo::append(char type, int xcol, int bcol, float h)
+template <class BT>
+double MarsAlgo<BT>::append(char type, int xcol, int bcol, float h)
 {
     if (_m >= _max_terms) {
         throw std::runtime_error("basis matrix is full");
@@ -659,24 +678,24 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
 
     const size_t   n  = _data->n;
     const float    s  = _data->s[xcol];
-    const basis_t *bp = _data->B.data() + bcol*n;             // parent basis column
-    const float   *xp = _data->X        + xcol*_data->ldX;    // candidate X column (f32 input)
-    basis_t       *Bm = _data->B.data() + _m*n;               // new basis column
+    const BT    *bp = _data->B.data() + bcol*n;             // parent basis column
+    const float *xp = _data->X        + xcol*_data->ldX;    // candidate X column (f32 input)
+    BT          *Bm = _data->B.data() + _m*n;               // new basis column
 
     switch(type) {
         case 'l':
             for (size_t i = 0; i < n; ++i) {
-                Bm[i] = narrow(s*widen(bp[i])*xp[i]);
+                store(Bm[i], s*widen(bp[i])*xp[i]);
             }
             break;
         case '+':
             for (size_t i = 0; i < n; ++i) {
-                Bm[i] = narrow(s*widen(bp[i])*std::max(xp[i]-h, 0.0f));
+                store(Bm[i], s*widen(bp[i])*std::max(xp[i]-h, 0.0f));
             }
             break;
         case '-':
             for (size_t i = 0; i < n; ++i) {
-                Bm[i] = narrow(s*widen(bp[i])*std::max(h-xp[i], 0.0f));
+                store(Bm[i], s*widen(bp[i])*std::max(h-xp[i], 0.0f));
             }
             break;
         default:
@@ -701,7 +720,7 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
     }
     const float v_raw_norm = (float)std::sqrt(v_raw_norm2);
     for (size_t i = 0; i < n; ++i) {
-        Bm[i] = narrow(widen(Bm[i]) / v_raw_norm);
+        store(Bm[i], widen(Bm[i]) / v_raw_norm);
     }
 
     const double w = mars::orthonormalize_col(
@@ -712,10 +731,10 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
          *  orthonormalize_col left v as the unit residual; store it (f32) into
          *  Bo's new column _m (row-major, stride bo_stride).
          */
-        basis_t     *Bo   = _data->Bo.data();
+        BT          *Bo   = _data->Bo.data();
         const size_t ldBo = _data->bo_stride;
         for (size_t i = 0; i < n; ++i) {
-            Bo[i*ldBo + _m] = narrow(v[i]);
+            store(Bo[i*ldBo + _m], v[i]);
         }
 
         /*
@@ -741,4 +760,26 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
         }
     }
     return -1.;
+}
+
+/*
+ *  Instantiate the algorithm for each supported basis storage precision and
+ *  expose a dtype-erased factory so the pybind layer can hold a single type.
+ *  f32 is the full-precision default; bf16 halves the basis-buffer footprint
+ *  (linear_only only for now -- see the guard in eval()).
+ */
+template class MarsAlgo<float>;
+template class MarsAlgo<bf16>;
+
+IMarsAlgo *make_mars_algo(BasisDType dtype,
+                          const float *x, const float *y, const float *w,
+                          size_t n, size_t ncols, size_t max_terms, size_t ldx)
+{
+    switch (dtype) {
+        case BasisDType::f32:
+            return new MarsAlgo<float>(x, y, w, n, ncols, max_terms, ldx);
+        case BasisDType::bf16:
+            return new MarsAlgo<bf16>(x, y, w, n, ncols, max_terms, ldx);
+    }
+    throw std::runtime_error("unknown basis dtype");
 }

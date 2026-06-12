@@ -188,6 +188,7 @@ def fit(X, y, w=None, **kwargs):
     max_runtime   = kwargs.pop('max_runtime', 48*3600) # in seconds
     self_interact = kwargs.pop('self_interact', False)
     linear_only   = kwargs.pop('linear_only', False)
+    basis_dtype   = kwargs.pop('basis_dtype', 'f32')      # 'f32' or 'bf16' basis storage
     n_true        = kwargs.pop('n_true', len(X))
     logger        = kwargs.pop('logger', None)
     callback      = kwargs.pop("callback", None)
@@ -203,6 +204,11 @@ def fit(X, y, w=None, **kwargs):
 
     if kwargs:
         raise TypeError("unknown argument: %s" % kwargs)
+
+    # bf16 basis storage only supports the linear pass for now (the hinge sweep
+    # is not yet validated under bf16 -- see marsalgo.cc eval()).
+    if basis_dtype != 'f32' and not linear_only:
+        raise ValueError("basis_dtype=%r requires linear_only=True" % basis_dtype)
 
     start_t = time.time()
 
@@ -230,7 +236,7 @@ def fit(X, y, w=None, **kwargs):
     n = len(X)
     basis = [[]]  # list of lists of used basis
     tail = max(int(n * tail_span), 1)
-    algo = marslib.MarsAlgo(X, y, w, max_terms)
+    algo = marslib.MarsAlgo(X, y, w, max_terms, basis_dtype)
     var_y = algo.yvar()
 
     # Set up the SSE caches. For inputs, we initialize to +inf, so that we cover
