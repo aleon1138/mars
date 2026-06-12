@@ -116,6 +116,26 @@ localized a planted knot at −0.96 instead of 0.25. (The macOS *scalar* path
 masked this — it stayed under the 1e-5 scalar `HINGE_DSSE_TOL`; only the AVX
 server at 1e-6 exposed it, so validate numerics on the server.) `f`/`g` stay f64.
 
+**Architecture note (2026-06-12):** Introduced a precision-conversion *seam*
+(`basis_dtype.h`) to pave the way for storing the basis matrices `B`/`Bo`/`Bx` in
+bf16 (halving the load volume of the bandwidth-bound forward pass). `basis_dtype.h`
+defines `using basis_t = float` plus `widen(basis_t)->float` (decode to working
+precision) and `narrow(double)->basis_t` (round to storage). `B`/`Bo`/`Bx` and the
+kernels that touch them (`orthonormalize*`, `dot_widen`, `covariates_impl`, the
+internal `kernels.cc` helpers) are typed on `basis_t`, and every read of a stored
+basis element goes through `widen()`, every store through `narrow()`. For
+`basis_t == float` both are the identity (float↔double round-trips are exact and
+the optimizer elides them), so this is a bit-for-bit no-op (validated against the
+unittest/pytest suite and before/after `fit` snapshots). The AVX inner loops still
+operate on `float` — only the scalar paths were routed through the seam this round;
+the SIMD bf16 load/store helpers come with the bf16 build. **Scope:** bf16 is for
+the *internal basis matrices only* — the public X/y/w API stays f32 (the hot loops
+never read X in the inner loop). The bf16 build flips `basis_t` to a template
+parameter, instantiates the kernels for {float, bf16}, and selects precision via a
+runtime flag; staged linear_only-first (validate orthonormalize conditioning under
+eps_bf16) then the hinge sweep (`f`/`g` stay f64 — see the 2026-06-09 REJECTED
+note). See `TODO.md` for the full plan.
+
 **Data requirements:** `X` must be `float32`, **column-major** (Fortran order).
 `y` and `w` must be `float32` column-major 1D arrays. The bindings assert these
 layouts explicitly.

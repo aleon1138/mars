@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstddef>  // size_t
+#include "basis_dtype.h"  // basis_t, widen, narrow
 
 namespace mars {
 
@@ -51,13 +52,13 @@ constexpr double DGKS_GATE_RATIO_SQ = 9.0;
  */
 void orthonormalize(
     size_t n, size_t m, size_t p,
-    const float  *B,    size_t ldB,
-    const float  *x,
-    const int    *mask,
-    const float  *Bo,   size_t ldBo,
-    float        *Bx,   size_t ldBx,
-    double       *T,    size_t ldT,
-    double       *s_buf,
+    const basis_t *B,    size_t ldB,
+    const float   *x,
+    const int     *mask,
+    const basis_t *Bo,   size_t ldBo,
+    basis_t       *Bx,   size_t ldBx,
+    double        *T,    size_t ldT,
+    double        *s_buf,
     double tol,
     std::atomic<long> *dgks_counter = nullptr);
 
@@ -90,24 +91,29 @@ void orthonormalize(
  */
 double orthonormalize_col(
     size_t n, size_t m,
-    double       *v,
-    const float  *Bo,   size_t ldBo,
+    double        *v,
+    const basis_t *Bo,   size_t ldBo,
     double tol,
     std::atomic<long> *dgks_counter = nullptr);
 
 /*
- *  Dot product of two contiguous f32 vectors, accumulated in f64:
+ *  Dot product of a contiguous basis column with the contiguous f32 target,
+ *  accumulated in f64:
  *
  *      returns  sum_{i<n} (double)a[i] * (double)b[i]
  *
  *  Both inputs are upcast at the load (cvtps_pd) and summed in f64, so the
- *  result carries only the ~eps_f32 floor of the f32 inputs -- the summation
+ *  result carries only the ~eps_f32 floor of the inputs -- the summation
  *  adds nothing on top, unlike an f32 accumulation which grows ~sqrt(n)*eps_f32.
  *  Two accumulators break the FMA dependency chain (one chain would cap at
  *  ~1/4 of FMA throughput). AVX2+FMA when available, scalar fallback otherwise.
  *
- *      a, b : (n) contiguous float
+ *  The operand types are split so a future bf16 basis build can widen `a`
+ *  (the basis column) and `b` (the f32 target) independently at the load.
+ *
+ *      a : (n) contiguous basis column
+ *      b : (n) contiguous f32 target
  */
-double dot_widen(const float *a, const float *b, size_t n);
+double dot_widen(const basis_t *a, const float *b, size_t n);
 
 } // namespace mars

@@ -25,7 +25,7 @@ public:
      *
      *  Uniform weights (w=1) recover ordinary least squares.
      */
-    MarsAlgo(const float *x, const float *y, const float *w, size_t n, size_t m, size_t p, size_t ldx);
+    MarsAlgo(const float *x, const float *y, const float *w, size_t n, size_t ncols, size_t max_terms, size_t ldx);
     ~MarsAlgo();
 
     int nbasis() const;

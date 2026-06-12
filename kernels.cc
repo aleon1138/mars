@@ -35,7 +35,7 @@ inline __m256d loadu_ps_pd(const float *p)
  */
 
 // tc[k] += scalar * (double)bo_row[k] for k in 0..m.
-inline void axpy_m(double *tc, const float *bo_row, double scalar, size_t m)
+inline void axpy_m(double *tc, const basis_t *bo_row, double scalar, size_t m)
 {
     size_t k = 0;
 #if defined(__AVX__)
@@ -47,13 +47,13 @@ inline void axpy_m(double *tc, const float *bo_row, double scalar, size_t m)
     }
 #endif
     for (; k < m; ++k) {
-        tc[k] += (double)bo_row[k] * scalar;
+        tc[k] += widen(bo_row[k]) * scalar;
     }
 }
 
 // dot((double)bo_row[:m], tc[:m]).  Bo is f32, tc is f64. Two accumulators
 // break the FMA latency chain (one chain caps at ~1/4 FMA throughput).
-inline double dot_bo(const float *bo_row, const double *tc, size_t m)
+inline double dot_bo(const basis_t *bo_row, const double *tc, size_t m)
 {
     size_t k = 0;
 #if defined(__AVX__)
@@ -72,7 +72,7 @@ inline double dot_bo(const float *bo_row, const double *tc, size_t m)
     double acc = 0.0;
 #endif
     for (; k < m; ++k) {
-        acc += (double)bo_row[k] * tc[k];
+        acc += widen(bo_row[k]) * tc[k];
     }
     return acc;
 }
@@ -83,7 +83,7 @@ inline double dot_bo(const float *bo_row, const double *tc, size_t m)
  *  break the FMA latency chain. Hot in orthonormalize() Phase 2a, where the
  *  same bo_row is projected against every candidate column's T-coefficients.
  */
-inline void dot_bo4(const float *bo_row,
+inline void dot_bo4(const basis_t *bo_row,
                     const double *t0, const double *t1,
                     const double *t2, const double *t3,
                     size_t m, double out[4])
@@ -105,7 +105,7 @@ inline void dot_bo4(const float *bo_row,
     double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
 #endif
     for (; k < m; ++k) {
-        const double bo = (double)bo_row[k];
+        const double bo = widen(bo_row[k]);
         s0 += bo * t0[k];
         s1 += bo * t1[k];
         s2 += bo * t2[k];
@@ -153,16 +153,15 @@ inline double dot_m(const double *a, const double *b, size_t m)
  */
 inline double project_subtract_and_norm(
     size_t n, size_t m,
-    const float *Bo, size_t ldBo,
+    const basis_t *Bo, size_t ldBo,
     const double *tc,
-    float *bx)
+    basis_t *bx)
 {
     double s = 0.0;
     for (size_t i = 0; i < n; ++i) {
-        const double v = (double)bx[i] - dot_bo(Bo + i * ldBo, tc, m);
-        const float  v_f32 = (float)v;
-        bx[i] = v_f32;
-        const double v_back = (double)v_f32;
+        const double v = widen(bx[i]) - dot_bo(Bo + i * ldBo, tc, m);
+        bx[i] = narrow(v);
+        const double v_back = widen(bx[i]);
         s += v_back * v_back;
     }
     return s;
@@ -174,13 +173,13 @@ inline double project_subtract_and_norm(
  */
 inline void compute_BoT_bx_col(
     size_t n, size_t m,
-    const float *Bo, size_t ldBo,
-    const float *bx,
+    const basis_t *Bo, size_t ldBo,
+    const basis_t *bx,
     double *tc)
 {
     std::fill_n(tc, m, 0.0);
     for (size_t i = 0; i < n; ++i) {
-        axpy_m(tc, Bo + i * ldBo, (double)bx[i], m);
+        axpy_m(tc, Bo + i * ldBo, widen(bx[i]), m);
     }
 }
 
@@ -194,16 +193,16 @@ inline void compute_BoT_bx_col(
 inline double mgs_project_col(
     size_t n, size_t m,
     double *v,
-    const float *Bo, size_t ldBo)
+    const basis_t *Bo, size_t ldBo)
 {
     double proj_norm2 = 0.0;
     for (size_t j = 0; j < m; ++j) {
         double c = 0.0;
         for (size_t i = 0; i < n; ++i) {
-            c += (double)Bo[i*ldBo + j] * v[i];
+            c += widen(Bo[i*ldBo + j]) * v[i];
         }
         for (size_t i = 0; i < n; ++i) {
-            v[i] -= c * (double)Bo[i*ldBo + j];
+            v[i] -= c * widen(Bo[i*ldBo + j]);
         }
         proj_norm2 += c * c;
     }
@@ -212,7 +211,7 @@ inline double mgs_project_col(
 
 } // namespace
 
-double dot_widen(const float *a, const float *b, size_t n)
+double dot_widen(const basis_t *a, const float *b, size_t n)
 {
     size_t i = 0;
 #if defined(__AVX__)
@@ -231,15 +230,15 @@ double dot_widen(const float *a, const float *b, size_t n)
     double s = 0.0;
 #endif
     for (; i < n; ++i) {
-        s += (double)a[i] * (double)b[i];
+        s += widen(a[i]) * (double)b[i];
     }
     return s;
 }
 
 double orthonormalize_col(
     size_t n, size_t m,
-    double       *v,
-    const float  *Bo,   size_t ldBo,
+    double        *v,
+    const basis_t *Bo,   size_t ldBo,
     double tol,
     std::atomic<long> *dgks_counter)
 {
@@ -282,22 +281,22 @@ double orthonormalize_col(
 
 void orthonormalize(
     size_t n, size_t m, size_t p,
-    const float  *B,    size_t ldB,
-    const float  *x,
-    const int    *mask,
-    const float  *Bo,   size_t ldBo,
-    float        *Bx,   size_t ldBx,
-    double       *T,    size_t ldT,
-    double       *s_buf,
+    const basis_t *B,    size_t ldB,
+    const float   *x,
+    const int     *mask,
+    const basis_t *Bo,   size_t ldBo,
+    basis_t       *Bx,   size_t ldBx,
+    double        *T,    size_t ldT,
+    double        *s_buf,
     double tol,
     std::atomic<long> *dgks_counter)
 {
     /*
-     *  Bx[i, j] = B[i, mask[j]] * x[i]  -- f32 * f32 stored as f32
+     *  Bx[i, j] = B[i, mask[j]] * x[i]  -- basis * f32 candidate, stored as basis
      */
     for (size_t j = 0; j < p; ++j) {
-        const float *b  = B  + mask[j] * ldB;
-        float       *bx = Bx + j       * ldBx;
+        const basis_t *b  = B  + mask[j] * ldB;
+        basis_t       *bx = Bx + j       * ldBx;
         size_t i = 0;
 #if defined(__AVX__)
         for (; i + 8 <= n; i += 8) {
@@ -307,7 +306,7 @@ void orthonormalize(
         }
 #endif
         for (; i < n; ++i) {
-            bx[i] = b[i] * x[i];
+            bx[i] = narrow(widen(b[i]) * x[i]);
         }
     }
 
@@ -328,9 +327,9 @@ void orthonormalize(
         std::fill_n(T + j * ldT, m, 0.0);
     }
     for (size_t i = 0; i < n; ++i) {
-        const float *bo_row = Bo + i * ldBo;
+        const basis_t *bo_row = Bo + i * ldBo;
         for (size_t j = 0; j < p; ++j) {
-            axpy_m(T + j * ldT, bo_row, (double)Bx[i + j * ldBx], m);
+            axpy_m(T + j * ldT, bo_row, widen(Bx[i + j * ldBx]), m);
         }
     }
 
@@ -347,7 +346,7 @@ void orthonormalize(
      */
     std::fill_n(s_buf, p, 0.0);
     for (size_t i = 0; i < n; ++i) {
-        const float *bo_row = Bo + i * ldBo;
+        const basis_t *bo_row = Bo + i * ldBo;
         size_t j = 0;
         // Blocks of 4 columns share the bo_row load+widen (see dot_bo4).
         for (; j + 4 <= p; j += 4) {
@@ -357,21 +356,19 @@ void orthonormalize(
                     T + (j + 2) * ldT, T + (j + 3) * ldT,
                     m, proj);
             for (int c = 0; c < 4; ++c) {
-                float       *bx    = Bx + (j + c) * ldBx;
-                const double v     = (double)bx[i] - proj[c];
-                const float  v_f32 = (float)v;
-                bx[i]    = v_f32;
-                const double v_back = (double)v_f32;
+                basis_t      *bx    = Bx + (j + c) * ldBx;
+                const double  v     = widen(bx[i]) - proj[c];
+                bx[i]    = narrow(v);
+                const double v_back = widen(bx[i]);
                 s_buf[j + c] += v_back * v_back;
             }
         }
         for (; j < p; ++j) {
             const double *tc    = T  + j * ldT;
-            float        *bx    = Bx + j * ldBx;
-            const double  v     = (double)bx[i] - dot_bo(bo_row, tc, m);
-            const float   v_f32 = (float)v;
-            bx[i]    = v_f32;
-            const double v_back = (double)v_f32;
+            basis_t      *bx    = Bx + j * ldBx;
+            const double  v     = widen(bx[i]) - dot_bo(bo_row, tc, m);
+            bx[i]    = narrow(v);
+            const double v_back = widen(bx[i]);
             s_buf[j] += v_back * v_back;
         }
     }
@@ -382,8 +379,8 @@ void orthonormalize(
      *  degenerate anyway. See DGKS_GATE_RATIO_SQ in kernels.h.
      */
     for (size_t j = 0; j < p; ++j) {
-        double *tc = T  + j * ldT;
-        float  *bx = Bx + j * ldBx;
+        double  *tc = T  + j * ldT;
+        basis_t *bx = Bx + j * ldBx;
         const double t_norm2 = dot_m(tc, tc, m);
         if (s_buf[j] > tol && s_buf[j] * DGKS_GATE_RATIO_SQ < t_norm2) {
             if (dgks_counter) {
@@ -399,7 +396,7 @@ void orthonormalize(
      *  store cast, since the column is already f32-bounded.
      */
     for (size_t j = 0; j < p; ++j) {
-        float       *bx    = Bx + j * ldBx;
+        basis_t     *bx    = Bx + j * ldBx;
         const double s     = s_buf[j];
         const float  scale = (s > tol) ? (float)(1.0 / std::sqrt(s + tol)) : 0.0f;
         size_t i = 0;
@@ -411,7 +408,7 @@ void orthonormalize(
         }
 #endif
         for (; i < n; ++i) {
-            bx[i] *= scale;
+            bx[i] = narrow(widen(bx[i]) * scale);
         }
     }
 }

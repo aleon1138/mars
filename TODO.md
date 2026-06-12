@@ -2,34 +2,60 @@
 
 Ideas and notes for future performance work. Not planned for a specific release.
 
-## BF16 support for X (+ the AVX-512 BF16 path)
+## BF16 support for the basis matrices (+ the AVX-512 BF16 path)
 
-**Goal:** ~2× speedup on the forward pass by halving memory bandwidth for the X
-  matrix.
+**Goal:** ~2× speedup on the forward pass by halving the memory-load volume of
+  the bandwidth-bound hot loops.
 
-**Why it should help:** `covariates()` is ~1 FLOP/byte, which puts it near
-  memory-bound territory at multi-core. Halving X bytes ≈ halving the load
-  volume.
+**Scope (corrected 2026-06-12):** bf16 narrows the *internal basis matrices*
+  `B`/`Bo`/`Bx` (and, later, possibly the sorted-X scratch), **not** the public
+  X input. The hot loops (`orthonormalize()`, `covariates_impl()`) stream the
+  basis matrices and the f32 target `y`; they never read `X` in the inner loop
+  (`X` is touched only O(n) per `eval`/`append`, plus `argsort`). So the
+  bandwidth win lives in `B`/`Bo`/`Bx`. The public API stays f32 — no bf16 numpy
+  input, no `ml_dtypes` dependency, `mars.py`'s X handling is unchanged.
+
+**Why it should help:** `covariates()` is ~1 FLOP/byte, near memory-bound at
+  multi-core. The buffers it gathers (`Bo` rows, `B`/`Bx` columns) are the load
+  volume; halving their bytes ≈ halving the load.
 
 **Design:**
-- bf16 only for X storage and as inputs to FMA. Accumulators stay fp32 — bf16's
-  8-bit mantissa is not enough to accumulate n squared residuals without
-  precision loss.
-- Template `MarsAlgo` on input dtype (fp32 or bf16), dispatch from pybind based
-  on numpy dtype.
-- Most of the non-hot-loop code stays dtype-agnostic via templates. The real
-  work is in `covariates()`.
-- Keep the current AVX2 kernel as the default path — portable and fast enough on
-  most hardware. Add the AVX-512 + bf16 kernel behind `#ifdef __AVX512BF16__` or
-  a runtime CPUID check; `-march=native` then picks the best the CPU supports
-  and the repo stays public-friendly.
+- bf16 is **storage only** for `B`/`Bo`/`Bx`; all arithmetic stays f32/f64 —
+  bf16's 8-bit mantissa cannot accumulate n squared residuals without precision
+  loss. f32 and bf16 must coexist at runtime (precision-sensitive fits keep f32),
+  selected by a runtime flag (default f32) on the `MarsAlgo` constructor, surfaced
+  as a `mars.py` kwarg.
+- The precision-conversion **seam is already in place** (`basis_dtype.h`):
+  `using basis_t = float` plus `widen()`/`narrow()`, identity for f32 and routed
+  through every `B`/`Bo`/`Bx` read/store in `kernels.cc` + `marsalgo.cc`. The bf16
+  build turns `basis_t` into a template parameter, instantiates the kernels for
+  {float, bf16}, and adds bf16 SIMD load/store helpers — it should not have to
+  edit call sites.
+- End state: templated `MarsAlgo<BT>` behind a thin abstract base so the pybind
+  class surface stays single; `new_algo` picks the instantiation from the flag.
+- Keep the AVX2 kernel as the default path. Add the AVX-512 + bf16 kernel behind
+  `#ifdef __AVX512BF16__` or a runtime CPUID check; `-march=native` then picks the
+  best the CPU supports and the repo stays public-friendly.
+
+**Staging:**
+1. **Refactor (done):** install the `basis_dtype.h` seam as a behavior-preserving
+   no-op (validated bit-for-bit against the suite + before/after fits).
+2. **Phase 1 — bf16 on `linear_only` only.** Exercises the `orthonormalize()`
+   family + `append()`; defers the hinge sweep. This is where the bf16
+   orthogonality/conditioning story gets validated: narrowing `Bo`/`Bx` drops
+   orthogonality from O(eps_f32 ≈ 1e-7) to O(eps_bf16 ≈ 8e-3), so the degeneracy
+   tol (`_tol ≈ n·0.02·DBL_EPSILON`) and `DGKS_GATE_RATIO_SQ` likely need a bf16
+   variant.
+3. **Phase 2 — bf16 on the hinge sweep (`covariates_impl`).** `f`/`g` MUST stay
+   f64 (see CLAUDE.md 2026-06-09 REJECTED note). Add the optional `VDPBF16PS`
+   path and consider narrowing the sorted-X scratch. Validate cut-selection
+   numerics on the AVX server, not macOS scalar (the scalar path masked an
+   analogous f32-narrowing bug).
 
 **Complications:**
-- numpy has no native bf16; need `ml_dtypes.bfloat16` or torch tensors on the
-  Python side.
-- Native bf16 FMA (`VDPBF16PS`) requires AVX-512 BF16 — i.e., Intel Sapphire
-  Rapids+ or AMD Zen 4+. On older hardware, load bf16, convert to fp32 via
-  widening cast, then normal FMA. Still wins on memory but not on compute.
+- Native bf16 FMA (`VDPBF16PS`) requires AVX-512 BF16 — Intel Sapphire Rapids+ or
+  AMD Zen 4+. On older hardware, load bf16, widen to fp32, then normal FMA. Still
+  wins on memory but not on compute.
 
 **Why AVX-512 only pulls its weight *with* bf16:** plain AVX-512 (no bf16) is
   probably a wash — memory bandwidth is the real bottleneck at multi-core,
