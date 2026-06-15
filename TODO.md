@@ -2,45 +2,35 @@
 
 Ideas and notes for future performance work. Not planned for a specific release.
 
-## BF16 support for X (+ the AVX-512 BF16 path)
+## BF16 basis storage — EXPLORED AND ABANDONED (2026-06-15)
 
-**Goal:** ~2× speedup on the forward pass by halving memory bandwidth for the X
-  matrix.
+We built and benchmarked bf16 storage for the basis matrices `B`/`Bo`/`Bx`
+(storage only; everything widens to f32/f64 to compute) to cut the load volume
+of the bandwidth-bound forward pass. **Conclusion: not worth it on CPU — it caps
+at parity with f32.** The real speedup is the CUDA port below.
 
-**Why it should help:** `covariates()` is ~1 FLOP/byte, which puts it near
-  memory-bound territory at multi-core. Halving X bytes ≈ halving the load
-  volume.
+**Why it caps at parity (don't retry the f32-accum shortcut):**
+- A SIMD bf16 widen-load brought bf16 `orthonormalize()` from ~1.4× *slower*
+  (scalar) to **parity**, but no faster: with f64 accumulation the `T = Boᵀ·Bx`
+  GEMM is bound by f64 `T` traffic (load+store every FMA) + 4-wide f64 FMA, so
+  halving only the `Bo`/`Bx` *load* bytes can't win.
+- Getting the ~2× requires **f32 accumulation**, and that is numerically
+  **rejected**: `T = Boᵀ·Bx` is full of near-zero (cancelling) projection
+  entries, and f32 accumulation destroys them — measured 1e-2…4.6e-1 relative
+  error vs f64's ~1e-10, and it persists even for bf16 inputs (f64-accum of bf16
+  inputs is exact). The f64 accumulation is load-bearing. (This is a different
+  mechanism from the 2026-06-09 `f`/`g` rejection — cancellation in the GEMM, not
+  the hinge denominator.) A non-cancelling dot (e.g. the throwaway `bf16_bench.c`)
+  *does* hit 2× in f32, but that regime doesn't match the GEMM.
+- The only f64-preserving 2× would be a register-tiled, i-blocked GEMM (see the
+  store-port-bound note below) — deferred in favour of CUDA, which wins by far.
 
-**Design:**
-- bf16 only for X storage and as inputs to FMA. Accumulators stay fp32 — bf16's
-  8-bit mantissa is not enough to accumulate n squared residuals without
-  precision loss.
-- Template `MarsAlgo` on input dtype (fp32 or bf16), dispatch from pybind based
-  on numpy dtype.
-- Most of the non-hot-loop code stays dtype-agnostic via templates. The real
-  work is in `covariates()`.
-- Keep the current AVX2 kernel as the default path — portable and fast enough on
-  most hardware. Add the AVX-512 + bf16 kernel behind `#ifdef __AVX512BF16__` or
-  a runtime CPUID check; `-march=native` then picks the best the CPU supports
-  and the repo stays public-friendly.
-
-**Complications:**
-- numpy has no native bf16; need `ml_dtypes.bfloat16` or torch tensors on the
-  Python side.
-- Native bf16 FMA (`VDPBF16PS`) requires AVX-512 BF16 — i.e., Intel Sapphire
-  Rapids+ or AMD Zen 4+. On older hardware, load bf16, convert to fp32 via
-  widening cast, then normal FMA. Still wins on memory but not on compute.
-
-**Why AVX-512 only pulls its weight *with* bf16:** plain AVX-512 (no bf16) is
-  probably a wash — memory bandwidth is the real bottleneck at multi-core,
-  Skylake-X/Cascade Lake downclock away most of the width gain, and AVX-512 is
-  absent from most consumer Intel (12th–14th gen). The native bf16 FMA is what
-  makes the wider path worth maintaining. Target hardware: EPYC 9845 / Zen 5c,
-  Sapphire Rapids+.
-
-**Dev note:** i7-7820X (Skylake-X) has AVX-512F but no BF16 and heavy
-  downclocking, so it's dev/test only. EPYC 9845 is where performance testing
-  happens.
+**Where the work lives:** unmerged branches `refactor/bf16-basis-seam` (no-op
+widen/store seam) and `feat/bf16-linear-only` (templated `MarsAlgo<BT>` +
+`IMarsAlgo` base + runtime `basis_dtype` flag + `degeneracy_tol<BT>()`). Kept as
+an archived record; `master` is bf16-free. The de-Eigen seam refactor there is
+reusable if a future storage-dtype need (e.g. *memory* footprint, not speed)
+ever arises.
 
 ## CUDA port
 
@@ -430,7 +420,7 @@ Each item is independent and small; none of them block correctness today.
 
 ## Python scalar loop builds `bmask` each epoch
 
-**Location:** `mars.py:263-265`.
+**Location:** `mars.py:306-308` (the `for i in input_to_use:` loop in `fit()`).
 
 **Issue:**
 ```python
