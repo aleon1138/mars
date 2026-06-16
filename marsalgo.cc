@@ -680,50 +680,63 @@ void MarsAlgo::eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge
     mars::cuda::context_sync_basis(_cuda, m,
                                    _data->B.data(),  _data->n,
                                    _data->Bo.data(), _data->bo_stride);
-    const size_t cap = mars::cuda::context_batch_capacity(_cuda);
 
+    // The active X-columns this epoch (rows with >=1 candidate). Make their
+    // scaled candidates resident -- uploaded once over the whole fit, not per
+    // epoch.
+    std::vector<int> active;
+    active.reserve(n_xcols);
+    for (int i = 0; i < n_xcols; ++i) {
+        const bool *row = mask + (size_t)i * mask_row_stride;
+        for (size_t k = 0; k < m; ++k) {
+            if (row[k]) {
+                active.push_back(i);
+                break;
+            }
+        }
+    }
+    mars::cuda::context_sync_xcols(_cuda, _data->p, _data->X, _data->ldX,
+                                   _data->s.data(), active.data(), active.size());
+
+    const size_t cap = mars::cuda::context_batch_capacity(_cuda);
     std::vector<int>    src_xcol(cap), src_basis(cap);
     std::vector<double> ybx(cap);
 
-    int i0 = 0;
-    while (i0 < n_xcols) {
-        // Greedily pack X-columns [i0, i1) until the candidate count would exceed
-        // the batch capacity. A single X-column always fits (its active count is
-        // <= m <= max_terms <= cap).
-        size_t P = 0;
-        int i1 = i0;
-        while (i1 < n_xcols) {
-            const bool *row = mask + (size_t)i1 * mask_row_stride;
+    // Block the active columns so each batched call's candidate count stays within
+    // the GPU scratch capacity. src_xcol holds the GLOBAL X column (into the
+    // resident scaled candidates). A single X-column always fits (active count <=
+    // m <= max_terms <= cap).
+    size_t a0 = 0;
+    while (a0 < active.size()) {
+        size_t P = 0, a1 = a0;
+        while (a1 < active.size()) {
+            const int i = active[a1];
+            const bool *row = mask + (size_t)i * mask_row_stride;
             size_t p_i = 0;
             for (size_t k = 0; k < m; ++k) {
                 p_i += row[k] ? 1 : 0;
             }
             if (P > 0 && P + p_i > cap) {
-                break;  // block full; defer this X-column to the next block
+                break;
             }
-            const int xc_local = i1 - i0;
             for (size_t k = 0; k < m; ++k) {
                 if (row[k]) {
-                    src_xcol[P]  = xc_local;
+                    src_xcol[P]  = i;
                     src_basis[P] = (int)k;
                     ++P;
                 }
             }
-            ++i1;
+            ++a1;
         }
-        const size_t nb = (size_t)(i1 - i0);
 
         if (P > 0) {
-            const float *Xblock = _data->X + (size_t)i0 * _data->ldX;
-            const float *sblk   = _data->s.data() + i0;
-            mars::cuda::orthonormalize_batch(_cuda, m, P, nb,
-                                             Xblock, _data->ldX, sblk,
+            mars::cuda::orthonormalize_batch(_cuda, m, P,
                                              src_xcol.data(), src_basis.data(),
                                              ybx.data());
-            // Scatter ybx² back into linear_dsse, re-deriving (xcol, basis) in the
-            // same row-major/k-ascending order the maps were built in.
+            // Scatter ybx² back, re-deriving (xcol, basis) in build order.
             size_t j = 0;
-            for (int i = i0; i < i1; ++i) {
+            for (size_t a = a0; a < a1; ++a) {
+                const int i = active[a];
                 const bool *row = mask + (size_t)i * mask_row_stride;
                 double *out = linear_dsse + (size_t)i * m;
                 for (size_t k = 0; k < m; ++k) {
@@ -734,7 +747,7 @@ void MarsAlgo::eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge
                 }
             }
         }
-        i0 = i1;
+        a0 = a1;
     }
 #else
     (void)mask; (void)mask_row_stride;

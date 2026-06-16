@@ -357,10 +357,16 @@ TEST(CudaKernelsTest, BatchMatchesPerColumn)
                                    B.data(),  (size_t)B.outerStride(),
                                    Bo.data(), (size_t)Bo.outerStride());
 
+    // Make all n_x scaled candidate columns resident, then batch (src_xcol are
+    // global X-column indices into the resident candidates).
+    std::vector<int> all_cols(n_x);
+    std::iota(all_cols.begin(), all_cols.end(), 0);
+    mars::cuda::context_sync_xcols(ctx, (size_t)n_x, X.data(),
+                                   (size_t)X.outerStride(), s.data(),
+                                   all_cols.data(), (size_t)n_x);
+
     std::vector<double> ybx_batch(P, 0.0);
-    mars::cuda::orthonormalize_batch(ctx, m, P, n_x,
-                                     X.data(), (size_t)X.outerStride(), s.data(),
-                                     src_xcol.data(), src_basis.data(),
+    mars::cuda::orthonormalize_batch(ctx, m, P, src_xcol.data(), src_basis.data(),
                                      ybx_batch.data());
 
     // Per-column reference on the same context: scale the candidate (f32), then

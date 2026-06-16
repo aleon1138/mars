@@ -80,6 +80,23 @@ void context_sync_basis(Context *ctx, size_t m,
 void context_set_target(Context *ctx, const float *y);
 
 /*
+ *  Ensure the given X-columns are resident on the device as the *scaled*
+ *  candidates x_c = X[:,c]·s[c] (f32). Lazy and idempotent: a column is uploaded
+ *  and scaled only the first time it is requested (the scaled candidate is fixed
+ *  for a fit), so over a whole fit each used column transfers exactly once
+ *  instead of every epoch. Backs the batched path, which indexes these by global
+ *  column. The resident buffer is sized (n, p_x) on the first call.
+ *
+ *      p_x  : total number of X-columns (sizes the resident buffer once).
+ *      X    : (n, p_x) col-major f32 host pointer; col stride ldX.
+ *      s    : (p_x) per-column 1/rms scale.
+ *      cols : (ncols) int32 global column indices to ensure resident.
+ */
+void context_sync_xcols(Context *ctx, size_t p_x,
+                        const float *X, size_t ldX, const float *s,
+                        const int *cols, size_t ncols);
+
+/*
  *  GPU counterpart of mars::orthonormalize(). For each j in [0, p):
  *      Bx[:,j]  = B[:, mask[j]] .* x                    (f32 multiply, f32 store)
  *      Bx[:,j] -= Bo * (Boᵀ * Bx[:,j])                  (f64 GEMM, f32 round)
@@ -114,31 +131,25 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
                     std::atomic<long> *dgks_counter = nullptr);
 
 /*
- *  Batched linear_only orthonormalize: process P candidate columns drawn from a
- *  block of `nb` X-columns (which all share the resident Bo) in ONE set of GEMMs,
- *  returning ybx[j] = scale·Σ Bx[:,j]·y for each. This amortizes the GEMM /
- *  launch / transfer overhead that dominates the one-eval-at-a-time path. The
- *  matrix Bx is never returned (linear_only). Requires context_set_target() and
- *  context_sync_basis() up to m first.
+ *  Batched linear_only orthonormalize: process P candidate columns (which all
+ *  share the resident Bo) in ONE set of GEMMs, returning ybx[j] = scale·Σ
+ *  Bx[:,j]·y for each. This amortizes the GEMM / launch / transfer overhead that
+ *  dominates the one-eval-at-a-time path. The matrix Bx is never returned
+ *  (linear_only). Requires context_set_target(), context_sync_basis() up to m,
+ *  and context_sync_xcols() for every X-column referenced by src_xcol.
  *
  *      m         : live orthonormal basis count (resident Bo columns).
- *      P         : number of candidate (output) columns across the block.
- *      nb        : number of distinct X-columns in the block (<= P).
- *      Xblock    : (n, nb) col-major f32 host pointer -- the raw X columns; col
- *                  stride ldX. Scaled on-device by s_block (so x = X·s is
- *                  f32-rounded before multiplying by B, matching the per-eval path).
- *      s_block   : (nb) per-column 1/rms scale.
- *      src_xcol  : (P) int32 -- output col -> block-local X column in [0, nb).
+ *      P         : number of candidate (output) columns in this block.
+ *      src_xcol  : (P) int32 -- output col -> global X column (into the resident
+ *                  scaled candidates from context_sync_xcols).
  *      src_basis : (P) int32 -- output col -> B/Bo column in [0, m).
  *      ybx       : (P) f64 host pointer [output].
  *      dgks_counter (optional): as in orthonormalize().
  *
- *  P must be <= the context's batch capacity (budget / ~16n bytes, never below
- *  max_terms; tune with MARS_CUDA_BLOCK_GB). The caller blocks the X-columns to
- *  respect that cap.
+ *  P must be <= the context's batch capacity (context_batch_capacity(); tune with
+ *  MARS_CUDA_BLOCK_GB). The caller blocks the candidate columns to respect it.
  */
-void orthonormalize_batch(Context *ctx, size_t m, size_t P, size_t nb,
-                          const float *Xblock, size_t ldX, const float *s_block,
+void orthonormalize_batch(Context *ctx, size_t m, size_t P,
                           const int *src_xcol, const int *src_basis,
                           double *ybx, std::atomic<long> *dgks_counter = nullptr);
 
