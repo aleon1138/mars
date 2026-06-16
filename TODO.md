@@ -125,15 +125,27 @@ well); the cost is the *count* (~7200 small GEMMs) + equal host overhead, not
 per-GEMM inefficiency. So the chunked-f32 split-K idea also won't beat d884's
 throughput and carries the cancellation risk -- deprioritized.
 
-### Next lever: batch X-columns into one GEMM per epoch
+### Batch X-columns into one GEMM per block -- IMPLEMENTED (2026-06-16, commit e650049)
 
 Within an epoch all X-columns share Bo, so stack their candidate matrices and do
-ONE big GEMM T_all = Boᵀ·[Bx_1|Bx_2|…] (M=m, N=Σp, K=n) instead of ~7200 thin
-ones -- a healthy tensor-core shape AND amortized launches/transfers/syncs (hits
-both the GEMM and the host-side bottleneck). Python API is unchanged: the eval
-binding already receives the full (p_X, m) mask and loops internally; the batching
-moves into the cuda path (a new batched orthonormalize entry point). Most invasive
-change so far; highest leverage.
+ONE set of GEMMs per block (T_all = Boᵀ·[Bx_1|…], M=m, N=Σp, K=n) instead of
+~7200 thin ones -- a healthy tensor-core shape AND amortized launches/transfers/
+syncs (hits both the GEMM and host-side bottleneck). Python API unchanged: the
+eval binding hands the full (p_X, m) mask to MarsAlgo::eval_batch (cuda &&
+linear_only), which blocks X-columns by a VRAM cap (MARS_CUDA_BLOCK_GB, default
+8) and calls mars::cuda::orthonormalize_batch per block. Shared post-fill
+pipeline (project_reduce) is reused by both per-column and batched paths.
+
+Correctness validated (batched vs CPU/per-column ~1e-9, single + multi-block).
+**Speed: to be measured on the server** -- re-profile and compare wall-clock +
+the GEMM kernel count/shape vs the per-eval baseline. Expected: the ~7200 small
+d884 GEMMs collapse to ~M·(few blocks) large ones, and the host-side per-eval
+overhead (was ~equal to GPU) largely disappears. If a single block per epoch is
+too large for VRAM, lower MARS_CUDA_BLOCK_GB; if GPU is underused, raise it.
+
+If still not beating the CPU after this, the remaining levers are pinned host
+staging for the x/ybx transfers and reducing the per-block syncs (the DGKS gate
+still does one mid-block host round-trip).
 
 ## Phase 1 GEMM (`T = Boᵀ·Bx`) is store-port-bound
 
