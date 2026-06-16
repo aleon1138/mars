@@ -1,0 +1,96 @@
+#pragma once
+
+/*
+ *  Host-facing API for the optional CUDA acceleration of the MARS forward pass.
+ *
+ *  This header is compiled by the *host* compiler (it is included by
+ *  marsalgo.cc / tests), so it must stay free of any CUDA types or headers --
+ *  only plain C++ types appear below. The implementation, and the full
+ *  definition of `Context` (cuBLAS handle, stream, device buffers), live in
+ *  cuda/orthonormalize.cu and are opaque here (PIMPL across the static-lib
+ *  boundary).
+ *
+ *  First pass scope: a GPU drop-in for mars::orthonormalize() only, behind the
+ *  `cuda=True` flag on MarsAlgo.eval(). The CPU kernel in kernels.cc stays the
+ *  correctness oracle; this path must match it within the f32 storage floor
+ *  (~1e-5), which means the T = Boᵀ·Bx contraction MUST accumulate in f64
+ *  (cublasDgemm) -- f32 accumulation corrupts the near-zero projection entries.
+ */
+
+#include <atomic>
+#include <cstddef>  // size_t
+
+namespace mars {
+namespace cuda {
+
+/*
+ *  Opaque per-MarsAlgo GPU context. Owns a cuBLAS handle + stream, resident
+ *  device copies of B (f32) and Bo (widened to f64), and per-call scratch sized
+ *  for up to `max_terms` columns. One context drives one GPU stream's worth of
+ *  resident state; it is NOT thread-safe -- the binding serializes the cuda
+ *  path to a single host thread.
+ */
+struct Context;
+
+/*
+ *  Allocate a context for an n-row problem with up to `max_terms` basis columns
+ *  and degeneracy threshold `tol` (the same _tol MarsAlgo uses). Device buffers
+ *  are sized for the worst case (p == max_terms) up front, so no per-call
+ *  reallocation occurs. Throws std::runtime_error on any CUDA/cuBLAS failure
+ *  (e.g. out-of-memory). Create lazily on first cuda eval so CPU-only fits never
+ *  touch the GPU.
+ */
+Context *context_create(size_t n, size_t max_terms, double tol);
+
+/*
+ *  Free all device memory and the cuBLAS handle/stream. Safe on nullptr.
+ */
+void context_destroy(Context *ctx);
+
+/*
+ *  Ensure the device holds columns [0, m) of the current basis. B/Bo columns
+ *  are append-only over a fit, so this uploads only the columns appended since
+ *  the last call (tracked internally by count) -- cheap to call at the top of
+ *  every cuda eval.
+ *
+ *      B    : (n, *) col-major f32; col stride ldB (== n in practice).
+ *      Bo   : (n, m) row-major f32; row stride ldBo (the live bo_stride; may
+ *             have grown via restride since the last call -- pass it fresh).
+ *
+ *  The device keeps B as f32 (col-major) and Bo widened to f64 (col-major), in
+ *  its own layout decoupled from the host's ldBo, so a host restride never
+ *  invalidates already-uploaded device columns.
+ */
+void context_sync_basis(Context *ctx, size_t m,
+                        const float *B,  size_t ldB,
+                        const float *Bo, size_t ldBo);
+
+/*
+ *  GPU counterpart of mars::orthonormalize(). For each j in [0, p):
+ *      Bx[:,j]  = B[:, mask[j]] .* x                    (f32 multiply, f32 store)
+ *      Bx[:,j] -= Bo * (Boᵀ * Bx[:,j])                  (f64 GEMM, f32 round)
+ *      s        = ||Bx[:,j]||^2  over the rounded f32
+ *      Bx[:,j] *= (s > tol) ? 1/sqrt(s + tol) : 0
+ *  with one DGKS retry per column whose residual energy is < 1/9 of its
+ *  projection energy (matching the CPU gate). Requires context_sync_basis to
+ *  have brought columns [0, m) of B/Bo onto the device first.
+ *
+ *      m    : live orthonormal basis count (columns of resident Bo).
+ *      p    : number of candidate columns (== length of mask).
+ *      x    : (n) f32 host pointer -- the normalized candidate column.
+ *      mask : (p) int32 host pointer -- indexes into columns of B.
+ *      Bx   : (n, p) col-major f32 host pointer; col stride ldBx [output].
+ *      dgks_counter (optional): host atomic, incremented per column the retry
+ *             fires on (nullptr in production; used by tests).
+ *
+ *  Internally the T = Boᵀ·Bx workspace and per-column norms stay on the device;
+ *  only Bx is copied back to the host. The call is synchronous: on return, Bx
+ *  is fully populated. Throws std::runtime_error on any CUDA/cuBLAS failure.
+ */
+void orthonormalize(Context *ctx, size_t m, size_t p,
+                    const float *x, const int *mask,
+                    float *Bx, size_t ldBx,
+                    std::atomic<long> *dgks_counter = nullptr);
+
+} // namespace cuda
+} // namespace mars

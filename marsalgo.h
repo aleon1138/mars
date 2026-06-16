@@ -8,8 +8,14 @@ inline void verify(bool check, const char *msg)
     }
 }
 
+// Opaque GPU context (see cuda/mars_cuda.h). Forward-declared unconditionally so
+// this header stays identical whether or not MARS_USE_CUDA is defined; the
+// pointer is null and never dereferenced in a non-CUDA build.
+namespace mars { namespace cuda { struct Context; } }
+
 class MarsAlgo {
     struct MarsData *_data = nullptr;
+    mars::cuda::Context *_cuda = nullptr;  // lazily created on first cuda eval
     size_t  _m         = 1;  // number of basis found
     size_t  _max_terms = 0;  // capacity cap: B/Bo grow up to this many columns
     double  _yvar      = 0;  // variance of 'y'
@@ -66,9 +72,16 @@ public:
      *  linear_only : bool
      *      do not attempt to find any hinge cuts, only build a linear model.
      *      This will ignore the output values of `hinge_dsse` and `hinge_cuts`.
+     *
+     *  cuda : bool
+     *      run the orthonormalize step on the GPU (requires a CUDA build, i.e.
+     *      USE_CUDA=ON; throws otherwise). The rest of eval() stays on the CPU.
+     *      The GPU context is not thread-safe -- callers must drive the cuda
+     *      path from a single thread.
      */
     void eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
-              int xcol, const bool *bmask, int min_span, int end_span, bool linear_only);
+              int xcol, const bool *bmask, int min_span, int end_span,
+              bool linear_only, bool cuda = false);
 
     /*
      *  Append a new basis function and update the orthonormalized state.
