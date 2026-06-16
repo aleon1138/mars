@@ -186,17 +186,25 @@ GPU-f64 agree there). Accepted: quality preserved, not bit-reproducible vs CPU o
 correlated features. Now the f64 *projection* GEMM (~174 ms of the 298) is the
 bottleneck, then fill_batch+round_reduce (~110 ms).
 
-### Projection GEMM in f32 -- NEXT, but riskier than T
+### Projection GEMM in f32 -- DONE, opt-in (MARS_CUDA_PROJ_F32=1, default OFF)
 
-Would compound to ~4x (proj ~174 -> ~15 ms). BUT the projection's cancellation is
-in the subtract Bx - Bo*T: for a candidate near span(Bo) the residual is near-zero
-and its *norm* feeds the linear ΔSSE, the DGKS gate, and the degeneracy test, so
-f32 there corrupts the residual *directly* -> risk of spurious ΔSSE peaks on
-near-degenerate columns (the failure mode that killed the f/g f32 attempt: a
-*worse* term winning the argmax, not just a reordering). Must pass the full gates
-PLUS a degenerate-column stress and correlated-feature fit-equivalence before
-trusting it; may be rejected on accuracy. Then fill_batch+round_reduce (memory
--bound) are the floor.
+proj = Bo·T as one cublasSgemm (K=m small), subtracted from Bx in f64 (dBx_f32 --
+the spent phase-0 fill -- is reused as the proj scratch). The a-priori risk was
+spurious ΔSSE peaks on near-degenerate columns (residual cancellation), so it was
+gated hard. Result: it held up. Speed (dev box, n=200k m=400): T-only 381 ->
+T+proj 63 ms/block (~6x more; ~12.7x over the f64 baseline) -- the f64 projection
+was the post-T bottleneck and f32 makes it nearly free, leaving fill_batch +
+round_reduce (memory-bound) as the floor. Accuracy: all 6 CUDA tests at 1e-5
+(incl. degenerate+collinear MatchesCpuKernel); fit R^2 **identical to f64** on
+correlated features AND a 0.98-collinearity stress (Δ=0) -- the feared
+degradation didn't appear (near-degenerate columns lose the argmax anyway; DGKS /
+degeneracy-tol still catch them). Term ordering differs on correlated features
+(same as T-f32). Kept default OFF: more theoretical residual-cancellation risk
+than T, validated only on synthetic stresses -- default it on after real-data
+fit-equivalence if desired (as was done for kchunk).
+
+After T+proj-f32 the GEMMs are no longer the bottleneck; fill_batch + round_reduce
+(memory-bound passes over n×P) are the floor (~63 ms/block on the dev box).
 
 ## Phase 1 GEMM (`T = Boᵀ·Bx`) is store-port-bound
 
