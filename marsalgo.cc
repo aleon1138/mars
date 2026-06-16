@@ -660,6 +660,88 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
 #endif
 }
 
+void MarsAlgo::eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
+                          const bool *mask, int n_xcols, int mask_row_stride)
+{
+    const size_t m = _m;
+
+    // Outputs are (n_xcols, m) row-major contiguous; zero / NaN them.
+    const size_t total = (size_t)n_xcols * m;
+    std::fill_n(linear_dsse, total, 0.0);
+    std::fill_n(hinge_dsse,  total, 0.0);
+    std::fill_n(hinge_cuts,  total, NAN);
+
+#ifdef MARS_USE_CUDA
+    const size_t n = _data->n;
+    if (!_cuda) {
+        _cuda = mars::cuda::context_create(n, _max_terms, _tol);
+    }
+    mars::cuda::context_set_target(_cuda, _data->y.data());
+    mars::cuda::context_sync_basis(_cuda, m,
+                                   _data->B.data(),  _data->n,
+                                   _data->Bo.data(), _data->bo_stride);
+    const size_t cap = mars::cuda::context_batch_capacity(_cuda);
+
+    std::vector<int>    src_xcol(cap), src_basis(cap);
+    std::vector<double> ybx(cap);
+
+    int i0 = 0;
+    while (i0 < n_xcols) {
+        // Greedily pack X-columns [i0, i1) until the candidate count would exceed
+        // the batch capacity. A single X-column always fits (its active count is
+        // <= m <= max_terms <= cap).
+        size_t P = 0;
+        int i1 = i0;
+        while (i1 < n_xcols) {
+            const bool *row = mask + (size_t)i1 * mask_row_stride;
+            size_t p_i = 0;
+            for (size_t k = 0; k < m; ++k) {
+                p_i += row[k] ? 1 : 0;
+            }
+            if (P > 0 && P + p_i > cap) {
+                break;  // block full; defer this X-column to the next block
+            }
+            const int xc_local = i1 - i0;
+            for (size_t k = 0; k < m; ++k) {
+                if (row[k]) {
+                    src_xcol[P]  = xc_local;
+                    src_basis[P] = (int)k;
+                    ++P;
+                }
+            }
+            ++i1;
+        }
+        const size_t nb = (size_t)(i1 - i0);
+
+        if (P > 0) {
+            const float *Xblock = _data->X + (size_t)i0 * _data->ldX;
+            const float *sblk   = _data->s.data() + i0;
+            mars::cuda::orthonormalize_batch(_cuda, m, P, nb,
+                                             Xblock, _data->ldX, sblk,
+                                             src_xcol.data(), src_basis.data(),
+                                             ybx.data());
+            // Scatter ybx² back into linear_dsse, re-deriving (xcol, basis) in the
+            // same row-major/k-ascending order the maps were built in.
+            size_t j = 0;
+            for (int i = i0; i < i1; ++i) {
+                const bool *row = mask + (size_t)i * mask_row_stride;
+                double *out = linear_dsse + (size_t)i * m;
+                for (size_t k = 0; k < m; ++k) {
+                    if (row[k]) {
+                        out[k] = ybx[j] * ybx[j];
+                        ++j;
+                    }
+                }
+            }
+        }
+        i0 = i1;
+    }
+#else
+    (void)mask; (void)mask_row_stride;
+    verify(false, "marslib was built without CUDA support (configure with -DUSE_CUDA=ON)");
+#endif
+}
+
 double MarsAlgo::append(char type, int xcol, int bcol, float h)
 {
     if (_m >= _max_terms) {

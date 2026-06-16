@@ -48,6 +48,13 @@ Context *context_create(size_t n, size_t max_terms, double tol);
 void context_destroy(Context *ctx);
 
 /*
+ *  Candidate-column capacity of the batched scratch (>= max_terms). The caller
+ *  blocks X-columns so that the total candidate columns per orthonormalize_batch
+ *  call does not exceed this.
+ */
+size_t context_batch_capacity(Context *ctx);
+
+/*
  *  Ensure the device holds columns [0, m) of the current basis. B/Bo columns
  *  are append-only over a fit, so this uploads only the columns appended since
  *  the last call (tracked internally by count) -- cheap to call at the top of
@@ -105,6 +112,35 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
                     float *Bx, size_t ldBx,
                     double *ybx = nullptr,
                     std::atomic<long> *dgks_counter = nullptr);
+
+/*
+ *  Batched linear_only orthonormalize: process P candidate columns drawn from a
+ *  block of `nb` X-columns (which all share the resident Bo) in ONE set of GEMMs,
+ *  returning ybx[j] = scale·Σ Bx[:,j]·y for each. This amortizes the GEMM /
+ *  launch / transfer overhead that dominates the one-eval-at-a-time path. The
+ *  matrix Bx is never returned (linear_only). Requires context_set_target() and
+ *  context_sync_basis() up to m first.
+ *
+ *      m         : live orthonormal basis count (resident Bo columns).
+ *      P         : number of candidate (output) columns across the block.
+ *      nb        : number of distinct X-columns in the block (<= P).
+ *      Xblock    : (n, nb) col-major f32 host pointer -- the raw X columns; col
+ *                  stride ldX. Scaled on-device by s_block (so x = X·s is
+ *                  f32-rounded before multiplying by B, matching the per-eval path).
+ *      s_block   : (nb) per-column 1/rms scale.
+ *      src_xcol  : (P) int32 -- output col -> block-local X column in [0, nb).
+ *      src_basis : (P) int32 -- output col -> B/Bo column in [0, m).
+ *      ybx       : (P) f64 host pointer [output].
+ *      dgks_counter (optional): as in orthonormalize().
+ *
+ *  P must be <= the context's batch capacity (budget / ~16n bytes, never below
+ *  max_terms; tune with MARS_CUDA_BLOCK_GB). The caller blocks the X-columns to
+ *  respect that cap.
+ */
+void orthonormalize_batch(Context *ctx, size_t m, size_t P, size_t nb,
+                          const float *Xblock, size_t ldX, const float *s_block,
+                          const int *src_xcol, const int *src_basis,
+                          double *ybx, std::atomic<long> *dgks_counter = nullptr);
 
 } // namespace cuda
 } // namespace mars

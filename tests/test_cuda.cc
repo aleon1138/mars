@@ -312,3 +312,70 @@ TEST(CudaKernelsTest, MatchesCpuKernel)
     // Both gate DGKS on the same near-collinear column.
     ASSERT_EQ(cuda_counter.load(), cpu_counter.load());
 }
+
+/*
+ *  Batched orthonormalize (many X-columns stacked into one set of GEMMs) must
+ *  produce the same ybx as the per-column orthonormalize for each (X-column,
+ *  basis) pair. Both fold the scale and accumulate in f64, so they agree to the
+ *  f64 GEMM-order floor. P (= n_x·m) stays within the default batch capacity --
+ *  the host-side blocking across multiple calls is exercised by the Python
+ *  end-to-end test (eval_batch), which owns the blocking.
+ */
+TEST(CudaKernelsTest, BatchMatchesPerColumn)
+{
+    if (!cuda_available()) {
+        GTEST_SKIP() << "no CUDA device available";
+    }
+    const int n = 4096;
+    const int m = 24;
+    const int n_x = 5;                 // X-columns
+    const int P = n_x * m;             // all (xcol, basis) pairs
+    constexpr double TOL = 1e-14;
+
+    std::mt19937 rng(0x6A7C);
+    MatrixXfC Bo = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+    MatrixXf  B  = MatrixXf::Random(n, m);
+    ArrayXf   y  = ArrayXf::Random(n);
+    MatrixXf  X(n, n_x);
+    X.setRandom();
+    std::vector<float> s(n_x);
+    for (int c = 0; c < n_x; ++c) {
+        s[c] = 0.5f + 0.25f * (float)(c + 1);  // arbitrary positive scales
+    }
+
+    std::vector<int> src_xcol(P), src_basis(P);
+    for (int j = 0, xc = 0; xc < n_x; ++xc) {
+        for (int k = 0; k < m; ++k, ++j) {
+            src_xcol[j]  = xc;
+            src_basis[j] = k;
+        }
+    }
+
+    mars::cuda::Context *ctx = mars::cuda::context_create(n, m, TOL);
+    mars::cuda::context_set_target(ctx, y.data());
+    mars::cuda::context_sync_basis(ctx, m,
+                                   B.data(),  (size_t)B.outerStride(),
+                                   Bo.data(), (size_t)Bo.outerStride());
+
+    std::vector<double> ybx_batch(P, 0.0);
+    mars::cuda::orthonormalize_batch(ctx, m, P, n_x,
+                                     X.data(), (size_t)X.outerStride(), s.data(),
+                                     src_xcol.data(), src_basis.data(),
+                                     ybx_batch.data());
+
+    // Per-column reference on the same context: scale the candidate (f32), then
+    // orthonormalize the single column and read ybx.
+    for (int j = 0; j < P; ++j) {
+        const int xc = src_xcol[j];
+        const int k  = src_basis[j];
+        std::vector<float> x(n);
+        for (int i = 0; i < n; ++i) {
+            x[i] = X(i, xc) * s[xc];
+        }
+        double ref = 0.0;
+        mars::cuda::orthonormalize(ctx, m, 1, x.data(), &k,
+                                   /*Bx=*/nullptr, 0, &ref);
+        EXPECT_NEAR(ybx_batch[j], ref, 1e-6 * (1.0 + std::abs(ref)));
+    }
+    mars::cuda::context_destroy(ctx);
+}

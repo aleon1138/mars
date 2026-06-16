@@ -84,6 +84,22 @@ public:
               bool linear_only, bool cuda = false);
 
     /*
+     *  Batched GPU counterpart of eval() for the linear_only regime: evaluate
+     *  ALL `n_xcols` candidate X-columns at once instead of one per call. The
+     *  candidate columns (across the X-columns that share Bo this epoch) are
+     *  stacked and orthonormalized in blocked GEMMs on the GPU, amortizing the
+     *  per-eval launch/transfer/sync overhead. Fills the (n_xcols, _m) row-major
+     *  `linear_dsse` with the linear delta-SSE for each (X-column, basis) pair
+     *  selected by `mask`; zeros `hinge_dsse` and NaNs `hinge_cuts` (no hinges).
+     *  Requires a CUDA build (throws otherwise).
+     *
+     *      mask            : (n_xcols, _m) bool; row stride `mask_row_stride`.
+     *      linear/hinge/cut: (n_xcols, _m) row-major, contiguous (stride _m).
+     */
+    void eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
+                    const bool *mask, int n_xcols, int mask_row_stride);
+
+    /*
      *  Append a new basis function and update the orthonormalized state.
      *  Returns the MSE after adding the basis, or -1 if the basis is
      *  numerically degenerate.

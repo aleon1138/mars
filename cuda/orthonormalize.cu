@@ -141,6 +141,40 @@ __global__ void fill_kernel(const float *B, size_t n, const float *x,
     bx64[idx] = (double)v;
 }
 
+// Scale a block of candidate X columns in place: Xcand[:,c] *= s[c]. Done as a
+// distinct f32 pass (not folded into fill_batch) so the candidate is rounded to
+// f32 before multiplying by B -- matching the CPU's x = X·s then B·x ordering.
+__global__ void scale_xcand_kernel(float *Xcand, size_t n, const float *s)
+{
+    const size_t c = blockIdx.y;
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    Xcand[c * n + i] *= s[c];
+}
+
+// Batched fill: Bx[:,j] = B[:, src_basis[j]] .* Xcand[:, src_xcol[j]], stacking
+// candidate columns from many X-columns (which share Bo) into one matrix. Each
+// output column j names its parent basis column and its (block-local) candidate
+// X column. f32 store + f64 widen, as in fill_kernel.
+__global__ void fill_batch_kernel(const float *B, size_t n, const float *Xcand,
+                                  const int *src_xcol, const int *src_basis,
+                                  float *bx32, double *bx64)
+{
+    const size_t j = blockIdx.y;
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int k  = src_basis[j];
+    const int xc = src_xcol[j];
+    const float v = B[(size_t)k * n + i] * Xcand[(size_t)xc * n + i];
+    const size_t idx = j * n + i;
+    bx32[idx] = v;
+    bx64[idx] = (double)v;
+}
+
 // Fused round + norm + dot, parallelized over both columns and rows.
 //
 // For each column j (= blockIdx.y), tiles of rows are split across blockIdx.x
@@ -283,6 +317,7 @@ struct Context {
     size_t n         = 0;
     size_t max_terms = 0;
     size_t ldT       = 0;   // == max_terms
+    size_t p_cap     = 0;   // candidate-column capacity of the scratch (>= max_terms)
     double tol       = 0.0;
     size_t m_synced  = 0;   // columns of B/Bo currently resident on device
 
@@ -292,25 +327,33 @@ struct Context {
     float  *dy      = nullptr;  // (n) normalized target
     const float *target_ptr = nullptr;  // host y pointer last uploaded to dy
 
-    // per-call scratch (sized for the worst case p == max_terms)
-    float  *dBx_f32 = nullptr;  // (n, max_terms) col-major, ld n
-    double *dBx_f64 = nullptr;  // (n, max_terms) col-major, ld n
-    double *dT      = nullptr;  // (max_terms, max_terms) col-major, ld max_terms
-    float  *dx      = nullptr;  // (n)
-    int    *dmask   = nullptr;  // (max_terms)
-    double *ds       = nullptr;  // (max_terms)
-    double *dtnorm2  = nullptr;  // (max_terms)
-    double *dybx_raw = nullptr;  // (max_terms) Σ Bx·y on the un-normalized column
-    double *dybx     = nullptr;  // (max_terms) scale·ybx_raw -- the ΔSSE input
-    float  *dscale   = nullptr;  // (max_terms)
-    int    *dflags  = nullptr;  // (max_terms)
+    // per-call scratch (sized for the worst case p == p_cap; the per-eval path
+    // uses the leading <= max_terms columns, the batched path up to p_cap)
+    float  *dBx_f32 = nullptr;  // (n, p_cap) col-major, ld n
+    double *dBx_f64 = nullptr;  // (n, p_cap) col-major, ld n
+    double *dT      = nullptr;  // (max_terms, p_cap) col-major, ld max_terms
+    float  *dx      = nullptr;  // (n) single candidate (per-eval path)
+    int    *dmask   = nullptr;  // (p_cap)
+    double *ds       = nullptr;  // (p_cap)
+    double *dtnorm2  = nullptr;  // (p_cap)
+    double *dybx_raw = nullptr;  // (p_cap) Σ Bx·y on the un-normalized column
+    double *dybx     = nullptr;  // (p_cap) scale·ybx_raw -- the ΔSSE input
+    float  *dscale   = nullptr;  // (p_cap)
+    int    *dflags  = nullptr;  // (p_cap)
     float  *dBo_col = nullptr;  // (n) Bo-column widen staging
+
+    // batched path: a block of nb candidate X-columns (nb <= p_cap), scaled, plus
+    // the per-output-column source maps.
+    float  *dXcand    = nullptr;  // (n, p_cap) col-major -- scaled candidate X cols
+    float  *dsblk     = nullptr;  // (p_cap) per-candidate-column scale
+    int    *dsrc_xcol = nullptr;  // (p_cap) output col -> block-local X col
+    int    *dsrc_basis = nullptr; // (p_cap) output col -> B/Bo column
 
     // host staging
     std::vector<float>  h_stage;    // (n) gather one Bo column
-    std::vector<double> h_ds;       // (max_terms)
-    std::vector<double> h_tnorm2;   // (max_terms)
-    std::vector<int>    h_flags;    // (max_terms)
+    std::vector<double> h_ds;       // (p_cap)
+    std::vector<double> h_tnorm2;   // (p_cap)
+    std::vector<int>    h_flags;    // (p_cap)
 };
 
 Context *context_create(size_t n, size_t max_terms, double tol)
@@ -344,27 +387,51 @@ Context *context_create(size_t n, size_t max_terms, double tol)
                 (int)CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT);
         }
 
-        const size_t nmt = n * max_terms;
-        CUDA_CHECK(cudaMalloc(&ctx->dB,      nmt * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&ctx->dBo_f64, nmt * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&ctx->dy,      n * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&ctx->dBx_f32, nmt * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&ctx->dBx_f64, nmt * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&ctx->dT,      max_terms * max_terms * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&ctx->dx,      n * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&ctx->dmask,   max_terms * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&ctx->ds,       max_terms * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&ctx->dtnorm2,  max_terms * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&ctx->dybx_raw, max_terms * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&ctx->dybx,     max_terms * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&ctx->dscale,   max_terms * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&ctx->dflags,  max_terms * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&ctx->dBo_col, n * sizeof(float)));
+        // Candidate-column capacity for the batched path. Per output column the
+        // scratch costs ~ (Bx_f32 4 + Bx_f64 8 + Xcand 4) = 16 bytes/row, so cap
+        // the block at MARS_CUDA_BLOCK_GB (default 8) GB of n-row columns. Never
+        // below max_terms (the per-eval path needs that many).
+        double block_gb = 8.0;
+        if (const char *bg = std::getenv("MARS_CUDA_BLOCK_GB")) {
+            const double v = std::atof(bg);
+            if (v > 0.0) {
+                block_gb = v;
+            }
+        }
+        const size_t budget = (size_t)(block_gb * 1e9);
+        const size_t bytes_per_col = n * (sizeof(float) + sizeof(double) + sizeof(float));
+        size_t p_cap = budget / (bytes_per_col ? bytes_per_col : 1);
+        if (p_cap < max_terms) {
+            p_cap = max_terms;
+        }
+        ctx->p_cap = p_cap;
+
+        const size_t nmt = n * max_terms;   // resident basis
+        const size_t npc = n * p_cap;        // batched scratch
+        CUDA_CHECK(cudaMalloc(&ctx->dB,        nmt * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx->dBo_f64,   nmt * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dy,        n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx->dBx_f32,   npc * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx->dBx_f64,   npc * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dT,        max_terms * p_cap * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dx,        n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx->dmask,     p_cap * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&ctx->ds,        p_cap * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dtnorm2,   p_cap * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dybx_raw,  p_cap * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dybx,      p_cap * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dscale,    p_cap * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx->dflags,    p_cap * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&ctx->dBo_col,   n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx->dXcand,    npc * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx->dsblk,     p_cap * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx->dsrc_xcol, p_cap * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&ctx->dsrc_basis, p_cap * sizeof(int)));
 
         ctx->h_stage.resize(n);
-        ctx->h_ds.resize(max_terms);
-        ctx->h_tnorm2.resize(max_terms);
-        ctx->h_flags.resize(max_terms);
+        ctx->h_ds.resize(p_cap);
+        ctx->h_tnorm2.resize(p_cap);
+        ctx->h_flags.resize(p_cap);
     } catch (...) {
         context_destroy(ctx);
         throw;
@@ -392,6 +459,10 @@ void context_destroy(Context *ctx)
     cudaFree(ctx->dscale);
     cudaFree(ctx->dflags);
     cudaFree(ctx->dBo_col);
+    cudaFree(ctx->dXcand);
+    cudaFree(ctx->dsblk);
+    cudaFree(ctx->dsrc_xcol);
+    cudaFree(ctx->dsrc_basis);
     if (ctx->handle) {
         cublasDestroy(ctx->handle);
     }
@@ -441,6 +512,11 @@ void context_sync_basis(Context *ctx, size_t m,
     ctx->m_synced = m;
 }
 
+size_t context_batch_capacity(Context *ctx)
+{
+    return ctx->p_cap;
+}
+
 void context_set_target(Context *ctx, const float *y)
 {
     if (ctx->target_ptr == y) {
@@ -452,6 +528,90 @@ void context_set_target(Context *ctx, const float *y)
     ctx->target_ptr = y;
 }
 
+// Shared post-fill pipeline for P candidate columns already laid out in
+// dBx_f32 (rounded) / dBx_f64 (widened): T = Boᵀ·Bx, project out Bo, fused
+// round + norm + (optional) Σ Bx·y, DGKS retry on cancelling columns, and
+// scale-fold. On return ctx->ds / ctx->dscale / ctx->dybx (if want_dot) hold
+// the per-column results; the caller owns any downloads and the final sync.
+static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
+                           std::atomic<long> *dgks_counter)
+{
+    const size_t n   = ctx->n;
+    const size_t ldT = ctx->ldT;
+    const double tol = ctx->tol;
+    cudaStream_t   s = ctx->stream;
+    const double one = 1.0, zero = 0.0, neg_one = -1.0;
+    const dim3 block(BLOCK);
+
+    // Phase 1: T = Boᵀ · Bx  (m×P, f64).
+    gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_T, CUBLAS_OP_N,
+           (int)m, (int)P, (int)n, &one, ctx->dBo_f64, (int)n,
+           ctx->dBx_f64, (int)n, &zero, ctx->dT, (int)ldT);
+
+    // Phase 2a: Bx -= Bo·T (in place, f64), then one fused pass that rounds to
+    // f32, stores it, and reduces ‖Bx[:,j]‖² (ds) and Σ Bx·y (ybx_raw), split
+    // over rows AND columns (atomic f64 partials) so the whole GPU is used.
+    gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_N, CUBLAS_OP_N,
+           (int)n, (int)P, (int)m, &neg_one, ctx->dBo_f64, (int)n,
+           ctx->dT, (int)ldT, &one, ctx->dBx_f64, (int)n);
+    unsigned tiles = (unsigned)std::min<size_t>(64, (n + BLOCK - 1) / BLOCK);
+    if (tiles == 0) {
+        tiles = 1;
+    }
+    const dim3 grid_reduce(tiles, (unsigned)P);
+    CUDA_CHECK(cudaMemsetAsync(ctx->ds, 0, P * sizeof(double), s));
+    if (want_dot) {
+        CUDA_CHECK(cudaMemsetAsync(ctx->dybx_raw, 0, P * sizeof(double), s));
+    }
+    round_reduce_kernel<<<grid_reduce, block, 0, s>>>(
+        ctx->dBx_f64, ctx->dBx_f32, ctx->dy, n, ctx->ds, ctx->dybx_raw, want_dot);
+    check_launch();
+
+    // Phase 2b: DGKS gate. s[j] > tol && s[j]*9 < ‖T[:,j]‖² -> retry.
+    colsumsq_f64_kernel<<<(unsigned)P, block, 0, s>>>(ctx->dT, ldT, m, ctx->dtnorm2);
+    check_launch();
+    CUDA_CHECK(cudaMemcpyAsync(ctx->h_ds.data(), ctx->ds, P * sizeof(double),
+                               cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(ctx->h_tnorm2.data(), ctx->dtnorm2,
+                               P * sizeof(double), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaStreamSynchronize(s));
+
+    long fired = 0;
+    for (size_t j = 0; j < P; ++j) {
+        const bool flag = ctx->h_ds[j] > tol &&
+                          ctx->h_ds[j] * mars::DGKS_GATE_RATIO_SQ < ctx->h_tnorm2[j];
+        ctx->h_flags[j] = flag ? 1 : 0;
+        fired += flag ? 1 : 0;
+    }
+
+    if (fired > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(ctx->dflags, ctx->h_flags.data(),
+                                   P * sizeof(int), cudaMemcpyHostToDevice, s));
+        const size_t total = n * P;
+        const dim3 grid_total((unsigned)((total + BLOCK - 1) / BLOCK));
+        widen_kernel<<<grid_total, block, 0, s>>>(ctx->dBx_f32, ctx->dBx_f64, total);
+        check_launch();
+        gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_T, CUBLAS_OP_N,
+               (int)m, (int)P, (int)n, &one, ctx->dBo_f64, (int)n,
+               ctx->dBx_f64, (int)n, &zero, ctx->dT, (int)ldT);
+        gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_N, CUBLAS_OP_N,
+               (int)n, (int)P, (int)m, &neg_one, ctx->dBo_f64, (int)n,
+               ctx->dT, (int)ldT, &one, ctx->dBx_f64, (int)n);
+        round_reduce_masked_kernel<<<(unsigned)P, block, 0, s>>>(
+            ctx->dBx_f64, ctx->dBx_f32, ctx->dy, n,
+            ctx->ds, ctx->dybx_raw, ctx->dflags, want_dot);
+        check_launch();
+        if (dgks_counter) {
+            dgks_counter->fetch_add(fired, std::memory_order_relaxed);
+        }
+    }
+
+    // Phase 2c: scale, folded into ybx (= scale·Σ Bx·y).
+    scale_fold_kernel<<<(unsigned)((P + BLOCK - 1) / BLOCK), block, 0, s>>>(
+        ctx->ds, ctx->dscale, ctx->dybx_raw, ctx->dybx, P, tol, want_dot);
+    check_launch();
+}
+
 void orthonormalize(Context *ctx, size_t m, size_t p,
                     const float *x, const int *mask,
                     float *Bx, size_t ldBx,
@@ -461,113 +621,29 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
     if (p == 0) {
         return;
     }
-    const size_t n   = ctx->n;
-    const size_t ldT = ctx->ldT;
-    const double tol = ctx->tol;
-    cudaStream_t   s = ctx->stream;
-    const double one = 1.0, zero = 0.0, neg_one = -1.0;
+    const size_t n = ctx->n;
+    cudaStream_t s = ctx->stream;
+    const dim3 block(BLOCK);
+    const dim3 grid_np((n + BLOCK - 1) / BLOCK, (unsigned)p);
+    const int want_dot = (ybx != nullptr) ? 1 : 0;
 
-    // Upload the candidate column and the active-basis mask.
+    // Upload the candidate column + active-basis mask, fill Bx = B[:,mask]·x.
     CUDA_CHECK(cudaMemcpyAsync(ctx->dx, x, n * sizeof(float),
                                cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(ctx->dmask, mask, p * sizeof(int),
                                cudaMemcpyHostToDevice, s));
-
-    // Phase 0: Bx = B[:,mask] .* x  (f32 store + f64 widen).
-    const dim3 block(BLOCK);
-    const dim3 grid_np((n + BLOCK - 1) / BLOCK, p);
     fill_kernel<<<grid_np, block, 0, s>>>(ctx->dB, n, ctx->dx, ctx->dmask,
                                           ctx->dBx_f32, ctx->dBx_f64);
     check_launch();
 
-    // Phase 1: T = Boᵀ · Bx   (m×p, f64).
-    gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_T, CUBLAS_OP_N,
-           (int)m, (int)p, (int)n,
-           &one, ctx->dBo_f64, (int)n,
-           ctx->dBx_f64, (int)n,
-           &zero, ctx->dT, (int)ldT);
+    project_reduce(ctx, m, p, want_dot, dgks_counter);
 
-    // Phase 2a: Bx -= Bo · T (in place, f64), then a single fused pass that
-    // rounds to f32, stores it, and reduces both ||Bx[:,j]||² (ds) and Σ Bx·y
-    // (ybx_raw). The reduction is split over rows AND columns (atomic f64
-    // partials), so the whole GPU is used -- not one block per column.
-    gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_N, CUBLAS_OP_N,
-           (int)n, (int)p, (int)m,
-           &neg_one, ctx->dBo_f64, (int)n,
-           ctx->dT, (int)ldT,
-           &one, ctx->dBx_f64, (int)n);
-    const int want_dot = (ybx != nullptr) ? 1 : 0;
-    unsigned tiles = (unsigned)std::min<size_t>(64, (n + BLOCK - 1) / BLOCK);
-    if (tiles == 0) {
-        tiles = 1;
-    }
-    const dim3 grid_reduce(tiles, (unsigned)p);
-    CUDA_CHECK(cudaMemsetAsync(ctx->ds, 0, p * sizeof(double), s));
-    if (want_dot) {
-        CUDA_CHECK(cudaMemsetAsync(ctx->dybx_raw, 0, p * sizeof(double), s));
-    }
-    round_reduce_kernel<<<grid_reduce, block, 0, s>>>(
-        ctx->dBx_f64, ctx->dBx_f32, ctx->dy, n, ctx->ds, ctx->dybx_raw, want_dot);
-    check_launch();
-
-    // Phase 2b: DGKS gate. s[j] > tol && s[j]*9 < ||T[:,j]||^2 -> retry.
-    colsumsq_f64_kernel<<<(unsigned)p, block, 0, s>>>(ctx->dT, ldT, m, ctx->dtnorm2);
-    check_launch();
-    CUDA_CHECK(cudaMemcpyAsync(ctx->h_ds.data(), ctx->ds, p * sizeof(double),
-                               cudaMemcpyDeviceToHost, s));
-    CUDA_CHECK(cudaMemcpyAsync(ctx->h_tnorm2.data(), ctx->dtnorm2,
-                               p * sizeof(double), cudaMemcpyDeviceToHost, s));
-    CUDA_CHECK(cudaStreamSynchronize(s));
-
-    long fired = 0;
-    for (size_t j = 0; j < p; ++j) {
-        const bool flag = ctx->h_ds[j] > tol &&
-                          ctx->h_ds[j] * mars::DGKS_GATE_RATIO_SQ < ctx->h_tnorm2[j];
-        ctx->h_flags[j] = flag ? 1 : 0;
-        fired += flag ? 1 : 0;
-    }
-
-    if (fired > 0) {
-        CUDA_CHECK(cudaMemcpyAsync(ctx->dflags, ctx->h_flags.data(),
-                                   p * sizeof(int), cudaMemcpyHostToDevice, s));
-        // Re-orthogonalize from the rounded Bx: widen, recompute T, reproject,
-        // then recompute ds/ybx_raw for the flagged columns only.
-        const size_t total = n * p;
-        const dim3 grid_total((unsigned)((total + BLOCK - 1) / BLOCK));
-        widen_kernel<<<grid_total, block, 0, s>>>(ctx->dBx_f32, ctx->dBx_f64, total);
-        check_launch();
-        CUBLAS_CHECK(cublasDgemm(ctx->handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                 (int)m, (int)p, (int)n,
-                                 &one, ctx->dBo_f64, (int)n,
-                                 ctx->dBx_f64, (int)n,
-                                 &zero, ctx->dT, (int)ldT));
-        CUBLAS_CHECK(cublasDgemm(ctx->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                 (int)n, (int)p, (int)m,
-                                 &neg_one, ctx->dBo_f64, (int)n,
-                                 ctx->dT, (int)ldT,
-                                 &one, ctx->dBx_f64, (int)n));
-        round_reduce_masked_kernel<<<(unsigned)p, block, 0, s>>>(
-            ctx->dBx_f64, ctx->dBx_f32, ctx->dy, n,
-            ctx->ds, ctx->dybx_raw, ctx->dflags, want_dot);
-        check_launch();
-        if (dgks_counter) {
-            dgks_counter->fetch_add(fired, std::memory_order_relaxed);
-        }
-    }
-
-    // Phase 2c: scale, and fold it into ybx (= scale·Σ Bx·y -- the normalized
-    // column dot, no separate normalize pass needed for the linear ΔSSE).
-    scale_fold_kernel<<<(unsigned)((p + BLOCK - 1) / BLOCK), block, 0, s>>>(
-        ctx->ds, ctx->dscale, ctx->dybx_raw, ctx->dybx, p, tol, want_dot);
-    check_launch();
     if (ybx) {
         CUDA_CHECK(cudaMemcpyAsync(ybx, ctx->dybx, p * sizeof(double),
                                    cudaMemcpyDeviceToHost, s));
     }
-
     // Only when the caller needs the matrix itself (hinge sweep) do we physically
-    // normalize and copy Bx back. In linear_only Bx is nullptr and never leaves
-    // the device, so the normalize pass is skipped entirely.
+    // normalize and copy Bx back. In linear_only Bx is nullptr and stays resident.
     if (Bx) {
         normalize_kernel<<<grid_np, block, 0, s>>>(ctx->dBx_f32, ctx->dscale, n);
         check_launch();
@@ -577,6 +653,53 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
             n * sizeof(float), p,
             cudaMemcpyDeviceToHost, s));
     }
+    CUDA_CHECK(cudaStreamSynchronize(s));
+}
+
+void orthonormalize_batch(Context *ctx, size_t m, size_t P, size_t nb,
+                          const float *Xblock, size_t ldX, const float *s_block,
+                          const int *src_xcol, const int *src_basis,
+                          double *ybx, std::atomic<long> *dgks_counter)
+{
+    if (P == 0) {
+        return;
+    }
+    if (P > ctx->p_cap) {
+        throw std::runtime_error(
+            "orthonormalize_batch: P exceeds batch capacity (caller must block)");
+    }
+    const size_t n = ctx->n;
+    cudaStream_t s = ctx->stream;
+    const dim3 block(BLOCK);
+
+    // Upload the raw X block (n×nb) and per-column scales, then scale in place so
+    // the candidate is f32-rounded (matching x = X·s) before fill multiplies by B.
+    CUDA_CHECK(cudaMemcpy2DAsync(
+        ctx->dXcand, n * sizeof(float),
+        Xblock, ldX * sizeof(float),
+        n * sizeof(float), nb,
+        cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(ctx->dsblk, s_block, nb * sizeof(float),
+                               cudaMemcpyHostToDevice, s));
+    const dim3 grid_nb((n + BLOCK - 1) / BLOCK, (unsigned)nb);
+    scale_xcand_kernel<<<grid_nb, block, 0, s>>>(ctx->dXcand, n, ctx->dsblk);
+    check_launch();
+
+    // Upload the per-output-column source maps and fill the stacked Bx (n×P).
+    CUDA_CHECK(cudaMemcpyAsync(ctx->dsrc_xcol, src_xcol, P * sizeof(int),
+                               cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(ctx->dsrc_basis, src_basis, P * sizeof(int),
+                               cudaMemcpyHostToDevice, s));
+    const dim3 grid_nP((n + BLOCK - 1) / BLOCK, (unsigned)P);
+    fill_batch_kernel<<<grid_nP, block, 0, s>>>(
+        ctx->dB, n, ctx->dXcand, ctx->dsrc_xcol, ctx->dsrc_basis,
+        ctx->dBx_f32, ctx->dBx_f64);
+    check_launch();
+
+    project_reduce(ctx, m, P, /*want_dot=*/1, dgks_counter);
+
+    CUDA_CHECK(cudaMemcpyAsync(ybx, ctx->dybx, P * sizeof(double),
+                               cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
 }
 
