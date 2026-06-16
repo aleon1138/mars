@@ -1,5 +1,8 @@
 #include "marsalgo.h"
 #include "kernels.h"
+#ifdef MARS_USE_CUDA
+#   include "cuda/mars_cuda.h"
+#endif
 #include <numeric>          // for std::iota
 #include <cfloat>           // for DBL_EPSILON
 #include <cmath>            // for std::sqrt, std::isfinite
@@ -369,6 +372,11 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
 MarsAlgo::~MarsAlgo()
 {
     delete _data;
+#ifdef MARS_USE_CUDA
+    if (_cuda) {
+        mars::cuda::context_destroy(_cuda);
+    }
+#endif
 }
 int MarsAlgo::nbasis() const
 {
@@ -392,7 +400,8 @@ double MarsAlgo::yvar() const
 }
 
 void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
-                    int xcol, const bool *bmask, int min_span, int end_span, bool linear_only)
+                    int xcol, const bool *bmask, int min_span, int end_span,
+                    bool linear_only, bool cuda)
 {
     // xcol is a signed caller-supplied index; the >= 0 guard makes the
     // (size_t) compare against the column count well-defined.
@@ -443,16 +452,37 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
      *  orthonormalize(); it is overwritten immediately below with Bxᵀ * y.
      */
     double *ybx = S.ybx.data();
-    mars::orthonormalize(
-        n, _m, p,
-        _data->B.data(),  _data->n,
-        x,
-        bcols,
-        _data->Bo.data(), _data->bo_stride,
-        Bx,               n,
-        S.BoTBx.data(),   S.cap,
-        ybx,
-        _tol);
+    if (cuda) {
+#ifdef MARS_USE_CUDA
+        /*
+         *  GPU orthonormalize. The resident context is created lazily (so
+         *  CPU-only fits never touch the GPU) and synced by column count -- B/Bo
+         *  are append-only, so this uploads only columns added since the last
+         *  cuda eval. T and the per-column norms stay on the device; only Bx is
+         *  copied back, and the linear ΔSSE below runs on the CPU as usual.
+         */
+        if (!_cuda) {
+            _cuda = mars::cuda::context_create(n, _max_terms, _tol);
+        }
+        mars::cuda::context_sync_basis(_cuda, _m,
+                                       _data->B.data(),  _data->n,
+                                       _data->Bo.data(), _data->bo_stride);
+        mars::cuda::orthonormalize(_cuda, _m, p, x, bcols, Bx, n);
+#else
+        verify(false, "marslib was built without CUDA support (configure with -DUSE_CUDA=ON)");
+#endif
+    } else {
+        mars::orthonormalize(
+            n, _m, p,
+            _data->B.data(),  _data->n,
+            x,
+            bcols,
+            _data->Bo.data(), _data->bo_stride,
+            Bx,               n,
+            S.BoTBx.data(),   S.cap,
+            ybx,
+            _tol);
+    }
 
     /*
      *  Calculate the linear delta SSE and map to the output buffer. Bx.col(j)

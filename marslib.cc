@@ -1,5 +1,8 @@
 #include "marsalgo.h"
 #include <omp.h>
+#include <atomic>
+#include <stdexcept>
+#include <string>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 namespace py = pybind11;
@@ -36,7 +39,7 @@ MarsAlgo * new_algo(
 ///////////////////////////////////////////////////////////////////////////////
 
 py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
-               int min_span, int endspan, bool linear, int threads)
+               int min_span, int endspan, bool linear, int threads, bool cuda)
 {
     py::buffer_info mask_info = mask_array.request();
     verify(mask_info.ndim == 2, "expected 2D array for mask");
@@ -60,11 +63,21 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
     threads = std::min<int>(threads, mask_rows);
 
     /*
+     *  The CUDA orthonormalize context is shared, single-stream and not
+     *  thread-safe, so the GPU path runs from a single host thread (the GPU
+     *  itself provides the parallelism within each eval()).
+     */
+    if (cuda) {
+        threads = 1;
+    }
+
+    /*
      * `mask` is a (r,c) boolean matrix where `r` is the number of columns of
      * the design matrix `X` and `c` is the number of basis already chosen by
      * the algorithm.
      */
     std::atomic<bool> ok{true};
+    std::string err;  // first C++ error message, if any (guarded by `critical`)
     {
         py::gil_scoped_release gil_r;
         #pragma omp parallel num_threads(threads)
@@ -80,12 +93,20 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
             /*
              *  eval() uses a function-local thread_local scratch, grown on
              *  demand and reused across calls -- no caller-supplied buffer.
+             *  C++ exceptions (e.g. a CUDA error) must not escape the OpenMP
+             *  region, so catch them here and surface via `ok`/`err`.
              */
             #pragma omp for schedule(static)
             for (int i = 0; i < mask_rows; ++i) {
                 if (ok.load(std::memory_order_relaxed)) {
-                    algo.eval(&dsse1_ptr(i,0), &dsse2_ptr(i,0), &h_cut_ptr(i,0),
-                              i, &mask(i,0), min_span, endspan, linear);
+                    try {
+                        algo.eval(&dsse1_ptr(i,0), &dsse2_ptr(i,0), &h_cut_ptr(i,0),
+                                  i, &mask(i,0), min_span, endspan, linear, cuda);
+                    } catch (const std::exception &e) {
+                        #pragma omp critical
+                        { if (err.empty()) err = e.what(); }
+                        ok.store(false, std::memory_order_relaxed);
+                    }
                 }
 
                 if (i % 32 == 0) {
@@ -99,6 +120,9 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
     }
 
     if (!ok) {
+        if (!err.empty()) {
+            throw std::runtime_error(err);
+        }
         throw py::error_already_set();
     }
 
@@ -129,6 +153,7 @@ PYBIND11_MODULE(marslib, m)
          , py::arg("endspan")
          , py::arg("linear_only")
          , py::arg("threads")
+         , py::arg("cuda") = false
         )
     .def("nbasis",       &MarsAlgo::nbasis)
     .def("yvar",         &MarsAlgo::yvar)

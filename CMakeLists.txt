@@ -13,6 +13,33 @@ endif()
 find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
 
+# --- CUDA (opt-in) -----------------------------------------------------------
+# Build the GPU orthonormalize kernels into a static lib and link it into
+# marslib.so. OFF by default so CPU-only builds / CI without nvcc still work.
+# Enable with -DUSE_CUDA=ON (or, for a wheel, pip install . -C cmake.define.USE_CUDA=ON).
+option(USE_CUDA "Build CUDA orthonormalize kernels" OFF)
+if(USE_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    # 75 = RTX 2080 Ti (dev), 120 = RTX PRO 6000 Blackwell (research server).
+    # Override with -DCMAKE_CUDA_ARCHITECTURES=... once the target is pinned.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "75;120")
+    endif()
+
+    add_library(mars_cuda STATIC cuda/orthonormalize.cu)
+    set_target_properties(mars_cuda PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)   # linked into a shared object (marslib.so)
+    target_include_directories(mars_cuda PRIVATE "${CMAKE_SOURCE_DIR}")  # kernels.h
+    # mars_cuda must NOT inherit mars_common (nvcc rejects -march=native). Keep
+    # the project's hidden-visibility hygiene by passing it to the host compiler.
+    target_compile_options(mars_cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fvisibility=hidden>)
+    target_link_libraries(mars_cuda PRIVATE CUDA::cublas CUDA::cudart)
+endif()
+
 # Eigen3 is used only by the C++ unit tests (as the correctness oracle); the
 # shipped library is Eigen-free. find_package(Eigen3) lives in the BUILD_TESTING
 # block below, so a library/wheel build does not require Eigen at all.
@@ -71,6 +98,10 @@ endif()
 # --- pybind11 module ---------------------------------------------------------
 pybind11_add_module(marslib marslib.cc marsalgo.cc kernels.cc)
 target_link_libraries(marslib PRIVATE mars_common)
+if(USE_CUDA)
+    target_link_libraries(marslib PRIVATE mars_cuda)
+    target_compile_definitions(marslib PRIVATE MARS_USE_CUDA)
+endif()
 
 # For standalone dev builds, drop marslib*.so next to mars.py so `import
 # marslib` works from the source tree. scikit-build-core sets SKBUILD when it
@@ -114,5 +145,21 @@ if(BUILD_TESTING)
         target_link_libraries(unittest PRIVATE Eigen3::Eigen)
     else()
         target_link_libraries(unittest PRIVATE PkgConfig::EIGEN3)
+    endif()
+
+    # CUDA orthonormalize tests: validate the GPU path against the same Eigen
+    # oracle and against the CPU kernel. Host-compiled (calls only the
+    # mars::cuda::* host API), linked against the CUDA static lib.
+    if(USE_CUDA)
+        add_executable(test_cuda tests/test_cuda.cc kernels.cc)
+        target_include_directories(test_cuda PRIVATE "${CMAKE_SOURCE_DIR}")
+        target_link_libraries(test_cuda PRIVATE
+            mars_common mars_cuda CUDA::cudart
+            GTest::gtest GTest::gtest_main Threads::Threads)
+        if(Eigen3_FOUND)
+            target_link_libraries(test_cuda PRIVATE Eigen3::Eigen)
+        else()
+            target_link_libraries(test_cuda PRIVATE PkgConfig::EIGEN3)
+        endif()
     endif()
 endif()
