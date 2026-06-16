@@ -141,17 +141,16 @@ __global__ void fill_kernel(const float *B, size_t n, const float *x,
     bx64[idx] = (double)v;
 }
 
-// Scale a block of candidate X columns in place: Xcand[:,c] *= s[c]. Done as a
-// distinct f32 pass (not folded into fill_batch) so the candidate is rounded to
-// f32 before multiplying by B -- matching the CPU's x = X·s then B·x ordering.
-__global__ void scale_xcand_kernel(float *Xcand, size_t n, const float *s)
+// Scale one resident candidate column in place: col[:] *= s. A distinct f32
+// pass (not folded into fill_batch) so the candidate is rounded to f32 before
+// multiplying by B -- matching the CPU's x = X·s then B·x ordering. Run once per
+// column when it first becomes resident (context_sync_xcols).
+__global__ void scale_col_kernel(float *col, size_t n, float s)
 {
-    const size_t c = blockIdx.y;
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) {
-        return;
+    if (i < n) {
+        col[i] *= s;
     }
-    Xcand[c * n + i] *= s[c];
 }
 
 // Batched fill: Bx[:,j] = B[:, src_basis[j]] .* Xcand[:, src_xcol[j]], stacking
@@ -342,11 +341,13 @@ struct Context {
     int    *dflags  = nullptr;  // (p_cap)
     float  *dBo_col = nullptr;  // (n) Bo-column widen staging
 
-    // batched path: a block of nb candidate X-columns (nb <= p_cap), scaled, plus
-    // the per-output-column source maps.
-    float  *dXcand    = nullptr;  // (n, p_cap) col-major -- scaled candidate X cols
-    float  *dsblk     = nullptr;  // (p_cap) per-candidate-column scale
-    int    *dsrc_xcol = nullptr;  // (p_cap) output col -> block-local X col
+    // batched path: resident scaled candidates (x_c = X[:,c]·s[c]) and the
+    // per-output-column source maps. dXscaled is allocated (n, p_x) on the first
+    // context_sync_xcols call; columns are uploaded+scaled lazily, once each.
+    float  *dXscaled  = nullptr;  // (n, p_x) col-major -- resident scaled candidates
+    size_t  p_x       = 0;        // X-column count (dXscaled width)
+    std::vector<char> x_resident; // (p_x) which columns are uploaded+scaled
+    int    *dsrc_xcol = nullptr;  // (p_cap) output col -> global X column
     int    *dsrc_basis = nullptr; // (p_cap) output col -> B/Bo column
 
     // host staging
@@ -423,10 +424,9 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         CUDA_CHECK(cudaMalloc(&ctx->dscale,    p_cap * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dflags,    p_cap * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ctx->dBo_col,   n * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&ctx->dXcand,    npc * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&ctx->dsblk,     p_cap * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dsrc_xcol, p_cap * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ctx->dsrc_basis, p_cap * sizeof(int)));
+        // dXscaled is allocated lazily in context_sync_xcols (needs p_x).
 
         ctx->h_stage.resize(n);
         ctx->h_ds.resize(p_cap);
@@ -459,8 +459,7 @@ void context_destroy(Context *ctx)
     cudaFree(ctx->dscale);
     cudaFree(ctx->dflags);
     cudaFree(ctx->dBo_col);
-    cudaFree(ctx->dXcand);
-    cudaFree(ctx->dsblk);
+    cudaFree(ctx->dXscaled);
     cudaFree(ctx->dsrc_xcol);
     cudaFree(ctx->dsrc_basis);
     if (ctx->handle) {
@@ -526,6 +525,33 @@ void context_set_target(Context *ctx, const float *y)
                                cudaMemcpyHostToDevice, ctx->stream));
     CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
     ctx->target_ptr = y;
+}
+
+void context_sync_xcols(Context *ctx, size_t p_x,
+                        const float *X, size_t ldX, const float *s,
+                        const int *cols, size_t ncols)
+{
+    const size_t n = ctx->n;
+    if (!ctx->dXscaled) {
+        CUDA_CHECK(cudaMalloc(&ctx->dXscaled, n * p_x * sizeof(float)));
+        ctx->p_x = p_x;
+        ctx->x_resident.assign(p_x, 0);
+    }
+    const dim3 grid_col((n + BLOCK - 1) / BLOCK);
+    for (size_t t = 0; t < ncols; ++t) {
+        const int c = cols[t];
+        if (ctx->x_resident[c]) {
+            continue;  // x_c = X[:,c]·s[c] is fixed for the fit -- upload once
+        }
+        CUDA_CHECK(cudaMemcpyAsync(ctx->dXscaled + (size_t)c * n,
+                                   X + (size_t)c * ldX, n * sizeof(float),
+                                   cudaMemcpyHostToDevice, ctx->stream));
+        scale_col_kernel<<<grid_col, BLOCK, 0, ctx->stream>>>(
+            ctx->dXscaled + (size_t)c * n, n, s[c]);
+        check_launch();
+        ctx->x_resident[c] = 1;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
 }
 
 // Shared post-fill pipeline for P candidate columns already laid out in
@@ -656,8 +682,7 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
     CUDA_CHECK(cudaStreamSynchronize(s));
 }
 
-void orthonormalize_batch(Context *ctx, size_t m, size_t P, size_t nb,
-                          const float *Xblock, size_t ldX, const float *s_block,
+void orthonormalize_batch(Context *ctx, size_t m, size_t P,
                           const int *src_xcol, const int *src_basis,
                           double *ybx, std::atomic<long> *dgks_counter)
 {
@@ -672,27 +697,16 @@ void orthonormalize_batch(Context *ctx, size_t m, size_t P, size_t nb,
     cudaStream_t s = ctx->stream;
     const dim3 block(BLOCK);
 
-    // Upload the raw X block (n×nb) and per-column scales, then scale in place so
-    // the candidate is f32-rounded (matching x = X·s) before fill multiplies by B.
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        ctx->dXcand, n * sizeof(float),
-        Xblock, ldX * sizeof(float),
-        n * sizeof(float), nb,
-        cudaMemcpyHostToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(ctx->dsblk, s_block, nb * sizeof(float),
-                               cudaMemcpyHostToDevice, s));
-    const dim3 grid_nb((n + BLOCK - 1) / BLOCK, (unsigned)nb);
-    scale_xcand_kernel<<<grid_nb, block, 0, s>>>(ctx->dXcand, n, ctx->dsblk);
-    check_launch();
-
-    // Upload the per-output-column source maps and fill the stacked Bx (n×P).
+    // Upload the per-output-column source maps and fill the stacked Bx (n×P) from
+    // the RESIDENT scaled candidates (dXscaled, indexed by global X column) and
+    // resident B -- no per-block X upload.
     CUDA_CHECK(cudaMemcpyAsync(ctx->dsrc_xcol, src_xcol, P * sizeof(int),
                                cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(ctx->dsrc_basis, src_basis, P * sizeof(int),
                                cudaMemcpyHostToDevice, s));
     const dim3 grid_nP((n + BLOCK - 1) / BLOCK, (unsigned)P);
     fill_batch_kernel<<<grid_nP, block, 0, s>>>(
-        ctx->dB, n, ctx->dXcand, ctx->dsrc_xcol, ctx->dsrc_basis,
+        ctx->dB, n, ctx->dXscaled, ctx->dsrc_xcol, ctx->dsrc_basis,
         ctx->dBx_f32, ctx->dBx_f64);
     check_launch();
 
