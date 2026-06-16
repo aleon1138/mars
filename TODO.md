@@ -167,6 +167,37 @@ fill_batch + round_reduce ~19%. Re-profile to confirm HtoD collapsed; next lever
 if needed: pinned ybx/src transfers, on-device DGKS gate (kill the per-block
 sync), bigger MARS_CUDA_BLOCK_GB for fewer/larger GEMMs.
 
+### Blocked-f32 T GEMM -- DONE, ON BY DEFAULT (2026-06-16, commits f0a3181 + default flip)
+
+Native f64 is pinned at the GB202 workstation card's ~1.44 TFLOP/s f64 ceiling
+(no real f64-tensor acceleration on sm_120). MARS_CUDA_BLOCK_GB sweeps plateaued
+(~5%) -- it's f64-compute-bound. The win is doing the T = Boᵀ·Bx GEMM in f32:
+split K=n into MARS_CUDA_KCHUNK-sized chunks, cublasSgemm each in f32, accumulate
+the chunk results in f64 (gram()-style). The cross-chunk f64 sum handles T's
+*global* cancellation exactly; only the within-chunk f32 error (~sqrt(kchunk)*
+eps_f32) remains. Default kchunk=2048 (on); MARS_CUDA_KCHUNK=0 = native-f64
+reference.
+
+Server (n=500k, m=400): 580 -> 298 ms/block = ~1.95x; kchunk 2048 ~= 8192 (not
+launch-bound). Gates: all 6 CUDA tests at 1e-5; fit-equivalence well-conditioned
+= bit-identical to f64; correlated/ill-conditioned = identical final R^2 but a
+different (equally good) term ordering (f32 flips near-tied ΔSSE argmaxes; CPU and
+GPU-f64 agree there). Accepted: quality preserved, not bit-reproducible vs CPU on
+correlated features. Now the f64 *projection* GEMM (~174 ms of the 298) is the
+bottleneck, then fill_batch+round_reduce (~110 ms).
+
+### Projection GEMM in f32 -- NEXT, but riskier than T
+
+Would compound to ~4x (proj ~174 -> ~15 ms). BUT the projection's cancellation is
+in the subtract Bx - Bo*T: for a candidate near span(Bo) the residual is near-zero
+and its *norm* feeds the linear ΔSSE, the DGKS gate, and the degeneracy test, so
+f32 there corrupts the residual *directly* -> risk of spurious ΔSSE peaks on
+near-degenerate columns (the failure mode that killed the f/g f32 attempt: a
+*worse* term winning the argmax, not just a reordering). Must pass the full gates
+PLUS a degenerate-column stress and correlated-feature fit-equivalence before
+trusting it; may be rejected on accuracy. Then fill_batch+round_reduce (memory
+-bound) are the floor.
+
 ## Phase 1 GEMM (`T = Boᵀ·Bx`) is store-port-bound
 
 **Finding:** Phase 1 of `orthonormalize()` (the `axpy_m` sweep building
