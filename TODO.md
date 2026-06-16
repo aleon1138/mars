@@ -1,38 +1,6 @@
 # TODO
 
-Ideas and notes for future performance work. Not planned for a specific release.
-
-## BF16 basis storage — EXPLORED AND ABANDONED (2026-06-15)
-
-We built and benchmarked bf16 storage for the basis matrices `B`/`Bo`/`Bx`
-(storage only; everything widens to f32/f64 to compute) to cut the load volume
-of the bandwidth-bound forward pass. **Conclusion: not worth it on CPU — it caps
-at parity with f32.** The real speedup is the CUDA port below.
-
-**Why it caps at parity (don't retry the f32-accum shortcut):**
-- A SIMD bf16 widen-load brought bf16 `orthonormalize()` from ~1.4× *slower*
-  (scalar) to **parity**, but no faster: with f64 accumulation the `T = Boᵀ·Bx`
-  GEMM is bound by f64 `T` traffic (load+store every FMA) + 4-wide f64 FMA, so
-  halving only the `Bo`/`Bx` *load* bytes can't win.
-- Getting the ~2× requires **f32 accumulation**, and that is numerically
-  **rejected**: `T = Boᵀ·Bx` is full of near-zero (cancelling) projection
-  entries, and f32 accumulation destroys them — measured 1e-2…4.6e-1 relative
-  error vs f64's ~1e-10, and it persists even for bf16 inputs (f64-accum of bf16
-  inputs is exact). The f64 accumulation is load-bearing. (This is a different
-  mechanism from the 2026-06-09 `f`/`g` rejection — cancellation in the GEMM, not
-  the hinge denominator.) A non-cancelling dot (e.g. the throwaway `bf16_bench.c`)
-  *does* hit 2× in f32, but that regime doesn't match the GEMM.
-- The only f64-preserving 2× would be a register-tiled, i-blocked GEMM (see the
-  store-port-bound note below) — deferred in favour of CUDA, which wins by far.
-
-**Where the work lives:** unmerged branches `refactor/bf16-basis-seam` (no-op
-widen/store seam) and `feat/bf16-linear-only` (templated `MarsAlgo<BT>` +
-`IMarsAlgo` base + runtime `basis_dtype` flag + `degeneracy_tol<BT>()`). Kept as
-an archived record; `master` is bf16-free. The de-Eigen seam refactor there is
-reusable if a future storage-dtype need (e.g. *memory* footprint, not speed)
-ever arises.
-
-## CUDA port
+## I) CUDA port
 
 **Realistic speedup:** 10–30× on the forward pass vs. current multi-core AVX2.
   Not 100× — MARS isn't pure matmul; there's sorting, dependency chains between
@@ -55,9 +23,7 @@ ever arises.
   the (x_col, basis_col) candidate grid is embarrassingly parallel — same
   parallelism OpenMP is already exploiting.
 
-**Effort estimate:** multi-week project, not a weekend.
-
-## Phase 1 GEMM (`T = Boᵀ·Bx`) is store-port-bound
+## II) Phase 1 GEMM (`T = Boᵀ·Bx`) is store-port-bound
 
 **Finding:** Phase 1 of `orthonormalize()` (the `axpy_m` sweep building
   `T = Boᵀ·Bx`) is limited by store-port throughput, not DRAM bandwidth or FMA.
@@ -78,8 +44,8 @@ ever arises.
 
 **Why deferred:** ~100 lines of intricate AVX with three levels of edge handling
   (i/k/j tails) plus hardware-specific tile tuning (i-panel size for L2, the
-  register tile). The AVX-512 experiment (see CLAUDE.md, 2026-05-16) showed these
-  kernels go port/setup-bound, so the win may evaporate.
+  register tile). The AVX-512 experiment (see CLAUDE.md, 2026-05-16) showed
+  these kernels go port/setup-bound, so the win may evaporate.
 
 **Before investing:** profile Phase 1's actual share of `eval()` on the EPYC
   server — the hinge sweep and Phase 2a are comparable O(n·p·m) costs, so Phase 1
@@ -87,30 +53,59 @@ ever arises.
   it, validate the AVX path + tune tiles on the server; it can't be exercised on
   the arm64 dev box.
 
-# MARS improvements — TODO
+## III) `argsort` redone on every `eval()` call
 
-Context for future-me: this is a roadmap of three improvements to the
-`aleon1138/mars` codebase, ordered roughly from cheapest to most invasive.
-The first two sit on top of the existing hinge-basis design; the third
-(BMARS) replaces the internal linear algebra wholesale. They are independent
-in principle — you can ship (1)–(2) without touching (3) — but (2) and (3)
-compose particularly well.
+**Location:** the `argsort()` call in `MarsAlgo::eval()` (`marsalgo.cc`).
+
+**Issue:** Per-xcol sort order depends only on `X`, which is immutable for the
+  lifetime of `MarsAlgo`. Yet `argsort()` runs again every epoch for every
+  candidate column.
+
+**Constraint:** A full `p × n` int32 cache is 4·p·n bytes -- 2.4 GB for the
+  n=6M, p=100 case. Although feasible to cache everything, it seems wasteful.
+
+**Fix:** A Fast-MARS LRU sized to the current `max_inputs` cap covers the inputs
+  we actually re-evaluate. Eviction by age matches Friedman's Fast-MARS
+  recipe.
+
+## IV) Python scalar loop builds `bmask` each epoch
+
+**Location:** `mars.py:306-308` (the `for i in input_to_use:` loop in `fit()`).
+
+**Issue:**
+```python
+for i in input_to_use:
+    bmask[i] &= np.array([basic_filter(i, b) for b in basis])
+    bmask[i] &= np.array([aux_filter(i, b) for b in basis])
+```
+Two Python list comprehensions per input per epoch. For `len(input_to_use)`
+× `len(basis)` in the hundreds-to-thousands, this is the dominant cost on
+the Python side.
+
+**Fix:** Precompute once per epoch:
+- `degree = np.array([len(b) for b in basis])` (M,)
+- `contains[i,k] = (i in basis[k])` (p, M) -- bool sparse, O(p·M)
+
+Then:
+```python
+bmask &= (degree[None, :] < max_degree) & (~contains | self_interact)
+```
+Vectorized in numpy. `aux_filter` is user-supplied so it has to stay scalar,
+but the basic filter is the hot one.
+
+## V) MARS algorithmic improvements
 
 The underlying motivation across all three is the same observation: stock MARS
 becomes numerically unreliable at interaction order $\geq 3$ on correlated
-features. The Gram matrix loses effective rank, GCV rankings become noisy,
-and the backward pass cannot be trusted to remove redundant terms. Each item
-below addresses some part of that failure chain.
+features. The Gram matrix loses effective rank, GCV rankings become noisy, and
+the backward pass cannot be trusted to remove redundant terms. Each item below
+addresses some part of that failure chain.
 
----
-
-## 1. Fix `endspan` logic
+### 1. Fix `endspan` logic
 
 Applied at the **boundaries** of the data: minimum gap between the
 smallest/largest data point and the first/last candidate knot for each
 variable.
-
-### Why a separate parameter
 
 Boundary knots are asymmetrically dangerous. A hinge with knot $t$ near $\min
 (x_v)$ has support $[t, \infty)$ that extends past every data point — it will
@@ -119,7 +114,7 @@ in-sample observations. The cost of a bad boundary knot is therefore much
 higher than the cost of a bad interior knot, which justifies a separate
 (and larger) gap.
 
-### Friedman's default formula
+Friedman's default formula:
 
 $$
 \text{endspan} = 3 - \log_2(\alpha / d)
@@ -137,19 +132,16 @@ Things to audit when you get back to this:
 - Check that `endspan` and `minspan` are **both** applied — the slice should
   be `sorted_x[endspan : N - endspan : minspan]`, not one or the other.
 
----
-
-## 2. Knot tuning — 1D refinement after each forward pick
+### 2. Knot tuning — 1D refinement after each forward pick
 
 After the forward pass picks a knot $t^* \in \{\tau_i\}$ from the discrete
-candidate grid, do a local 1D line search to refine $t^*$ to the
-RSS-minimizing position in the open interval $(\tau_{i-1}, \tau_
-{i+1})$. Brent's method or golden-section search both work; bracket is the two
-adjacent grid points.
+candidate grid, do a local 1D line search to refine $t^*$ to the RSS-minimizing
+position in the open interval $(\tau_{i-1}, \tau_{i+1})$. Brent's method or
+golden-section search both work; bracket is the two adjacent grid points.
 
-Friedman discussed and rejected knot tuning in 1991 on cost grounds — the
-line search is $\mathcal{O}(N)$ per step and he wanted forward selection cheap.
-On modern hardware (especially with cached partial residuals from the fast-MARS
+Friedman discussed and rejected knot tuning in 1991 on cost grounds — the line
+search is $\mathcal{O}(N)$ per step and he wanted forward selection cheap. On
+modern hardware (especially with cached partial residuals from the fast-MARS
 framework already being used), each line search is sub-millisecond even for $N
 = 10^6$. The cost calculus is inverted.
 
@@ -180,35 +172,25 @@ converges in 5–10 steps. Total added cost per forward step:
 $\mathcal{O}(M)$ in the best case, $\mathcal{O}(MN/K)$ if you're lazy where
 $K$ is the candidate grid size.
 
-### Implementation order
-
 Do this **after** (1) is working — knot tuning amplifies the quality of
 the discrete pick, which itself depends on a clean candidate filter. Wire
 in the line search as a refinement step that runs after the discrete
 forward pass and before committing the basis function.
 
-### Validation
+Validation: Same setup as before. With knot tuning on, the test-set MSE should
+improve at fixed $M$ (model size). Equivalently, you should reach the same MSE
+with fewer basis functions. The improvement is largest when the underlying
+signal has knot-like discontinuities at non-grid positions(easy to construct
+synthetically: $f(x) = \mathbb{1}[x > 0.4137]$ and let the grid be aligned to
+quantiles that don't include 0.4137).
 
-Same Friedman-benchmark setup as before. With knot tuning on, the test-set
-MSE should improve at fixed $M$ (model size). Equivalently, you should reach
-the same MSE with fewer basis functions. The improvement is largest when
-the underlying signal has knot-like discontinuities at non-grid positions
-(easy to construct synthetically: $f(x) = \mathbb{1}[x > 0.4137]$ and let
-the grid be aligned to quantiles that don't include 0.4137).
-
----
-
-## 3. BMARS basis reformulation
-
-### What it is
+### 3. BMARS basis reformulation
 
 A change of basis that's **purely internal to the linear algebra**. The user
 still sees a hinge-basis MARS model, the API and serialization are
 unchanged, but the matrices you actually factor and update are formed in a
 compactly-supported B-spline basis where the Gram is banded and well-
 conditioned.
-
-### Why this is the real fix
 
 Items (1)–(2) reduce the *frequency* of conditioning failures. They don't
 fix the underlying problem, which is that truncated power basis functions
@@ -222,8 +204,6 @@ physically overlap. The Gram matrix becomes banded (1D) or sparse with
 structured nonzero pattern (tensor product). Sparse Cholesky on the B-spline
 Gram is numerically much better-behaved than dense Cholesky on the hinge
 Gram, and the gap *widens* with interaction order rather than narrowing.
-
-### The change-of-basis identity (the math)
 
 For each variable $v$, set up an internal linear B-spline basis
 $\{\phi_1^v, \ldots, \phi_{K_v}^v\}$ on a knot grid
@@ -259,7 +239,7 @@ $W^{v_1} \otimes W^{v_2} \otimes \cdots \otimes W^{v_k}$, but you never
 materialize the Kronecker product — apply the factors as a sequence of
 banded matvecs.
 
-### Algorithm
+#### Algorithm
 
 1. **Startup (once)**:
    - For each variable $v$: compute knot grid $\{\tau_i^v\}$ as quantiles.
@@ -389,8 +369,8 @@ Three regimes to test:
 6. **Item 3d (quadratic B-splines)** — only if needed.
 
 Items 1 and 2 can each ship as standalone improvements with their own
-benchmarks. Item 3 is a multi-month project; stage it carefully and keep
-the hinge-basis code path working as the validation oracle.
+benchmarks. Item 3 is a multi-month project; stage it carefully and keep the
+hinge-basis code path working as the validation oracle.
 
 ---
 
@@ -412,49 +392,3 @@ the hinge-basis code path working as the validation oracle.
 - For the change-of-basis identity between truncated powers and B-splines:
   de Boor, "A Practical Guide to Splines" (revised ed., 2001), §IX.
   Standard reference; the identity is classical.
-
-# Smaller items / known issues
-
-Collected during the DGKS re-orthogonalization review (2026-05-17 session).
-Each item is independent and small; none of them block correctness today.
-
-## Python scalar loop builds `bmask` each epoch
-
-**Location:** `mars.py:306-308` (the `for i in input_to_use:` loop in `fit()`).
-
-**Issue:**
-```python
-for i in input_to_use:
-    bmask[i] &= np.array([basic_filter(i, b) for b in basis])
-    bmask[i] &= np.array([aux_filter(i, b) for b in basis])
-```
-Two Python list comprehensions per input per epoch. For `len(input_to_use)`
-× `len(basis)` in the hundreds-to-thousands, this is the dominant cost on
-the Python side.
-
-**Fix:** Precompute once per epoch:
-- `degree = np.array([len(b) for b in basis])` (M,)
-- `contains[i,k] = (i in basis[k])` (p, M) -- bool sparse, O(p·M)
-
-Then:
-```python
-bmask &= (degree[None, :] < max_degree) & (~contains | self_interact)
-```
-Vectorized in numpy. `aux_filter` is user-supplied so it has to stay scalar,
-but the basic filter is the hot one.
-
-## `argsort` redone on every `eval()` call
-
-**Location:** the `argsort()` call in `MarsAlgo::eval()` (`marsalgo.cc`).
-
-**Issue:** Per-xcol sort order depends only on `X`, which is immutable for the
-lifetime of `MarsAlgo`. Yet `argsort()` runs again every epoch for every
-candidate column.
-
-**Constraint:** A full `p × n` int32 cache is 4·p·n bytes -- 2.4 GB for the
-n=6M, p=100 case. Can't just cache everything.
-
-**Fix:** A Fast-MARS LRU sized to the current `max_inputs` cap covers the
-inputs we actually re-evaluate. Eviction by age matches Friedman's Fast-MARS
-recipe.
-

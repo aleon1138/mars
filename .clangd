@@ -1,2 +1,2 @@
 CompileFlags:
-    Add: [-I/usr/include/eigen3, -std=c++17]
+  Add: [-I/usr/include/eigen3, -std=c++17, -DFP_FAST_FMA, -D__AVX__]
