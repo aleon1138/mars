@@ -283,6 +283,29 @@ __global__ void accum_f32_to_f64_kernel(const float *src, double *dst,
     dst[j * ld_dst + k] += (double)src[j * rows + k];
 }
 
+// Cast the f64 T (col stride ld_src) to a compact f32 dTc (ld = rows) for the
+// f32 projection sgemm.
+__global__ void cast_f64_to_f32_kernel(const double *src, size_t ld_src,
+                                       float *dst, size_t rows, size_t cols)
+{
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) {
+        return;
+    }
+    const size_t k = idx % rows;
+    const size_t j = idx / rows;
+    dst[j * rows + k] = (float)src[j * ld_src + k];
+}
+
+// In-place f64 subtract of an f32 term: dst[i] -= (double)src[i], contiguous.
+__global__ void sub_f32_from_f64_kernel(double *dst, const float *src, size_t total)
+{
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        dst[idx] -= (double)src[idx];
+    }
+}
+
 
 // scale[j] = (ds[j] > tol) ? (float)(1/sqrt(ds[j]+tol)) : 0  -- f64 reciprocal
 // sqrt then a single cast, matching the CPU normalize step. When want_ybx, also
@@ -347,7 +370,11 @@ struct Context {
     // accumulate the chunk results into the f64 dT. Default 2048 (on);
     // MARS_CUDA_KCHUNK=0 selects the native-f64 T GEMM.
     size_t  kchunk   = 2048;
-    float  *dTc_f32  = nullptr;  // (max_terms, p_cap) per-chunk f32 T
+    float  *dTc_f32  = nullptr;  // (max_terms, p_cap) per-chunk f32 T / cast of dT
+
+    // f32 projection Bx -= Bo·T (MARS_CUDA_PROJ_F32=1, default OFF -- riskier: it
+    // perturbs the near-zero residual directly, which feeds ΔSSE/DGKS/degeneracy).
+    int     proj_f32 = 0;
 
     // per-call scratch (sized for the worst case p == p_cap; the per-eval path
     // uses the leading <= max_terms columns, the batched path up to p_cap)
@@ -439,6 +466,9 @@ Context *context_create(size_t n, size_t max_terms, double tol)
             if (v >= 0) {
                 ctx->kchunk = (size_t)v;  // 0 disables (native f64)
             }
+        }
+        if (const char *pf = std::getenv("MARS_CUDA_PROJ_F32")) {
+            ctx->proj_f32 = (pf[0] == '1') ? 1 : 0;
         }
         if (std::getenv("MARS_CUDA_VERBOSE")) {
             std::fprintf(stderr,
@@ -641,9 +671,27 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     // Phase 2a: Bx -= Bo·T (in place, f64), then one fused pass that rounds to
     // f32, stores it, and reduces ‖Bx[:,j]‖² (ds) and Σ Bx·y (ybx_raw), split
     // over rows AND columns (atomic f64 partials) so the whole GPU is used.
-    gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_N, CUBLAS_OP_N,
-           (int)n, (int)P, (int)m, &neg_one, ctx->dBo_f64, (int)n,
-           ctx->dT, (int)ldT, &one, ctx->dBx_f64, (int)n);
+    if (!ctx->proj_f32) {
+        gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_N, CUBLAS_OP_N,
+               (int)n, (int)P, (int)m, &neg_one, ctx->dBo_f64, (int)n,
+               ctx->dT, (int)ldT, &one, ctx->dBx_f64, (int)n);
+    } else {
+        // f32 projection: proj = Bo·T (f32 sgemm, K=m), subtract in f64. dBx_f32
+        // (the phase-0 fill, no longer needed) is reused as the proj scratch.
+        const float one_f = 1.0f, zero_f = 0.0f;
+        const size_t nmp = m * P, nnp = n * P;
+        cast_f64_to_f32_kernel<<<(unsigned)((nmp + BLOCK - 1) / BLOCK), block, 0, s>>>(
+            ctx->dT, ldT, ctx->dTc_f32, m, P);
+        check_launch();
+        CUBLAS_CHECK(cublasSgemm(ctx->handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                 (int)n, (int)P, (int)m,
+                                 &one_f, ctx->dBo_f32, (int)n,
+                                 ctx->dTc_f32, (int)m,
+                                 &zero_f, ctx->dBx_f32, (int)n));
+        sub_f32_from_f64_kernel<<<(unsigned)((nnp + BLOCK - 1) / BLOCK), block, 0, s>>>(
+            ctx->dBx_f64, ctx->dBx_f32, nnp);
+        check_launch();
+    }
     unsigned tiles = (unsigned)std::min<size_t>(64, (n + BLOCK - 1) / BLOCK);
     if (tiles == 0) {
         tiles = 1;
