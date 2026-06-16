@@ -72,6 +72,23 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
     }
 
     /*
+     *  Batched GPU path for the linear_only regime: one set of blocked GEMMs for
+     *  ALL X-columns instead of one eval() per column. Fills the whole output in
+     *  a single call (no OpenMP loop). Runs outside the OMP region, so a CUDA
+     *  error just propagates as a normal exception.
+     */
+    if (cuda && linear) {
+        const bool *mask_base = static_cast<const bool *>(mask_info.ptr);
+        const int   mask_rs   = (int)(mask_info.strides[0] / sizeof(bool));
+        {
+            py::gil_scoped_release gil_r;
+            algo.eval_batch(dsse1.mutable_data(), dsse2.mutable_data(),
+                            h_cut.mutable_data(), mask_base, (int)mask_rows, mask_rs);
+        }
+        return py::make_tuple(algo.dsse(), dsse1, dsse2, h_cut);
+    }
+
+    /*
      * `mask` is a (r,c) boolean matrix where `r` is the number of columns of
      * the design matrix `X` and `c` is the number of basis already chosen by
      * the algorithm.
