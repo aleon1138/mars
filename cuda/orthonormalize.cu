@@ -343,9 +343,10 @@ struct Context {
     float  *dy      = nullptr;  // (n) normalized target
     const float *target_ptr = nullptr;  // host y pointer last uploaded to dy
 
-    // blocked-f32 T = Boᵀ·Bx (MARS_CUDA_KCHUNK>0): split K=n into chunks, cublasSgemm
-    // each in f32, accumulate the chunk results into the f64 dT. 0 = native f64.
-    size_t  kchunk   = 0;
+    // blocked-f32 T = Boᵀ·Bx: split K=n into chunks, cublasSgemm each in f32,
+    // accumulate the chunk results into the f64 dT. Default 2048 (on);
+    // MARS_CUDA_KCHUNK=0 selects the native-f64 T GEMM.
+    size_t  kchunk   = 2048;
     float  *dTc_f32  = nullptr;  // (max_terms, p_cap) per-chunk f32 T
 
     // per-call scratch (sized for the worst case p == p_cap; the per-eval path
@@ -429,10 +430,15 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         ctx->p_cap = p_cap;
 
         // Blocked-f32 T GEMM: MARS_CUDA_KCHUNK = K-chunk size (rows per cublasSgemm,
-        // accumulated in f64 across chunks). 0 = native f64 T GEMM.
+        // accumulated in f64 across chunks). ON by default (2048) -- ~2x at m=400
+        // with fit quality preserved; set MARS_CUDA_KCHUNK=0 for the native-f64
+        // reference path (bit-reproducible vs CPU).
+        ctx->kchunk = 2048;
         if (const char *kc = std::getenv("MARS_CUDA_KCHUNK")) {
             const long v = std::atol(kc);
-            ctx->kchunk = (v > 0) ? (size_t)v : 0;
+            if (v >= 0) {
+                ctx->kchunk = (size_t)v;  // 0 disables (native f64)
+            }
         }
         if (std::getenv("MARS_CUDA_VERBOSE")) {
             std::fprintf(stderr,
