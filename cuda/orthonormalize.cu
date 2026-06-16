@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>   // getenv
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -306,6 +307,20 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         CUDA_CHECK(cudaStreamCreate(&ctx->stream));
         CUBLAS_CHECK(cublasCreate(&ctx->handle));
         CUBLAS_CHECK(cublasSetStream(ctx->handle, ctx->stream));
+
+        // Optional: run the f64 GEMMs via cuBLAS FP64 emulation on the integer
+        // tensor cores (Blackwell). Opt-in with MARS_CUDA_FP64_EMULATE=1. The
+        // fixed-point scheme reconstructs the f64 result (not a lossy f32/TF32
+        // approximation), so it should clear the cancellation gate -- but the
+        // precision-stress + DGKS tests must confirm it. Native f64 (d884 DMMA)
+        // remains the default.
+        const char *emu = std::getenv("MARS_CUDA_FP64_EMULATE");
+        if (emu && emu[0] == '1') {
+            CUBLAS_CHECK(cublasSetMathMode(ctx->handle,
+                                           CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH));
+            CUBLAS_CHECK(cublasSetEmulationStrategy(ctx->handle,
+                                                    CUBLAS_EMULATION_STRATEGY_EAGER));
+        }
 
         const size_t nmt = n * max_terms;
         CUDA_CHECK(cudaMalloc(&ctx->dB,      nmt * sizeof(float)));
