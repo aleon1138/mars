@@ -186,7 +186,7 @@ GPU-f64 agree there). Accepted: quality preserved, not bit-reproducible vs CPU o
 correlated features. Now the f64 *projection* GEMM (~174 ms of the 298) is the
 bottleneck, then fill_batch+round_reduce (~110 ms).
 
-### Projection GEMM in f32 -- DONE, opt-in (MARS_CUDA_PROJ_F32=1, default OFF)
+### Projection GEMM in f32 -- DONE, ON BY DEFAULT (MARS_CUDA_PROJ_F32=0 opts out)
 
 proj = Bo·T as one cublasSgemm (K=m small), subtracted from Bx in f64 (dBx_f32 --
 the spent phase-0 fill -- is reused as the proj scratch). The a-priori risk was
@@ -199,9 +199,10 @@ round_reduce (memory-bound) as the floor. Accuracy: all 6 CUDA tests at 1e-5
 correlated features AND a 0.98-collinearity stress (Δ=0) -- the feared
 degradation didn't appear (near-degenerate columns lose the argmax anyway; DGKS /
 degeneracy-tol still catch them). Term ordering differs on correlated features
-(same as T-f32). Kept default OFF: more theoretical residual-cancellation risk
-than T, validated only on synthetic stresses -- default it on after real-data
-fit-equivalence if desired (as was done for kchunk).
+(same as T-f32). Defaulted ON after the gates held + a 12.3x server speedup at
+m=400 (580 -> 47 us/col). Full f64 reference = MARS_CUDA_KCHUNK=0 and
+MARS_CUDA_PROJ_F32=0. The residual-cancellation risk is real but didn't appear on
+the synthetic stresses -- watch real-data fits.
 
 After T+proj-f32 the GEMMs are no longer the bottleneck; fill_batch + round_reduce
 (memory-bound passes over n×P) are the floor (~63 ms/block on the dev box).

@@ -372,9 +372,9 @@ struct Context {
     size_t  kchunk   = 2048;
     float  *dTc_f32  = nullptr;  // (max_terms, p_cap) per-chunk f32 T / cast of dT
 
-    // f32 projection Bx -= Bo·T (MARS_CUDA_PROJ_F32=1, default OFF -- riskier: it
-    // perturbs the near-zero residual directly, which feeds ΔSSE/DGKS/degeneracy).
-    int     proj_f32 = 0;
+    // f32 projection Bx -= Bo·T. Default ON; MARS_CUDA_PROJ_F32=0 selects the
+    // native-f64 projection. (Full f64 reference = KCHUNK=0 and PROJ_F32=0.)
+    int     proj_f32 = 1;
 
     // per-call scratch (sized for the worst case p == p_cap; the per-eval path
     // uses the leading <= max_terms columns, the batched path up to p_cap)
@@ -468,7 +468,7 @@ Context *context_create(size_t n, size_t max_terms, double tol)
             }
         }
         if (const char *pf = std::getenv("MARS_CUDA_PROJ_F32")) {
-            ctx->proj_f32 = (pf[0] == '1') ? 1 : 0;
+            ctx->proj_f32 = (pf[0] == '0') ? 0 : 1;  // 0 selects native-f64 projection
         }
         if (std::getenv("MARS_CUDA_VERBOSE")) {
             std::fprintf(stderr,
