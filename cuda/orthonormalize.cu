@@ -18,6 +18,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -78,6 +79,30 @@ __inline__ __device__ double blockReduceSum(double v)
     return v;
 }
 
+// Reduce two independent accumulators with a single barrier (thread 0 gets both
+// block sums). Used by the fused round/norm/dot kernel.
+__inline__ __device__ void blockReduceSum2(double &a, double &b)
+{
+    __shared__ double sa[32];
+    __shared__ double sb[32];
+    const int lane = threadIdx.x % warpSize;
+    const int wid  = threadIdx.x / warpSize;
+    a = warpReduceSum(a);
+    b = warpReduceSum(b);
+    if (lane == 0) {
+        sa[wid] = a;
+        sb[wid] = b;
+    }
+    __syncthreads();
+    const int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+    a = (threadIdx.x < nwarps) ? sa[lane] : 0.0;
+    b = (threadIdx.x < nwarps) ? sb[lane] : 0.0;
+    if (wid == 0) {
+        a = warpReduceSum(a);
+        b = warpReduceSum(b);
+    }
+}
+
 // --- kernels ----------------------------------------------------------------
 
 // Bx[i,j] = B[i, mask[j]] * x[i], stored both as f32 (the kernel output) and as
@@ -98,67 +123,72 @@ __global__ void fill_kernel(const float *B, size_t n, const float *x,
     bx64[idx] = (double)v;
 }
 
-// Round the f64 projection residual to f32, store it, and accumulate the
-// squared norm of the *rounded* value (one block per column). ld is the column
-// stride (== n) shared by `in` and `out`.
-__global__ void round_colnorm_kernel(const double *in, float *out, size_t n,
-                                     size_t ld, double *ds)
+// Fused round + norm + dot, parallelized over both columns and rows.
+//
+// For each column j (= blockIdx.y), tiles of rows are split across blockIdx.x
+// blocks (grid-stride), so the whole GPU is filled instead of one block/column.
+// Each block: rounds the f64 residual to f32 and stores it, then block-reduces
+// two partials -- Σ(round)² and (if want_dot) Σ(round)·y -- and atomic-adds them
+// to ds[j] / ybx_raw[j] (which the caller must zero first). f64 throughout, so
+// the f32-store-rounding semantics match the CPU kernel exactly.
+__global__ void round_reduce_kernel(const double *in, float *out,
+                                    const float *y, size_t n,
+                                    double *ds, double *ybx_raw, int want_dot)
 {
-    const size_t j = blockIdx.x;
-    const double *cin  = in  + j * ld;
-    float        *cout = out + j * ld;
-    double partial = 0.0;
-    for (size_t i = threadIdx.x; i < n; i += blockDim.x) {
-        const float v = (float)cin[i];
+    const size_t j = blockIdx.y;
+    const double *cin  = in  + j * n;
+    float        *cout = out + j * n;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    double s_norm = 0.0, s_dot = 0.0;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += stride) {
+        const float  v  = (float)cin[i];
         cout[i] = v;
         const double vb = (double)v;
-        partial += vb * vb;
+        s_norm += vb * vb;
+        if (want_dot) {
+            s_dot += vb * (double)y[i];
+        }
     }
-    partial = blockReduceSum(partial);
+    blockReduceSum2(s_norm, s_dot);
     if (threadIdx.x == 0) {
-        ds[j] = partial;
+        atomicAdd(&ds[j], s_norm);
+        if (want_dot) {
+            atomicAdd(&ybx_raw[j], s_dot);
+        }
     }
 }
 
-// DGKS retry commit: same as round_colnorm_kernel but only for flagged columns.
-// Non-flagged columns are left untouched (uniform early-return per block).
-__global__ void round_colnorm_masked_kernel(const double *in, float *out,
-                                            size_t n, size_t ld,
-                                            double *ds, const int *flags)
+// DGKS retry commit (rare): recompute ds[j]/ybx_raw[j] for flagged columns only,
+// one block per column (direct write, no atomics -- a single block does the full
+// column reduction). Non-flagged columns are left untouched (uniform return).
+__global__ void round_reduce_masked_kernel(const double *in, float *out,
+                                           const float *y, size_t n,
+                                           double *ds, double *ybx_raw,
+                                           const int *flags, int want_dot)
 {
     const size_t j = blockIdx.x;
     if (!flags[j]) {
         return;
     }
-    const double *cin  = in  + j * ld;
-    float        *cout = out + j * ld;
-    double partial = 0.0;
+    const double *cin  = in  + j * n;
+    float        *cout = out + j * n;
+    double s_norm = 0.0, s_dot = 0.0;
     for (size_t i = threadIdx.x; i < n; i += blockDim.x) {
-        const float v = (float)cin[i];
+        const float  v  = (float)cin[i];
         cout[i] = v;
         const double vb = (double)v;
-        partial += vb * vb;
+        s_norm += vb * vb;
+        if (want_dot) {
+            s_dot += vb * (double)y[i];
+        }
     }
-    partial = blockReduceSum(partial);
+    blockReduceSum2(s_norm, s_dot);
     if (threadIdx.x == 0) {
-        ds[j] = partial;
-    }
-}
-
-// ybx[j] = Σ_i Bx[i,j] * y[i], f64 accumulation over the rounded f32 inputs
-// (one block per column). Matches mars::dot_widen: each f32 upcast at the load.
-__global__ void col_dot_y_kernel(const float *Bx, size_t ld, const float *y,
-                                 size_t n, double *ybx)
-{
-    const size_t j = blockIdx.x;
-    const float *col = Bx + j * ld;
-    double partial = 0.0;
-    for (size_t i = threadIdx.x; i < n; i += blockDim.x) {
-        partial += (double)col[i] * (double)y[i];
-    }
-    partial = blockReduceSum(partial);
-    if (threadIdx.x == 0) {
-        ybx[j] = partial;
+        ds[j] = s_norm;
+        if (want_dot) {
+            ybx_raw[j] = s_dot;
+        }
     }
 }
 
@@ -188,15 +218,24 @@ __global__ void widen_kernel(const float *in, double *out, size_t total)
 }
 
 // scale[j] = (ds[j] > tol) ? (float)(1/sqrt(ds[j]+tol)) : 0  -- f64 reciprocal
-// sqrt then a single cast, matching the CPU normalize step.
-__global__ void scale_kernel(const double *ds, float *scale, size_t p, double tol)
+// sqrt then a single cast, matching the CPU normalize step. When want_ybx, also
+// fold the scale into the linear ΔSSE input: ybx[j] = scale[j]·(Σ Bx·y). This
+// is the normalized-column dot product without a separate normalize pass:
+// ‖Bx‖·scale applied once to the reduced dot instead of per element.
+__global__ void scale_fold_kernel(const double *ds, float *scale,
+                                  const double *ybx_raw, double *ybx,
+                                  size_t p, double tol, int want_ybx)
 {
     const size_t j = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= p) {
         return;
     }
-    const double s = ds[j];
-    scale[j] = (s > tol) ? (float)(1.0 / sqrt(s + tol)) : 0.0f;
+    const double s  = ds[j];
+    const float  sc = (s > tol) ? (float)(1.0 / sqrt(s + tol)) : 0.0f;
+    scale[j] = sc;
+    if (want_ybx) {
+        ybx[j] = (double)sc * ybx_raw[j];
+    }
 }
 
 __global__ void normalize_kernel(float *bx32, const float *scale, size_t n)
@@ -240,10 +279,11 @@ struct Context {
     double *dT      = nullptr;  // (max_terms, max_terms) col-major, ld max_terms
     float  *dx      = nullptr;  // (n)
     int    *dmask   = nullptr;  // (max_terms)
-    double *ds      = nullptr;  // (max_terms)
-    double *dtnorm2 = nullptr;  // (max_terms)
-    double *dybx    = nullptr;  // (max_terms) Bxᵀ·y output
-    float  *dscale  = nullptr;  // (max_terms)
+    double *ds       = nullptr;  // (max_terms)
+    double *dtnorm2  = nullptr;  // (max_terms)
+    double *dybx_raw = nullptr;  // (max_terms) Σ Bx·y on the un-normalized column
+    double *dybx     = nullptr;  // (max_terms) scale·ybx_raw -- the ΔSSE input
+    float  *dscale   = nullptr;  // (max_terms)
     int    *dflags  = nullptr;  // (max_terms)
     float  *dBo_col = nullptr;  // (n) Bo-column widen staging
 
@@ -276,10 +316,11 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         CUDA_CHECK(cudaMalloc(&ctx->dT,      max_terms * max_terms * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&ctx->dx,      n * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dmask,   max_terms * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&ctx->ds,      max_terms * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&ctx->dtnorm2, max_terms * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&ctx->dybx,    max_terms * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&ctx->dscale,  max_terms * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx->ds,       max_terms * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dtnorm2,  max_terms * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dybx_raw, max_terms * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dybx,     max_terms * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dscale,   max_terms * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dflags,  max_terms * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ctx->dBo_col, n * sizeof(float)));
 
@@ -309,6 +350,7 @@ void context_destroy(Context *ctx)
     cudaFree(ctx->dmask);
     cudaFree(ctx->ds);
     cudaFree(ctx->dtnorm2);
+    cudaFree(ctx->dybx_raw);
     cudaFree(ctx->dybx);
     cudaFree(ctx->dscale);
     cudaFree(ctx->dflags);
@@ -408,14 +450,27 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
                              ctx->dBx_f64, (int)n,
                              &zero, ctx->dT, (int)ldT));
 
-    // Phase 2a: Bx -= Bo · T  (in place, f64), then round to f32 + column norms.
+    // Phase 2a: Bx -= Bo · T (in place, f64), then a single fused pass that
+    // rounds to f32, stores it, and reduces both ||Bx[:,j]||² (ds) and Σ Bx·y
+    // (ybx_raw). The reduction is split over rows AND columns (atomic f64
+    // partials), so the whole GPU is used -- not one block per column.
     CUBLAS_CHECK(cublasDgemm(ctx->handle, CUBLAS_OP_N, CUBLAS_OP_N,
                              (int)n, (int)p, (int)m,
                              &neg_one, ctx->dBo_f64, (int)n,
                              ctx->dT, (int)ldT,
                              &one, ctx->dBx_f64, (int)n));
-    round_colnorm_kernel<<<(unsigned)p, block, 0, s>>>(
-        ctx->dBx_f64, ctx->dBx_f32, n, n, ctx->ds);
+    const int want_dot = (ybx != nullptr) ? 1 : 0;
+    unsigned tiles = (unsigned)std::min<size_t>(64, (n + BLOCK - 1) / BLOCK);
+    if (tiles == 0) {
+        tiles = 1;
+    }
+    const dim3 grid_reduce(tiles, (unsigned)p);
+    CUDA_CHECK(cudaMemsetAsync(ctx->ds, 0, p * sizeof(double), s));
+    if (want_dot) {
+        CUDA_CHECK(cudaMemsetAsync(ctx->dybx_raw, 0, p * sizeof(double), s));
+    }
+    round_reduce_kernel<<<grid_reduce, block, 0, s>>>(
+        ctx->dBx_f64, ctx->dBx_f32, ctx->dy, n, ctx->ds, ctx->dybx_raw, want_dot);
     check_launch();
 
     // Phase 2b: DGKS gate. s[j] > tol && s[j]*9 < ||T[:,j]||^2 -> retry.
@@ -438,7 +493,8 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
     if (fired > 0) {
         CUDA_CHECK(cudaMemcpyAsync(ctx->dflags, ctx->h_flags.data(),
                                    p * sizeof(int), cudaMemcpyHostToDevice, s));
-        // Re-orthogonalize from the rounded Bx: widen, recompute T, reproject.
+        // Re-orthogonalize from the rounded Bx: widen, recompute T, reproject,
+        // then recompute ds/ybx_raw for the flagged columns only.
         const size_t total = n * p;
         const dim3 grid_total((unsigned)((total + BLOCK - 1) / BLOCK));
         widen_kernel<<<grid_total, block, 0, s>>>(ctx->dBx_f32, ctx->dBx_f64, total);
@@ -453,34 +509,31 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
                                  &neg_one, ctx->dBo_f64, (int)n,
                                  ctx->dT, (int)ldT,
                                  &one, ctx->dBx_f64, (int)n));
-        round_colnorm_masked_kernel<<<(unsigned)p, block, 0, s>>>(
-            ctx->dBx_f64, ctx->dBx_f32, n, n, ctx->ds, ctx->dflags);
+        round_reduce_masked_kernel<<<(unsigned)p, block, 0, s>>>(
+            ctx->dBx_f64, ctx->dBx_f32, ctx->dy, n,
+            ctx->ds, ctx->dybx_raw, ctx->dflags, want_dot);
         check_launch();
         if (dgks_counter) {
             dgks_counter->fetch_add(fired, std::memory_order_relaxed);
         }
     }
 
-    // Phase 2c: normalize.
-    scale_kernel<<<(unsigned)((p + BLOCK - 1) / BLOCK), block, 0, s>>>(
-        ctx->ds, ctx->dscale, p, tol);
+    // Phase 2c: scale, and fold it into ybx (= scale·Σ Bx·y -- the normalized
+    // column dot, no separate normalize pass needed for the linear ΔSSE).
+    scale_fold_kernel<<<(unsigned)((p + BLOCK - 1) / BLOCK), block, 0, s>>>(
+        ctx->ds, ctx->dscale, ctx->dybx_raw, ctx->dybx, p, tol, want_dot);
     check_launch();
-    normalize_kernel<<<grid_np, block, 0, s>>>(ctx->dBx_f32, ctx->dscale, n);
-    check_launch();
-
-    // ybx = Bxᵀ·y on the device (f64) -- only p doubles cross PCIe, so the n×p
-    // Bx matrix stays resident. This is the linear ΔSSE input.
     if (ybx) {
-        col_dot_y_kernel<<<(unsigned)p, block, 0, s>>>(
-            ctx->dBx_f32, n, ctx->dy, n, ctx->dybx);
-        check_launch();
         CUDA_CHECK(cudaMemcpyAsync(ybx, ctx->dybx, p * sizeof(double),
                                    cudaMemcpyDeviceToHost, s));
     }
 
-    // Copy Bx back only when the caller needs it (e.g. the hinge sweep). In the
-    // linear_only path Bx is nullptr and never leaves the device.
+    // Only when the caller needs the matrix itself (hinge sweep) do we physically
+    // normalize and copy Bx back. In linear_only Bx is nullptr and never leaves
+    // the device, so the normalize pass is skipped entirely.
     if (Bx) {
+        normalize_kernel<<<grid_np, block, 0, s>>>(ctx->dBx_f32, ctx->dscale, n);
+        check_launch();
         CUDA_CHECK(cudaMemcpy2DAsync(
             Bx, ldBx * sizeof(float),
             ctx->dBx_f32, n * sizeof(float),

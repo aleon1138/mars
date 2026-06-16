@@ -242,12 +242,17 @@ TEST(CudaKernelsTest, YbxMatchesBxTransposeY)
                                Bx.data(), (size_t)Bx.outerStride(), ybx.data());
     mars::cuda::context_destroy(ctx);
 
-    // Reference: f64 dot of the returned Bx columns with y.
+    // Reference: f64 dot of the returned (normalized) Bx columns with y. ybx is
+    // computed as scale·Σ(unnormalized Bx)·y (the scale is folded in f64 instead
+    // of applied per-element in f32), so it matches this reference only to the
+    // f32 storage floor -- it is in fact marginally *more* accurate than the
+    // per-element-normalized dot. ‖y‖~√n, so the absolute floor is ~ε_f32·√n.
     MatrixXd Bxd = Bx.cast<double>();
     VectorXd yd  = y.cast<double>();
+    const double floor = 1e-6 * yd.norm();
     for (int j = 0; j < p; ++j) {
         const double ref = Bxd.col(j).dot(yd);
-        EXPECT_NEAR(ybx[j], ref, 1e-9 * (1.0 + std::abs(ref)));
+        EXPECT_NEAR(ybx[j], ref, floor + 1e-6 * std::abs(ref));
     }
 }
 
