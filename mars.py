@@ -151,6 +151,12 @@ def fit(X, y, w=None, **kwargs):
     threads : int (default=-1)
         Number of cores to use. A negative number implies usage of all cores.
 
+    cuda : bool (default=False)
+        Run the forward-pass orthonormalize step on the GPU (requires a CUDA
+        build, i.e. USE_CUDA=ON). Most effective in the `linear_only` regime,
+        where the candidate columns are batched into large GEMMs; the GPU path
+        is driven single-threaded (`threads` is ignored for it).
+
     Returns
     -------
     model : structured numpy array
@@ -199,6 +205,7 @@ def fit(X, y, w=None, **kwargs):
     max_inputs    = kwargs.pop('max_inputs', None)        # Faster-MARS-v2 input cap; None = all
     aging_factor  = kwargs.pop('aging_factor', 1.0)
     threads       = kwargs.pop('threads', -1)
+    cuda          = kwargs.pop('cuda', False)
     # fmt: on
 
     if kwargs:
@@ -310,7 +317,7 @@ def fit(X, y, w=None, **kwargs):
         # Find the delta-SSE for the entire block
         # 'sse1' is the improvement by adding a linear term
         # 'sse2' is the improvement by adding two disjoint hinges
-        sse0, sse1, sse2, cut = algo.eval(bmask, min_span, tail, linear_only, threads)
+        sse0, sse1, sse2, cut = algo.eval(bmask, min_span, tail, linear_only, threads, cuda=cuda)
 
         # Update the delta-SSE cache
         # TODO - should we really be using GCV adjusted SSE instead?
