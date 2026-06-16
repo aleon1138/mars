@@ -41,6 +41,12 @@ if(USE_CUDA)
     target_compile_options(mars_cuda PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fvisibility=hidden>)
     target_link_libraries(mars_cuda PRIVATE CUDA::cublas CUDA::cudart)
+
+    # Standalone orthonormalize microbench (CPU vs GPU at a pre-built basis).
+    # No Eigen/GTest -- a plain perf tool; builds with `make configure-cuda`.
+    add_executable(bench_ortho tests/bench_ortho.cc kernels.cc)
+    target_link_libraries(bench_ortho PRIVATE mars_common mars_cuda CUDA::cudart)
+    target_include_directories(bench_ortho PRIVATE "${CMAKE_SOURCE_DIR}")
 endif()
 
 # Eigen3 is used only by the C++ unit tests (as the correctness oracle); the
