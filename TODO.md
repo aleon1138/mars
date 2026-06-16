@@ -147,6 +147,26 @@ If still not beating the CPU after this, the remaining levers are pinned host
 staging for the x/ybx transfers and reducing the per-block syncs (the DGKS gate
 still does one mid-block host round-trip).
 
+### Resident scaled X -- DONE (2026-06-16, commit d7f362b)
+
+Batching profile at n=300k,p=1k exposed the next bottleneck: candidate X columns
+re-uploaded every epoch -- 43 GB HtoD total (~36× the 1.2 GB X), host transfer
+~6.9 s > GPU 4.7 s. Fixed: context_sync_xcols() uploads+scales each candidate
+x_c = X[:,c]·s[c] once into a resident dXscaled (n×p_x), lazily by column;
+orthonormalize_batch indexes it by global X column (no per-block X upload). Each
+used column now transfers once per fit instead of per epoch.
+
+**Memory note:** dXscaled is n·p_x·4 bytes (1.2 GB at n=300k,p_x=1k; ~16 GB at
+n=4M,p_x=1k; scales with p_x). With resident dBo_f64 (n·max_terms·8) + dB + the
+n·p_cap batch scratch, very large n·p_x could pressure the 96 GB. If so: cap/evict
+dXscaled to the active working set, or fall back to per-block upload. Fine at
+current scales.
+
+After this the GPU GEMMs (T = Boᵀ·Bx ~49%, projection ~30%) dominate again, with
+fill_batch + round_reduce ~19%. Re-profile to confirm HtoD collapsed; next levers
+if needed: pinned ybx/src transfers, on-device DGKS gate (kill the per-block
+sync), bigger MARS_CUDA_BLOCK_GB for fewer/larger GEMMs.
+
 ## Phase 1 GEMM (`T = Boᵀ·Bx`) is store-port-bound
 
 **Finding:** Phase 1 of `orthonormalize()` (the `axpy_m` sweep building
