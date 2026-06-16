@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>    // fprintf
 #include <cstdlib>   // getenv
 #include <stdexcept>
 #include <string>
@@ -51,6 +52,22 @@ namespace {
     } while (0)
 
 constexpr int BLOCK = 256;
+
+// f64 GEMM via cublasGemmEx so the compute type is explicit per call: native
+// CUBLAS_COMPUTE_64F (d884 DMMA) or CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT
+// (integer-tensor-core emulation on Blackwell). All operands stay CUDA_R_64F.
+inline void gemm64(cublasHandle_t h, cublasComputeType_t ct,
+                   cublasOperation_t ta, cublasOperation_t tb,
+                   int m, int n, int k, const double *alpha,
+                   const double *A, int lda, const double *B, int ldb,
+                   const double *beta, double *C, int ldc)
+{
+    CUBLAS_CHECK(cublasGemmEx(h, ta, tb, m, n, k,
+                              alpha, A, CUDA_R_64F, lda,
+                              B, CUDA_R_64F, ldb,
+                              beta, C, CUDA_R_64F, ldc,
+                              ct, CUBLAS_GEMM_DEFAULT));
+}
 
 // --- reductions -------------------------------------------------------------
 
@@ -261,6 +278,7 @@ inline void check_launch()
 struct Context {
     cublasHandle_t handle = nullptr;
     cudaStream_t   stream = nullptr;
+    cublasComputeType_t compute_type = CUBLAS_COMPUTE_64F;  // or _EMULATED_FIXEDPOINT
 
     size_t n         = 0;
     size_t max_terms = 0;
@@ -316,10 +334,14 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         // remains the default.
         const char *emu = std::getenv("MARS_CUDA_FP64_EMULATE");
         if (emu && emu[0] == '1') {
-            CUBLAS_CHECK(cublasSetMathMode(ctx->handle,
-                                           CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH));
+            // Request emulation per-GEMM via the compute type (cublasGemmEx);
+            // EAGER tells cuBLAS to use emulation whenever the compute type asks.
+            ctx->compute_type = CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT;
             CUBLAS_CHECK(cublasSetEmulationStrategy(ctx->handle,
                                                     CUBLAS_EMULATION_STRATEGY_EAGER));
+            std::fprintf(stderr,
+                "[mars-cuda] FP64 emulation enabled: compute_type=%d, strategy=EAGER\n",
+                (int)CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT);
         }
 
         const size_t nmt = n * max_terms;
@@ -459,21 +481,21 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
     check_launch();
 
     // Phase 1: T = Boᵀ · Bx   (m×p, f64).
-    CUBLAS_CHECK(cublasDgemm(ctx->handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                             (int)m, (int)p, (int)n,
-                             &one, ctx->dBo_f64, (int)n,
-                             ctx->dBx_f64, (int)n,
-                             &zero, ctx->dT, (int)ldT));
+    gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_T, CUBLAS_OP_N,
+           (int)m, (int)p, (int)n,
+           &one, ctx->dBo_f64, (int)n,
+           ctx->dBx_f64, (int)n,
+           &zero, ctx->dT, (int)ldT);
 
     // Phase 2a: Bx -= Bo · T (in place, f64), then a single fused pass that
     // rounds to f32, stores it, and reduces both ||Bx[:,j]||² (ds) and Σ Bx·y
     // (ybx_raw). The reduction is split over rows AND columns (atomic f64
     // partials), so the whole GPU is used -- not one block per column.
-    CUBLAS_CHECK(cublasDgemm(ctx->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                             (int)n, (int)p, (int)m,
-                             &neg_one, ctx->dBo_f64, (int)n,
-                             ctx->dT, (int)ldT,
-                             &one, ctx->dBx_f64, (int)n));
+    gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_N, CUBLAS_OP_N,
+           (int)n, (int)p, (int)m,
+           &neg_one, ctx->dBo_f64, (int)n,
+           ctx->dT, (int)ldT,
+           &one, ctx->dBx_f64, (int)n);
     const int want_dot = (ybx != nullptr) ? 1 : 0;
     unsigned tiles = (unsigned)std::min<size_t>(64, (n + BLOCK - 1) / BLOCK);
     if (tiles == 0) {
