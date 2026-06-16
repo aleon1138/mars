@@ -182,18 +182,24 @@ __global__ void fill_batch_kernel(const float *B, size_t n, const float *Xcand,
 // two partials -- Σ(round)² and (if want_dot) Σ(round)·y -- and atomic-adds them
 // to ds[j] / ybx_raw[j] (which the caller must zero first). f64 throughout, so
 // the f32-store-rounding semantics match the CPU kernel exactly.
+// `proj` (optional, n×P, ld n): when non-null, the f32 projection to subtract
+// in f64 first (residual = in - (double)proj) -- fuses the f32-projection
+// subtract into this pass so it isn't a separate n×P read-modify-write.
 __global__ void round_reduce_kernel(const double *in, float *out,
                                     const float *y, size_t n,
-                                    double *ds, double *ybx_raw, int want_dot)
+                                    double *ds, double *ybx_raw, int want_dot,
+                                    const float *proj)
 {
     const size_t j = blockIdx.y;
-    const double *cin  = in  + j * n;
-    float        *cout = out + j * n;
+    const double *cin   = in   + j * n;
+    float        *cout  = out  + j * n;
+    const float  *cproj = proj ? proj + j * n : nullptr;
     const size_t stride = (size_t)gridDim.x * blockDim.x;
     double s_norm = 0.0, s_dot = 0.0;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          i < n; i += stride) {
-        const float  v  = (float)cin[i];
+        const double r  = cproj ? (cin[i] - (double)cproj[i]) : cin[i];
+        const float  v  = (float)r;
         cout[i] = v;
         const double vb = (double)v;
         s_norm += vb * vb;
@@ -297,14 +303,6 @@ __global__ void cast_f64_to_f32_kernel(const double *src, size_t ld_src,
     dst[j * rows + k] = (float)src[j * ld_src + k];
 }
 
-// In-place f64 subtract of an f32 term: dst[i] -= (double)src[i], contiguous.
-__global__ void sub_f32_from_f64_kernel(double *dst, const float *src, size_t total)
-{
-    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total) {
-        dst[idx] -= (double)src[idx];
-    }
-}
 
 
 // scale[j] = (ds[j] > tol) ? (float)(1/sqrt(ds[j]+tol)) : 0  -- f64 reciprocal
@@ -679,18 +677,17 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
         // f32 projection: proj = Bo·T (f32 sgemm, K=m), subtract in f64. dBx_f32
         // (the phase-0 fill, no longer needed) is reused as the proj scratch.
         const float one_f = 1.0f, zero_f = 0.0f;
-        const size_t nmp = m * P, nnp = n * P;
+        const size_t nmp = m * P;
         cast_f64_to_f32_kernel<<<(unsigned)((nmp + BLOCK - 1) / BLOCK), block, 0, s>>>(
             ctx->dT, ldT, ctx->dTc_f32, m, P);
         check_launch();
+        // proj = Bo·T into dBx_f32. The subtract (dBx_f64 - proj) is fused into
+        // round_reduce below -- no separate n×P pass.
         CUBLAS_CHECK(cublasSgemm(ctx->handle, CUBLAS_OP_N, CUBLAS_OP_N,
                                  (int)n, (int)P, (int)m,
                                  &one_f, ctx->dBo_f32, (int)n,
                                  ctx->dTc_f32, (int)m,
                                  &zero_f, ctx->dBx_f32, (int)n));
-        sub_f32_from_f64_kernel<<<(unsigned)((nnp + BLOCK - 1) / BLOCK), block, 0, s>>>(
-            ctx->dBx_f64, ctx->dBx_f32, nnp);
-        check_launch();
     }
     unsigned tiles = (unsigned)std::min<size_t>(64, (n + BLOCK - 1) / BLOCK);
     if (tiles == 0) {
@@ -701,8 +698,11 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     if (want_dot) {
         CUDA_CHECK(cudaMemsetAsync(ctx->dybx_raw, 0, P * sizeof(double), s));
     }
+    // f32-projection path: dBx_f32 holds proj; fuse the f64 subtract here (out and
+    // proj are the same buffer -- each thread reads then writes its own index).
     round_reduce_kernel<<<grid_reduce, block, 0, s>>>(
-        ctx->dBx_f64, ctx->dBx_f32, ctx->dy, n, ctx->ds, ctx->dybx_raw, want_dot);
+        ctx->dBx_f64, ctx->dBx_f32, ctx->dy, n, ctx->ds, ctx->dybx_raw, want_dot,
+        ctx->proj_f32 ? ctx->dBx_f32 : nullptr);
     check_launch();
 
     // Phase 2b: DGKS gate. s[j] > tol && s[j]*9 < ‖T[:,j]‖² -> retry.
