@@ -268,6 +268,22 @@ __global__ void widen_kernel(const float *in, double *out, size_t total)
     }
 }
 
+// dst[k,j] += (double)src[k,j] over a (rows x cols) block; src is compact
+// (ld = rows), dst has column stride ld_dst. Accumulates each per-K-chunk f32 T
+// into the f64 T for the blocked GEMM.
+__global__ void accum_f32_to_f64_kernel(const float *src, double *dst,
+                                        size_t rows, size_t ld_dst, size_t cols)
+{
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) {
+        return;
+    }
+    const size_t k = idx % rows;
+    const size_t j = idx / rows;
+    dst[j * ld_dst + k] += (double)src[j * rows + k];
+}
+
+
 // scale[j] = (ds[j] > tol) ? (float)(1/sqrt(ds[j]+tol)) : 0  -- f64 reciprocal
 // sqrt then a single cast, matching the CPU normalize step. When want_ybx, also
 // fold the scale into the linear ΔSSE input: ybx[j] = scale[j]·(Σ Bx·y). This
@@ -322,9 +338,15 @@ struct Context {
 
     // resident basis + target
     float  *dB      = nullptr;  // (n, max_terms) col-major, ld n
-    double *dBo_f64 = nullptr;  // (n, max_terms) col-major, ld n
+    float  *dBo_f32 = nullptr;  // (n, max_terms) col-major, ld n -- f32 Bo (blocked GEMM + widen src)
+    double *dBo_f64 = nullptr;  // (n, max_terms) col-major, ld n -- widened from dBo_f32
     float  *dy      = nullptr;  // (n) normalized target
     const float *target_ptr = nullptr;  // host y pointer last uploaded to dy
+
+    // blocked-f32 T = Boᵀ·Bx (MARS_CUDA_KCHUNK>0): split K=n into chunks, cublasSgemm
+    // each in f32, accumulate the chunk results into the f64 dT. 0 = native f64.
+    size_t  kchunk   = 0;
+    float  *dTc_f32  = nullptr;  // (max_terms, p_cap) per-chunk f32 T
 
     // per-call scratch (sized for the worst case p == p_cap; the per-eval path
     // uses the leading <= max_terms columns, the batched path up to p_cap)
@@ -339,7 +361,6 @@ struct Context {
     double *dybx     = nullptr;  // (p_cap) scale·ybx_raw -- the ΔSSE input
     float  *dscale   = nullptr;  // (p_cap)
     int    *dflags  = nullptr;  // (p_cap)
-    float  *dBo_col = nullptr;  // (n) Bo-column widen staging
 
     // batched path: resident scaled candidates (x_c = X[:,c]·s[c]) and the
     // per-output-column source maps. dXscaled is allocated (n, p_x) on the first
@@ -406,21 +427,30 @@ Context *context_create(size_t n, size_t max_terms, double tol)
             p_cap = max_terms;
         }
         ctx->p_cap = p_cap;
+
+        // Blocked-f32 T GEMM: MARS_CUDA_KCHUNK = K-chunk size (rows per cublasSgemm,
+        // accumulated in f64 across chunks). 0 = native f64 T GEMM.
+        if (const char *kc = std::getenv("MARS_CUDA_KCHUNK")) {
+            const long v = std::atol(kc);
+            ctx->kchunk = (v > 0) ? (size_t)v : 0;
+        }
         if (std::getenv("MARS_CUDA_VERBOSE")) {
             std::fprintf(stderr,
                 "[mars-cuda] context: n=%zu max_terms=%zu block_gb=%.3g "
-                "-> p_cap=%zu candidate cols/block\n",
-                n, max_terms, block_gb, p_cap);
+                "-> p_cap=%zu candidate cols/block; kchunk=%zu\n",
+                n, max_terms, block_gb, p_cap, ctx->kchunk);
         }
 
         const size_t nmt = n * max_terms;   // resident basis
         const size_t npc = n * p_cap;        // batched scratch
         CUDA_CHECK(cudaMalloc(&ctx->dB,        nmt * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx->dBo_f32,   nmt * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dBo_f64,   nmt * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&ctx->dy,        n * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dBx_f32,   npc * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dBx_f64,   npc * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&ctx->dT,        max_terms * p_cap * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dTc_f32,   max_terms * p_cap * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dx,        n * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dmask,     p_cap * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ctx->ds,        p_cap * sizeof(double)));
@@ -429,7 +459,6 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         CUDA_CHECK(cudaMalloc(&ctx->dybx,      p_cap * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&ctx->dscale,    p_cap * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dflags,    p_cap * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&ctx->dBo_col,   n * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dsrc_xcol, p_cap * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ctx->dsrc_basis, p_cap * sizeof(int)));
         // dXscaled is allocated lazily in context_sync_xcols (needs p_x).
@@ -451,11 +480,13 @@ void context_destroy(Context *ctx)
         return;
     }
     cudaFree(ctx->dB);
+    cudaFree(ctx->dBo_f32);
     cudaFree(ctx->dBo_f64);
     cudaFree(ctx->dy);
     cudaFree(ctx->dBx_f32);
     cudaFree(ctx->dBx_f64);
     cudaFree(ctx->dT);
+    cudaFree(ctx->dTc_f32);
     cudaFree(ctx->dx);
     cudaFree(ctx->dmask);
     cudaFree(ctx->ds);
@@ -464,7 +495,6 @@ void context_destroy(Context *ctx)
     cudaFree(ctx->dybx);
     cudaFree(ctx->dscale);
     cudaFree(ctx->dflags);
-    cudaFree(ctx->dBo_col);
     cudaFree(ctx->dXscaled);
     cudaFree(ctx->dsrc_xcol);
     cudaFree(ctx->dsrc_basis);
@@ -496,20 +526,20 @@ void context_sync_basis(Context *ctx, size_t m,
         n * sizeof(float),   cnt,
         cudaMemcpyHostToDevice, ctx->stream));
 
-    // Bo: host is row-major (stride ldBo). Gather each new column, upload, widen
-    // to f64 into the device column-major dBo_f64. One column at a time with a
-    // stream sync so the reusable host stage buffer is safe to overwrite. Rare
-    // (≈ one column per epoch), so the per-column cost is amortized.
+    // Bo: host is row-major (stride ldBo). Gather each new column straight into
+    // the resident f32 dBo_f32, then widen in place to dBo_f64. One column at a
+    // time with a stream sync so the reusable host stage buffer is safe to
+    // overwrite. Rare (≈ one column per epoch), so the per-column cost amortizes.
     const dim3 grid_col((n + BLOCK - 1) / BLOCK);
     for (size_t c = start; c < m; ++c) {
         float *stage = ctx->h_stage.data();
         for (size_t i = 0; i < n; ++i) {
             stage[i] = Bo[i * ldBo + c];
         }
-        CUDA_CHECK(cudaMemcpyAsync(ctx->dBo_col, stage, n * sizeof(float),
+        CUDA_CHECK(cudaMemcpyAsync(ctx->dBo_f32 + c * n, stage, n * sizeof(float),
                                    cudaMemcpyHostToDevice, ctx->stream));
         widen_kernel<<<grid_col, BLOCK, 0, ctx->stream>>>(
-            ctx->dBo_col, ctx->dBo_f64 + c * n, n);
+            ctx->dBo_f32 + c * n, ctx->dBo_f64 + c * n, n);
         check_launch();
         CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
     }
@@ -575,10 +605,32 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     const double one = 1.0, zero = 0.0, neg_one = -1.0;
     const dim3 block(BLOCK);
 
-    // Phase 1: T = Boᵀ · Bx  (m×P, f64).
-    gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_T, CUBLAS_OP_N,
-           (int)m, (int)P, (int)n, &one, ctx->dBo_f64, (int)n,
-           ctx->dBx_f64, (int)n, &zero, ctx->dT, (int)ldT);
+    // Phase 1: T = Boᵀ · Bx  (m×P).
+    if (ctx->kchunk == 0) {
+        // Native f64 (exact dot of the f32-stored inputs).
+        gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_T, CUBLAS_OP_N,
+               (int)m, (int)P, (int)n, &one, ctx->dBo_f64, (int)n,
+               ctx->dBx_f64, (int)n, &zero, ctx->dT, (int)ldT);
+    } else {
+        // Blocked f32: split K=n into chunks, cublasSgemm each in f32 (fast on
+        // weak-f64 GPUs), accumulate the chunk results into the f64 dT. The
+        // cross-chunk f64 sum handles the global cancellation exactly; only the
+        // within-chunk f32 error (~sqrt(kchunk)*eps_f32) remains.
+        const float one_f = 1.0f, zero_f = 0.0f;
+        CUDA_CHECK(cudaMemsetAsync(ctx->dT, 0, ldT * P * sizeof(double), s));
+        const size_t nblk = (m * P + BLOCK - 1) / BLOCK;
+        for (size_t k0 = 0; k0 < n; k0 += ctx->kchunk) {
+            const int cc = (int)std::min(ctx->kchunk, n - k0);
+            CUBLAS_CHECK(cublasSgemm(ctx->handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                                     (int)m, (int)P, cc,
+                                     &one_f, ctx->dBo_f32 + k0, (int)n,
+                                     ctx->dBx_f32 + k0, (int)n,
+                                     &zero_f, ctx->dTc_f32, (int)m));
+            accum_f32_to_f64_kernel<<<(unsigned)nblk, block, 0, s>>>(
+                ctx->dTc_f32, ctx->dT, m, ldT, P);
+            check_launch();
+        }
+    }
 
     // Phase 2a: Bx -= Bo·T (in place, f64), then one fused pass that rounds to
     // f32, stores it, and reduces ‖Bx[:,j]‖² (ds) and Σ Bx·y (ybx_raw), split
