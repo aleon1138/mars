@@ -464,10 +464,17 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         if (!_cuda) {
             _cuda = mars::cuda::context_create(n, _max_terms, _tol);
         }
+        mars::cuda::context_set_target(_cuda, _data->y.data());
         mars::cuda::context_sync_basis(_cuda, _m,
                                        _data->B.data(),  _data->n,
                                        _data->Bo.data(), _data->bo_stride);
-        mars::cuda::orthonormalize(_cuda, _m, p, x, bcols, Bx, n);
+        /*
+         *  ybx = Bxᵀ*y is computed on the GPU (only p doubles come back). Bx
+         *  itself is downloaded only when the hinge sweep needs it (i.e. not
+         *  linear_only) -- in linear_only the n×p matrix never leaves the device.
+         */
+        float *Bx_out = linear_only ? nullptr : Bx;
+        mars::cuda::orthonormalize(_cuda, _m, p, x, bcols, Bx_out, n, ybx);
 #else
         verify(false, "marslib was built without CUDA support (configure with -DUSE_CUDA=ON)");
 #endif
@@ -490,7 +497,9 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
      *  and accumulates in f64. See kernels.h.
      */
     for (size_t j = 0; j < p; ++j) {
-        ybx[j] = mars::dot_widen(Bx + j*n, _data->y.data(), n);
+        if (!cuda) {
+            ybx[j] = mars::dot_widen(Bx + j*n, _data->y.data(), n);
+        }  // else: ybx was filled on the GPU by orthonormalize()
         linear_dsse[bcols[j]] = ybx[j]*ybx[j];
     }
 
