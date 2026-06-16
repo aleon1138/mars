@@ -20,8 +20,11 @@
  *    p         candidate X-columns           (default 1000)
  *    gpu_cols  candidate cols per GPU block  (default 8192, clamped to capacity;
  *              tune the cap with MARS_CUDA_BLOCK_GB)
- *    cpu_calls X-column orthonormalize calls (default 256)
- *    repeat    timed repeats                 (default 10)
+ *    cpu_calls X-column orthonormalize calls (default 128; 0 = skip the CPU
+ *              baseline). Each call is O(n*m^2) and the CPU side is single-pass
+ *              (not repeated), so at large m it dominates the bench wall time --
+ *              keep it small (~one wave per core) or 0 for GPU-only iteration.
+ *    repeat    timed GPU repeats             (default 10; GPU only)
  *
  *  GFLOP/s counts the two GEMMs (T = Boᵀ·Bx and the projection): 4·n·m per
  *  candidate column.
@@ -60,7 +63,7 @@ int main(int argc, char **argv)
     const size_t m        = arg(argc, argv, 2, 400);
     const size_t p        = arg(argc, argv, 3, 1000);
     size_t       gpu_cols = arg(argc, argv, 4, 8192);
-    const size_t cpu_calls = arg(argc, argv, 5, 256);
+    const size_t cpu_calls = arg(argc, argv, 5, 128);
     const int    repeat   = (int)arg(argc, argv, 6, 10);
     const double tol      = (n * 0.02) * DBL_EPSILON;
 
@@ -139,6 +142,15 @@ int main(int argc, char **argv)
                 gpu * 1e6 / gpu_cols);
 
     // ---- CPU (OpenMP over X-columns, like the eval binding) ----------------
+    // Each call is O(n*m^2) and there are `cpu_calls` of them (single pass, not
+    // repeated) -- at large m this is the slow part, so it's skippable (0) and
+    // kept small by default. cpu_calls=0 -> GPU-only.
+    if (cpu_calls == 0) {
+        std::printf("# CPU baseline skipped (cpu_calls=0)\n");
+        return 0;
+    }
+    std::printf("# CPU baseline: %zu calls (O(n*m^2) each) -- the slow part...\n",
+                cpu_calls);
     std::vector<int> mask(m);
     std::iota(mask.begin(), mask.end(), 0);
     auto cpu_run = [&]() {
@@ -161,10 +173,10 @@ int main(int argc, char **argv)
             }
         }
     };
-    cpu_run();  // warmup
+    // Single timed pass (no warmup/repeat -- it's already O(n*m^2)*cpu_calls).
     t0 = now_s();
-    for (int r = 0; r < repeat; ++r) cpu_run();
-    const double cpu = (now_s() - t0) / repeat;
+    cpu_run();
+    const double cpu = now_s() - t0;
     const double cpu_cols = (double)cpu_calls * m;
     std::printf("CPU  %8.2f ms       %8.0f cols/s  %7.1f GFLOP/s  (%.3f us/col)\n",
                 cpu * 1e3, cpu_cols / cpu, per_col_flop * cpu_cols / cpu / 1e9,
