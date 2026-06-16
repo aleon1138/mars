@@ -66,6 +66,13 @@ void context_sync_basis(Context *ctx, size_t m,
                         const float *Bo, size_t ldBo);
 
 /*
+ *  Upload the (normalized) target `y` (n f32) to the device, once. Idempotent:
+ *  re-uploads only when the pointer changes (y is fixed for a fit). Required
+ *  before requesting the `ybx` output from orthonormalize().
+ */
+void context_set_target(Context *ctx, const float *y);
+
+/*
  *  GPU counterpart of mars::orthonormalize(). For each j in [0, p):
  *      Bx[:,j]  = B[:, mask[j]] .* x                    (f32 multiply, f32 store)
  *      Bx[:,j] -= Bo * (Boᵀ * Bx[:,j])                  (f64 GEMM, f32 round)
@@ -80,16 +87,23 @@ void context_sync_basis(Context *ctx, size_t m,
  *      x    : (n) f32 host pointer -- the normalized candidate column.
  *      mask : (p) int32 host pointer -- indexes into columns of B.
  *      Bx   : (n, p) col-major f32 host pointer; col stride ldBx [output].
+ *             Pass nullptr to skip the (large) device->host copy -- e.g. in the
+ *             linear_only path, where only `ybx` is needed.
+ *      ybx  : (p) f64 host pointer [output, optional]. If non-null, the device
+ *             computes ybx[j] = Σ_i Bx[i,j]·y[i] (f64 accumulation, matching
+ *             mars::dot_widen) and copies back just these p doubles -- so the
+ *             n×p Bx matrix never crosses PCIe. Requires context_set_target().
  *      dgks_counter (optional): host atomic, incremented per column the retry
  *             fires on (nullptr in production; used by tests).
  *
- *  Internally the T = Boᵀ·Bx workspace and per-column norms stay on the device;
- *  only Bx is copied back to the host. The call is synchronous: on return, Bx
- *  is fully populated. Throws std::runtime_error on any CUDA/cuBLAS failure.
+ *  The T = Boᵀ·Bx workspace and per-column norms stay on the device. The call
+ *  is synchronous: on return, the requested outputs are fully populated. Throws
+ *  std::runtime_error on any CUDA/cuBLAS failure.
  */
 void orthonormalize(Context *ctx, size_t m, size_t p,
                     const float *x, const int *mask,
                     float *Bx, size_t ldBx,
+                    double *ybx = nullptr,
                     std::atomic<long> *dgks_counter = nullptr);
 
 } // namespace cuda

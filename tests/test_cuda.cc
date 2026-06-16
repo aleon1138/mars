@@ -100,7 +100,8 @@ MatrixXf run_cuda(int n, int m, int p,
     MatrixXf Bx(n, p);
     Bx.setZero();
     mars::cuda::orthonormalize(ctx, m, p, x.data(), mask.data(),
-                               Bx.data(), (size_t)Bx.outerStride(), counter);
+                               Bx.data(), (size_t)Bx.outerStride(),
+                               /*ybx=*/nullptr, counter);
     mars::cuda::context_destroy(ctx);
     return Bx;
 }
@@ -205,6 +206,49 @@ TEST(CudaKernelsTest, OrthonormalizeDoesNotFireDgksOnWellConditioned)
     std::atomic<long> counter{0};
     run_cuda(n, m, p, B, x, mask, Bo, TOL, &counter);
     ASSERT_EQ(counter.load(), 0);
+}
+
+/*
+ *  Win #1: the device-side ybx = Bxᵀ·y output (linear ΔSSE input). It must
+ *  match dot_widen(Bx, y) computed on the host from the same Bx, so the
+ *  per-eval Bx download can be dropped in linear_only mode.
+ */
+TEST(CudaKernelsTest, YbxMatchesBxTransposeY)
+{
+    if (!cuda_available()) {
+        GTEST_SKIP() << "no CUDA device available";
+    }
+    const int n = 4096;
+    const int m = 32;
+    const int p = 12;
+    constexpr double TOL = 1e-14;
+
+    std::mt19937 rng(0x59BC);
+    MatrixXfC Bo = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+    MatrixXf  B  = MatrixXf::Random(n, m);
+    ArrayXf   x  = ArrayXf::Random(n) * 3;
+    ArrayXi   mask = random_mask(m, p, rng);
+    ArrayXf   y  = ArrayXf::Random(n);
+
+    mars::cuda::Context *ctx = mars::cuda::context_create(n, m, TOL);
+    mars::cuda::context_set_target(ctx, y.data());
+    mars::cuda::context_sync_basis(ctx, m,
+                                   B.data(),  (size_t)B.outerStride(),
+                                   Bo.data(), (size_t)Bo.outerStride());
+    MatrixXf Bx(n, p);
+    Bx.setZero();
+    std::vector<double> ybx(p, 0.0);
+    mars::cuda::orthonormalize(ctx, m, p, x.data(), mask.data(),
+                               Bx.data(), (size_t)Bx.outerStride(), ybx.data());
+    mars::cuda::context_destroy(ctx);
+
+    // Reference: f64 dot of the returned Bx columns with y.
+    MatrixXd Bxd = Bx.cast<double>();
+    VectorXd yd  = y.cast<double>();
+    for (int j = 0; j < p; ++j) {
+        const double ref = Bxd.col(j).dot(yd);
+        EXPECT_NEAR(ybx[j], ref, 1e-9 * (1.0 + std::abs(ref)));
+    }
 }
 
 /*

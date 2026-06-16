@@ -145,6 +145,23 @@ __global__ void round_colnorm_masked_kernel(const double *in, float *out,
     }
 }
 
+// ybx[j] = Σ_i Bx[i,j] * y[i], f64 accumulation over the rounded f32 inputs
+// (one block per column). Matches mars::dot_widen: each f32 upcast at the load.
+__global__ void col_dot_y_kernel(const float *Bx, size_t ld, const float *y,
+                                 size_t n, double *ybx)
+{
+    const size_t j = blockIdx.x;
+    const float *col = Bx + j * ld;
+    double partial = 0.0;
+    for (size_t i = threadIdx.x; i < n; i += blockDim.x) {
+        partial += (double)col[i] * (double)y[i];
+    }
+    partial = blockReduceSum(partial);
+    if (threadIdx.x == 0) {
+        ybx[j] = partial;
+    }
+}
+
 // out[j] = ||M[:,j]||^2 over `rows` f64 entries (one block per column).
 __global__ void colsumsq_f64_kernel(const double *M, size_t ld, size_t rows,
                                     double *out)
@@ -211,9 +228,11 @@ struct Context {
     double tol       = 0.0;
     size_t m_synced  = 0;   // columns of B/Bo currently resident on device
 
-    // resident basis
+    // resident basis + target
     float  *dB      = nullptr;  // (n, max_terms) col-major, ld n
     double *dBo_f64 = nullptr;  // (n, max_terms) col-major, ld n
+    float  *dy      = nullptr;  // (n) normalized target
+    const float *target_ptr = nullptr;  // host y pointer last uploaded to dy
 
     // per-call scratch (sized for the worst case p == max_terms)
     float  *dBx_f32 = nullptr;  // (n, max_terms) col-major, ld n
@@ -223,6 +242,7 @@ struct Context {
     int    *dmask   = nullptr;  // (max_terms)
     double *ds      = nullptr;  // (max_terms)
     double *dtnorm2 = nullptr;  // (max_terms)
+    double *dybx    = nullptr;  // (max_terms) Bxᵀ·y output
     float  *dscale  = nullptr;  // (max_terms)
     int    *dflags  = nullptr;  // (max_terms)
     float  *dBo_col = nullptr;  // (n) Bo-column widen staging
@@ -250,6 +270,7 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         const size_t nmt = n * max_terms;
         CUDA_CHECK(cudaMalloc(&ctx->dB,      nmt * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dBo_f64, nmt * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dy,      n * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dBx_f32, nmt * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dBx_f64, nmt * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&ctx->dT,      max_terms * max_terms * sizeof(double)));
@@ -257,6 +278,7 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         CUDA_CHECK(cudaMalloc(&ctx->dmask,   max_terms * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ctx->ds,      max_terms * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&ctx->dtnorm2, max_terms * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dybx,    max_terms * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&ctx->dscale,  max_terms * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dflags,  max_terms * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ctx->dBo_col, n * sizeof(float)));
@@ -279,6 +301,7 @@ void context_destroy(Context *ctx)
     }
     cudaFree(ctx->dB);
     cudaFree(ctx->dBo_f64);
+    cudaFree(ctx->dy);
     cudaFree(ctx->dBx_f32);
     cudaFree(ctx->dBx_f64);
     cudaFree(ctx->dT);
@@ -286,6 +309,7 @@ void context_destroy(Context *ctx)
     cudaFree(ctx->dmask);
     cudaFree(ctx->ds);
     cudaFree(ctx->dtnorm2);
+    cudaFree(ctx->dybx);
     cudaFree(ctx->dscale);
     cudaFree(ctx->dflags);
     cudaFree(ctx->dBo_col);
@@ -338,9 +362,21 @@ void context_sync_basis(Context *ctx, size_t m,
     ctx->m_synced = m;
 }
 
+void context_set_target(Context *ctx, const float *y)
+{
+    if (ctx->target_ptr == y) {
+        return;  // y is fixed for a fit -- upload once
+    }
+    CUDA_CHECK(cudaMemcpyAsync(ctx->dy, y, ctx->n * sizeof(float),
+                               cudaMemcpyHostToDevice, ctx->stream));
+    CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+    ctx->target_ptr = y;
+}
+
 void orthonormalize(Context *ctx, size_t m, size_t p,
                     const float *x, const int *mask,
                     float *Bx, size_t ldBx,
+                    double *ybx,
                     std::atomic<long> *dgks_counter)
 {
     if (p == 0) {
@@ -432,12 +468,25 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
     normalize_kernel<<<grid_np, block, 0, s>>>(ctx->dBx_f32, ctx->dscale, n);
     check_launch();
 
-    // Copy Bx back to the host (device col-major ld n -> host col-major ld ldBx).
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        Bx, ldBx * sizeof(float),
-        ctx->dBx_f32, n * sizeof(float),
-        n * sizeof(float), p,
-        cudaMemcpyDeviceToHost, s));
+    // ybx = Bxᵀ·y on the device (f64) -- only p doubles cross PCIe, so the n×p
+    // Bx matrix stays resident. This is the linear ΔSSE input.
+    if (ybx) {
+        col_dot_y_kernel<<<(unsigned)p, block, 0, s>>>(
+            ctx->dBx_f32, n, ctx->dy, n, ctx->dybx);
+        check_launch();
+        CUDA_CHECK(cudaMemcpyAsync(ybx, ctx->dybx, p * sizeof(double),
+                                   cudaMemcpyDeviceToHost, s));
+    }
+
+    // Copy Bx back only when the caller needs it (e.g. the hinge sweep). In the
+    // linear_only path Bx is nullptr and never leaves the device.
+    if (Bx) {
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            Bx, ldBx * sizeof(float),
+            ctx->dBx_f32, n * sizeof(float),
+            n * sizeof(float), p,
+            cudaMemcpyDeviceToHost, s));
+    }
     CUDA_CHECK(cudaStreamSynchronize(s));
 }
 
