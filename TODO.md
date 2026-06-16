@@ -105,6 +105,36 @@ scan / per-cut argmax), much bigger.
   staging for x/ybx, fewer syncs, and/or batching multiple X-columns per GPU
   dispatch.
 
+### cuBLAS FP64 emulation — REJECTED on perf (2026-06-16), accuracy was fine
+
+Wired the f64 GEMMs through cublasGemmEx with CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT
+(commit 7eb437c, opt-in MARS_CUDA_FP64_EMULATE=1; left in as an off-by-default
+toggle). On sm_120 it **engages** (kernels become `cublasLt_fused_imma_dgemm_*`)
+and **passes the cancellation gate** (all 5 CUDA tests at 1e-5, incl. DGKS +
+collinear/degenerate). But it is **~30× slower**: GPU kernel time 2.1 s → ~66 s.
+The Ozaki/fixed-point scheme's per-GEMM overhead (int8 slice packing,
+max_scale/minmax passes, per-call cudaMallocAsync workspace, epilogue
+reconstruction) dwarfs the matmul because our GEMMs are small/skinny (T is m×p≈
+100×100 output, K=n large). Emulation targets *large dense* f64 GEMMs; it is the
+wrong tool here. Do not enable by default. (cuBLASLt with a hand-tuned emulation
+descriptor / fewer mantissa bits is unlikely to fix the per-call overhead on
+these shapes -- not worth pursuing.)
+
+Reframe: native d884 is already ~8.7 TFLOPS f64 (cuBLAS uses the f64 tensor cores
+well); the cost is the *count* (~7200 small GEMMs) + equal host overhead, not
+per-GEMM inefficiency. So the chunked-f32 split-K idea also won't beat d884's
+throughput and carries the cancellation risk -- deprioritized.
+
+### Next lever: batch X-columns into one GEMM per epoch
+
+Within an epoch all X-columns share Bo, so stack their candidate matrices and do
+ONE big GEMM T_all = Boᵀ·[Bx_1|Bx_2|…] (M=m, N=Σp, K=n) instead of ~7200 thin
+ones -- a healthy tensor-core shape AND amortized launches/transfers/syncs (hits
+both the GEMM and the host-side bottleneck). Python API is unchanged: the eval
+binding already receives the full (p_X, m) mask and loops internally; the batching
+moves into the cuda path (a new batched orthonormalize entry point). Most invasive
+change so far; highest leverage.
+
 ## Phase 1 GEMM (`T = Boᵀ·Bx`) is store-port-bound
 
 **Finding:** Phase 1 of `orthonormalize()` (the `axpy_m` sweep building
