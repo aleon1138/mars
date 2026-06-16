@@ -406,6 +406,12 @@ Context *context_create(size_t n, size_t max_terms, double tol)
             p_cap = max_terms;
         }
         ctx->p_cap = p_cap;
+        if (std::getenv("MARS_CUDA_VERBOSE")) {
+            std::fprintf(stderr,
+                "[mars-cuda] context: n=%zu max_terms=%zu block_gb=%.3g "
+                "-> p_cap=%zu candidate cols/block\n",
+                n, max_terms, block_gb, p_cap);
+        }
 
         const size_t nmt = n * max_terms;   // resident basis
         const size_t npc = n * p_cap;        // batched scratch
