@@ -19,15 +19,18 @@ find_package(pybind11 CONFIG REQUIRED)
 # Enable with -DUSE_CUDA=ON (or, for a wheel, pip install . -C cmake.define.USE_CUDA=ON).
 option(USE_CUDA "Build CUDA orthonormalize kernels" OFF)
 if(USE_CUDA)
+    # Must be set BEFORE enable_language(CUDA): enabling the language initializes
+    # CMAKE_CUDA_ARCHITECTURES (from the build host's detected GPU), after which a
+    # `NOT DEFINED` default would never fire. 75 = RTX 2080 Ti (dev), 120 = RTX
+    # PRO 6000 Blackwell (research server). Override with
+    # -DCMAKE_CUDA_ARCHITECTURES=... to pin a single target.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "75;120")
+    endif()
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-    # 75 = RTX 2080 Ti (dev), 120 = RTX PRO 6000 Blackwell (research server).
-    # Override with -DCMAKE_CUDA_ARCHITECTURES=... once the target is pinned.
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES "75;120")
-    endif()
 
     add_library(mars_cuda STATIC cuda/orthonormalize.cu)
     set_target_properties(mars_cuda PROPERTIES
