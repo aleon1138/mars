@@ -105,90 +105,95 @@ int main(int argc, char **argv)
     std::vector<float> s(p, 1.0f);
 
     // ---- GPU ---------------------------------------------------------------
-  try {
-    mars::cuda::Context *ctx = mars::cuda::context_create(n, m, tol);
-    mars::cuda::context_set_target(ctx, y.data());
-    mars::cuda::context_sync_basis(ctx, m, B.data(), n, Bo.data(), m);
-    std::vector<int> cols(p);
-    std::iota(cols.begin(), cols.end(), 0);
-    mars::cuda::context_sync_xcols(ctx, p, X.data(), n, s.data(), cols.data(), p);
+    try {
+        mars::cuda::Context *ctx = mars::cuda::context_create(n, m, tol);
+        mars::cuda::context_set_target(ctx, y.data());
+        mars::cuda::context_sync_basis(ctx, m, B.data(), n, Bo.data(), m);
+        std::vector<int> cols(p);
+        std::iota(cols.begin(), cols.end(), 0);
+        mars::cuda::context_sync_xcols(ctx, p, X.data(), n, s.data(), cols.data(), p);
 
-    const size_t cap = mars::cuda::context_batch_capacity(ctx);
-    if (gpu_cols > cap) {
-        std::printf("# gpu_cols clamped %zu -> %zu (batch capacity; raise MARS_CUDA_BLOCK_GB)\n",
-                    gpu_cols, cap);
-        gpu_cols = cap;
-    }
-    std::vector<int> src_xcol(gpu_cols), src_basis(gpu_cols);
-    for (size_t j = 0; j < gpu_cols; ++j) {
-        src_xcol[j]  = (int)(j % p);
-        src_basis[j] = (int)(j % m);
-    }
-    std::vector<double> ybx(gpu_cols);
+        const size_t cap = mars::cuda::context_batch_capacity(ctx);
+        if (gpu_cols > cap) {
+            std::printf("# gpu_cols clamped %zu -> %zu (batch capacity; raise MARS_CUDA_BLOCK_GB)\n",
+                        gpu_cols, cap);
+            gpu_cols = cap;
+        }
+        std::vector<int> src_xcol(gpu_cols), src_basis(gpu_cols);
+        for (size_t j = 0; j < gpu_cols; ++j) {
+            src_xcol[j]  = (int)(j % p);
+            src_basis[j] = (int)(j % m);
+        }
+        std::vector<double> ybx(gpu_cols);
 
-    mars::cuda::orthonormalize_batch(ctx, m, gpu_cols, src_xcol.data(),
-                                     src_basis.data(), ybx.data());  // warmup
-    double t0 = now_s();
-    for (int r = 0; r < repeat; ++r) {
         mars::cuda::orthonormalize_batch(ctx, m, gpu_cols, src_xcol.data(),
-                                         src_basis.data(), ybx.data());
-    }
-    const double gpu = (now_s() - t0) / repeat;
-    mars::cuda::context_destroy(ctx);
+                                         src_basis.data(), ybx.data());  // warmup
+        double t0 = now_s();
+        for (int r = 0; r < repeat; ++r) {
+            mars::cuda::orthonormalize_batch(ctx, m, gpu_cols, src_xcol.data(),
+                                             src_basis.data(), ybx.data());
+        }
+        const double gpu = (now_s() - t0) / repeat;
+        mars::cuda::context_destroy(ctx);
 
-    const double per_col_flop = 4.0 * (double)n * (double)m;  // 2 GEMMs
-    std::printf("GPU  %8.2f ms/block  %8.0f cols/s  %7.1f GFLOP/s  (%.3f us/col)\n",
-                gpu * 1e3, gpu_cols / gpu, per_col_flop * gpu_cols / gpu / 1e9,
-                gpu * 1e6 / gpu_cols);
+        const double per_col_flop = 4.0 * (double)n * (double)m;  // 2 GEMMs
+        std::printf("GPU  %8.2f ms/block  %8.0f cols/s  %7.1f GFLOP/s  (%.3f us/col)\n",
+                    gpu * 1e3, gpu_cols / gpu, per_col_flop * gpu_cols / gpu / 1e9,
+                    gpu * 1e6 / gpu_cols);
 
-    // ---- CPU (OpenMP over X-columns, like the eval binding) ----------------
-    // Each call is O(n*m^2) and there are `cpu_calls` of them (single pass, not
-    // repeated) -- at large m this is the slow part, so it's skippable (0) and
-    // kept small by default. cpu_calls=0 -> GPU-only.
-    if (cpu_calls == 0) {
-        std::printf("# CPU baseline skipped (cpu_calls=0)\n");
-        return 0;
-    }
-    std::printf("# CPU baseline: %zu calls (O(n*m^2) each) -- the slow part...\n",
-                cpu_calls);
-    std::vector<int> mask(m);
-    std::iota(mask.begin(), mask.end(), 0);
-    auto cpu_run = [&]() {
-        #pragma omp parallel
-        {
-            std::vector<float>  Bx((size_t)n * m), x(n);
-            std::vector<double> T((size_t)m * m), s_buf(m);
-            #pragma omp for schedule(static)
-            for (long c = 0; c < (long)cpu_calls; ++c) {
-                const float *xc = X.data() + (size_t)(c % p) * n;
-                const float  sc = s[c % p];
-                for (size_t i = 0; i < n; ++i) x[i] = xc[i] * sc;
-                mars::orthonormalize(n, m, m, B.data(), n, x.data(), mask.data(),
-                                     Bo.data(), m, Bx.data(), n, T.data(), m,
-                                     s_buf.data(), tol);
-                for (size_t j = 0; j < m; ++j) {
-                    volatile double d = mars::dot_widen(Bx.data() + j * n, y.data(), n);
-                    (void)d;
+        // ---- CPU (OpenMP over X-columns, like the eval binding) ----------------
+        // Each call is O(n*m^2) and there are `cpu_calls` of them (single pass, not
+        // repeated) -- at large m this is the slow part, so it's skippable (0) and
+        // kept small by default. cpu_calls=0 -> GPU-only.
+        if (cpu_calls == 0) {
+            std::printf("# CPU baseline skipped (cpu_calls=0)\n");
+            return 0;
+        }
+        std::printf("# CPU baseline: %zu calls (O(n*m^2) each) -- the slow part...\n",
+                    cpu_calls);
+        std::vector<int> mask(m);
+        std::iota(mask.begin(), mask.end(), 0);
+        auto cpu_run = [&]() {
+            #pragma omp parallel
+            {
+                std::vector<float>  Bx((size_t)n * m), x(n);
+                std::vector<double> T((size_t)m * m), s_buf(m);
+                #pragma omp for schedule(static)
+                for (long c = 0; c < (long)cpu_calls; ++c)
+                {
+                    const float *xc = X.data() + (size_t)(c % p) * n;
+                    const float  sc = s[c % p];
+                    for (size_t i = 0; i < n; ++i) {
+                        x[i] = xc[i] * sc;
+                    }
+                    mars::orthonormalize(n, m, m, B.data(), n, x.data(), mask.data(),
+                                         Bo.data(), m, Bx.data(), n, T.data(), m,
+                                         s_buf.data(), tol);
+                    for (size_t j = 0; j < m; ++j) {
+                        volatile double d = mars::dot_widen(Bx.data() + j * n, y.data(), n);
+                        (void)d;
+                    }
                 }
             }
-        }
-    };
-    // Single timed pass (no warmup/repeat -- it's already O(n*m^2)*cpu_calls).
-    t0 = now_s();
-    cpu_run();
-    const double cpu = now_s() - t0;
-    const double cpu_cols = (double)cpu_calls * m;
-    std::printf("CPU  %8.2f ms       %8.0f cols/s  %7.1f GFLOP/s  (%.3f us/col)\n",
-                cpu * 1e3, cpu_cols / cpu, per_col_flop * cpu_cols / cpu / 1e9,
-                cpu * 1e6 / cpu_cols);
+        };
 
-    std::printf("speedup (GPU/CPU cols/s): %.2fx\n",
-                (gpu_cols / gpu) / (cpu_cols / cpu));
-  } catch (const std::exception &e) {
-    std::fprintf(stderr, "bench_ortho: %s\n", e.what());
-    std::fprintf(stderr, "  (out of memory? lower MARS_CUDA_BLOCK_GB, n, or m -- "
-                         "batch scratch is ~16·n·p_cap bytes)\n");
-    return 1;
-  }
+        // Single timed pass (no warmup/repeat -- it's already O(n*m^2)*cpu_calls).
+        t0 = now_s();
+        cpu_run();
+        const double cpu = now_s() - t0;
+        const double cpu_cols = (double)cpu_calls * m;
+        std::printf("CPU  %8.2f ms       %8.0f cols/s  %7.1f GFLOP/s  (%.3f us/col)\n",
+                    cpu * 1e3, cpu_cols / cpu, per_col_flop * cpu_cols / cpu / 1e9,
+                    cpu * 1e6 / cpu_cols);
+
+        std::printf("speedup (GPU/CPU cols/s): %.2fx\n",
+                    (gpu_cols / gpu) / (cpu_cols / cpu));
+    }
+    catch (const std::exception &e) {
+        std::fprintf(stderr, "bench_ortho: %s\n", e.what());
+        std::fprintf(stderr, "  (out of memory? lower MARS_CUDA_BLOCK_GB, n, or m -- "
+                     "batch scratch is ~16·n·p_cap bytes)\n");
+        return 1;
+    }
     return 0;
 }

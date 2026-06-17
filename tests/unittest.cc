@@ -561,7 +561,9 @@ TEST(MarsTest, ConcurrentEval)
         pool.emplace_back(run, std::ref(lin), std::ref(hin), std::ref(cut),
                           (M * t) / nt, (M * (t + 1)) / nt);
     }
-    for (auto &th : pool) th.join();
+    for (auto &th : pool) {
+        th.join();
+    }
 
     for (int xc = 0; xc < M; ++xc) {
         for (int j = 0; j < m; ++j) {
@@ -569,7 +571,7 @@ TEST(MarsTest, ConcurrentEval)
             ASSERT_EQ(hin[xc][j], hin_ref[xc][j]) << "hinge_dsse col "  << xc << " j " << j;
             const double c = cut[xc][j], cr = cut_ref[xc][j];
             ASSERT_TRUE((std::isnan(c) && std::isnan(cr)) || c == cr)
-                << "hinge_cut col " << xc << " j " << j;
+                    << "hinge_cut col " << xc << " j " << j;
         }
     }
 }

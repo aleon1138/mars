@@ -197,7 +197,7 @@ __global__ void round_reduce_kernel(const double *in, float *out,
     const size_t stride = (size_t)gridDim.x * blockDim.x;
     double s_norm = 0.0, s_dot = 0.0;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         i < n; i += stride) {
+            i < n; i += stride) {
         const double r  = cproj ? (cin[i] - (double)cproj[i]) : cin[i];
         const float  v  = (float)r;
         cout[i] = v;
@@ -220,9 +220,9 @@ __global__ void round_reduce_kernel(const double *in, float *out,
 // one block per column (direct write, no atomics -- a single block does the full
 // column reduction). Non-flagged columns are left untouched (uniform return).
 __global__ void round_reduce_masked_kernel(const double *in, float *out,
-                                           const float *y, size_t n,
-                                           double *ds, double *ybx_raw,
-                                           const int *flags, int want_dot)
+        const float *y, size_t n,
+        double *ds, double *ybx_raw,
+        const int *flags, int want_dot)
 {
     const size_t j = blockIdx.x;
     if (!flags[j]) {
@@ -452,9 +452,9 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         }
         if (std::getenv("MARS_CUDA_VERBOSE")) {
             std::fprintf(stderr,
-                "[mars-cuda] context: n=%zu max_terms=%zu block_gb=%.3g "
-                "-> p_cap=%zu candidate cols/block; kchunk=%zu\n",
-                n, max_terms, block_gb, p_cap, ctx->kchunk);
+                         "[mars-cuda] context: n=%zu max_terms=%zu block_gb=%.3g "
+                         "-> p_cap=%zu candidate cols/block; kchunk=%zu\n",
+                         n, max_terms, block_gb, p_cap, ctx->kchunk);
         }
 
         const size_t nmt = n * max_terms;   // resident basis
@@ -483,7 +483,8 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         ctx->h_ds.resize(p_cap);
         ctx->h_tnorm2.resize(p_cap);
         ctx->h_flags.resize(p_cap);
-    } catch (...) {
+    }
+    catch (...) {
         context_destroy(ctx);
         throw;
     }
@@ -537,10 +538,10 @@ void context_sync_basis(Context *ctx, size_t m,
     // B: columns [start, m) -> dB columns [start, m). Both col-major; cudaMemcpy2D
     // tolerates ldB != n (it is n in practice -> a single contiguous block).
     CUDA_CHECK(cudaMemcpy2DAsync(
-        ctx->dB + start * n, n * sizeof(float),
-        B + start * ldB,     ldB * sizeof(float),
-        n * sizeof(float),   cnt,
-        cudaMemcpyHostToDevice, ctx->stream));
+                   ctx->dB + start * n, n * sizeof(float),
+                   B + start * ldB,     ldB * sizeof(float),
+                   n * sizeof(float),   cnt,
+                   cudaMemcpyHostToDevice, ctx->stream));
 
     // Bo: host is row-major (stride ldBo). Gather each new column straight into
     // the resident f32 dBo_f32, then widen in place to dBo_f64. One column at a
@@ -627,7 +628,8 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
         gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_T, CUBLAS_OP_N,
                (int)m, (int)P, (int)n, &one, ctx->dBo_f64, (int)n,
                ctx->dBx_f64, (int)n, &zero, ctx->dT, (int)ldT);
-    } else {
+    }
+    else {
         // Blocked f32: split K=n into chunks, cublasSgemm each in f32 (fast on
         // weak-f64 GPUs), accumulate the chunk results into the f64 dT. The
         // cross-chunk f64 sum handles the global cancellation exactly; only the
@@ -655,7 +657,8 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
         gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_N, CUBLAS_OP_N,
                (int)n, (int)P, (int)m, &neg_one, ctx->dBo_f64, (int)n,
                ctx->dT, (int)ldT, &one, ctx->dBx_f64, (int)n);
-    } else {
+    }
+    else {
         // f32 projection: proj = Bo·T (f32 sgemm, K=m), subtract in f64. dBx_f32
         // (the phase-0 fill, no longer needed) is reused as the proj scratch.
         const float one_f = 1.0f, zero_f = 0.0f;
@@ -768,10 +771,10 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
         normalize_kernel<<<grid_np, block, 0, s>>>(ctx->dBx_f32, ctx->dscale, n);
         check_launch();
         CUDA_CHECK(cudaMemcpy2DAsync(
-            Bx, ldBx * sizeof(float),
-            ctx->dBx_f32, n * sizeof(float),
-            n * sizeof(float), p,
-            cudaMemcpyDeviceToHost, s));
+                       Bx, ldBx * sizeof(float),
+                       ctx->dBx_f32, n * sizeof(float),
+                       n * sizeof(float), p,
+                       cudaMemcpyDeviceToHost, s));
     }
     CUDA_CHECK(cudaStreamSynchronize(s));
 }

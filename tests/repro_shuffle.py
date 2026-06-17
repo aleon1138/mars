@@ -13,6 +13,7 @@ random shuffles. Two metrics:
                proxy for "how much does this fix make results
                row-order-invariant?"
 """
+
 import os
 import sys
 import numpy as np
@@ -54,9 +55,10 @@ def fit_curve(X, y, max_terms=41, seed=None):
         perm = rng.permutation(len(X))
         X, y = np.asfortranarray(X[perm]), y[perm]
     model = mars.fit(
-        X, y,
+        X,
+        y,
         max_terms=max_terms,
-        threads=1,        # avoid OpenMP nondeterminism
+        threads=1,  # avoid OpenMP nondeterminism
         r2_window=1_000,  # disable patience early-stop for clean curves
         r2_thresh=0.0,
     )
@@ -95,8 +97,10 @@ def measure(label, X, y, k_shuffles=10, max_terms=41):
     print(f"  ratio sorted/shuf:   {rough_sorted / max(rough_shuffled, 1e-30):.2f}x")
     print(f"  shuffled spread:     {spread:.5e}  (sum of per-epoch std)")
     print(f"  final r2_cv sorted:  {sorted_curve[-1]:.6f}")
-    print(f"  final r2_cv shuf:    {shuffled_curves[:, -1].mean():.6f}"
-          f" ± {shuffled_curves[:, -1].std():.2e}")
+    print(
+        f"  final r2_cv shuf:    {shuffled_curves[:, -1].mean():.6f}"
+        f" ± {shuffled_curves[:, -1].std():.2e}"
+    )
     return {
         "rough_sorted": rough_sorted,
         "rough_shuffled": rough_shuffled,

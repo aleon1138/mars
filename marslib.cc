@@ -119,7 +119,8 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
                     try {
                         algo.eval(&dsse1_ptr(i,0), &dsse2_ptr(i,0), &h_cut_ptr(i,0),
                                   i, &mask(i,0), min_span, endspan, linear, cuda);
-                    } catch (const std::exception &e) {
+                    }
+                    catch (const std::exception &e) {
                         #pragma omp critical
                         { if (err.empty()) err = e.what(); }
                         ok.store(false, std::memory_order_relaxed);
