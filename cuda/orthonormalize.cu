@@ -417,24 +417,6 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         CUBLAS_CHECK(cublasCreate(&ctx->handle));
         CUBLAS_CHECK(cublasSetStream(ctx->handle, ctx->stream));
 
-        // Optional: run the f64 GEMMs via cuBLAS FP64 emulation on the integer
-        // tensor cores (Blackwell). Opt-in with MARS_CUDA_FP64_EMULATE=1. The
-        // fixed-point scheme reconstructs the f64 result (not a lossy f32/TF32
-        // approximation), so it should clear the cancellation gate -- but the
-        // precision-stress + DGKS tests must confirm it. Native f64 (d884 DMMA)
-        // remains the default.
-        const char *emu = std::getenv("MARS_CUDA_FP64_EMULATE");
-        if (emu && emu[0] == '1') {
-            // Request emulation per-GEMM via the compute type (cublasGemmEx);
-            // EAGER tells cuBLAS to use emulation whenever the compute type asks.
-            ctx->compute_type = CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT;
-            CUBLAS_CHECK(cublasSetEmulationStrategy(ctx->handle,
-                                                    CUBLAS_EMULATION_STRATEGY_EAGER));
-            std::fprintf(stderr,
-                "[mars-cuda] FP64 emulation enabled: compute_type=%d, strategy=EAGER\n",
-                (int)CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT);
-        }
-
         // Candidate-column capacity for the batched path. Per output column the
         // scratch costs ~ (Bx_f32 4 + Bx_f64 8 + Xcand 4) = 16 bytes/row, so cap
         // the block at MARS_CUDA_BLOCK_GB (default 8) GB of n-row columns. Never

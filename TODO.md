@@ -1,211 +1,22 @@
 # TODO
 
-## I) CUDA port
+Ideas and notes for future performance/quality work — not planned for a specific
+release. Completed work lives in git history; rejected approaches and why they
+were rejected live in CLAUDE.md's performance notes.
 
-**Realistic speedup:** 10–30× on the forward pass vs. current multi-core AVX2.
-  Not 100× — MARS isn't pure matmul; there's sorting, dependency chains between
-  epochs, and control flow for cut-point selection. Your current code already
-  hits decent CPU throughput.
+## CUDA port — status
 
-**Why it could still be worth it:**
-- 96GB VRAM is enough to keep the entire working set (X, B, Bo, y, internals)
-  resident — no PCIe transfers during a fit. That alone could be 2–3× if
-  current runs are memory-bandwidth-limited.
-- Tensor cores eat bf16×bf16 → fp32 natively, which is exactly the precision
-  regime we want.
+The `linear_only` forward pass runs on the GPU behind `fit(cuda=True)` (opt-in
+`-DUSE_CUDA=ON`, `make configure-cuda`); the CPU kernel stays the correctness
+oracle. It beats the 64-core CPU — ~12× over native f64 at n=500k, m=400 on the
+sm_120 server. The design, the f32-GEMM default and its accepted tradeoff, and
+the FP64-emulation rejection are recorded in CLAUDE.md's 2026-06-16 CUDA
+performance note; the full running record is in git history.
 
-**Design:**
-- Port incrementally. Keep CPU orchestration, move only the hottest inner loop
-  (`covariates()`) to CUDA first. Measure before doing more.
-- `covariates()` maps well to segmented scan primitives (CUB / thrust).
-- Orthonormalization is straightforward cuBLAS.
-- Per-epoch dependencies prevent parallelism across epochs, but within an epoch
-  the (x_col, basis_col) candidate grid is embarrassingly parallel — same
-  parallelism OpenMP is already exploiting.
-
-**Effort estimate:** multi-week project, not a weekend.
-
-### Status
-
-**Pass 1 — DONE (2026-06-16, branch `feat/cuda-orthonormalize`, commit 68c321b).**
-A GPU `mars::cuda::orthonormalize()` for the `linear_only` regime, behind a
-`cuda=True` flag on `MarsAlgo.eval()`. CPU kernel (kernels.cc) untouched, stays
-the oracle. Built as a static lib `mars_cuda` (nvcc) linked into marslib.so,
-opt-in via `-DUSE_CUDA=ON` (`make configure-cuda`). Resident Bo/B context (PIMPL,
-owned by MarsAlgo), synced lazily by column count — no `append()` hook (B/Bo are
-append-only). Validated against the Eigen oracle and CPU parity in
-tests/test_cuda.cc.
-
-Two findings that revise the notes above:
-- **"Orthonormalization is straightforward cuBLAS" is only half-true.** The
-  `T = Boᵀ·Bx` accumulation must be f64 (f32-accum corrupts the near-zero
-  projection entries via cancellation — same reason bf16 was rejected). There's
-  no f32-in/f64-accumulate cuBLAS primitive, so pass 1 widens Bo/Bx to f64 and
-  calls `cublasDgemm`.
-- **The server is not a data-center Blackwell.** It's an **RTX PRO 6000 Blackwell
-  Server Edition (sm_120, ~96 GB)** — workstation-class GB202 with crippled FP64
-  (~1:64; the 2080 Ti dev box is ~1:32). So native `cublasDgemm` is *correct but
-  slow*. The "tensor cores eat bf16×bf16→fp32" intuition is the right instinct,
-  but it has to be realized as an FP64-accuracy path on tensor cores (see Pass 2),
-  not plain `Dgemm`.
-
-### Pass 2 — make GPU `linear_only` actually beat the 64-core CPU
-
-Pass 1 is correctness + plumbing only; it re-uploads x per eval, runs one eval at
-a time (threads=1), downloads the full `Bx`, and uses slow native-f64 GEMM. Pass 2
-closes those gaps. **Gate on measurement first** ("measure before doing more"):
-profile pass-1 GPU eval vs the 64-core CPU at production scale *on the server* and
-split GPU time into GEMM / transfers / launch overhead; let that order the items.
-
-1. **Eliminate the per-eval `Bx` download (highest-confidence win).** In
-   `linear_only` the only consumer of `Bx` is `ybx[j] = dot_widen(Bx[:,j], y);
-   linear_dsse = ybx[j]²` (marsalgo.cc:462). Compute `Bxᵀ·y` on the GPU with `y`
-   resident and return only `ybx` (p doubles) instead of `Bx` (n×p f32) — at
-   n=4M, p=400 that's ~6.4 GB → ~3 KB per eval. Makes linear_only resident
-   end-to-end; mostly mechanical.
-
-2. **Precision-preserving fast GEMM (the compute win).** Replace native f64 for
-   `T = Boᵀ·Bx` and the projection. Candidates, in order of promise: cuBLAS
-   **FP64 emulation** on tensor cores (Ozaki-style DGEMM emulation, CUDA 13.x on
-   Blackwell); else error-compensated f32 / 3×TF32. MUST validate against the
-   1e-5 oracle AND prove it preserves the near-zero/cancelling `T` entries (the
-   thing that killed f32-accum and bf16). Build a bench harness comparing
-   native-f64 vs emulation vs compensated at production n/m/p.
-
-3. **Batch across X columns + keep candidates resident (throughput win).** The
-   `(x_col × basis)` grid is embarrassingly parallel; hoist the X-column loop into
-   the GPU layer (one batched orthonormalize per candidate block) instead of
-   one-eval-at-a-time, and keep `X` resident so `x = X[:,col]·scale` is computed
-   on-device (no per-call H2D). Add pinned staging + multiple streams for
-   transfer/compute overlap. Most invasive piece — changes the eval granularity
-   and the binding's OpenMP-over-X-columns model.
-
-Done = resident linear_only eval (Bo/B/y, ideally X, on device; only ybx/
-linear_dsse returned), f64 GEMM replaced by a validated fast path, demonstrably
-beating the CPU at production scale. The hinge sweep (`covariates`,
-`linear_only=False`) stays on the CPU — that's a later pass (sorting / segmented
-scan / per-cut argmax), much bigger.
-
-### Pass-2 progress (2026-06-16, server profiles guiding it)
-
-- **Win #1 DONE** (commit 14234d7): ybx = Bxᵀ·y on-device, Bx download dropped in
-  linear_only. Server profile confirmed D2H fell to <1 MB total.
-- **Post-GEMM kernels fused + parallelized DONE** (commit 7a005c2): the two
-  one-block-per-column reductions were ~42% of GPU time (occupancy-starved);
-  replaced by a single GPU-filling `round_reduce_kernel` (atomic f64 partials
-  over rows×cols) + scale-fold, normalize skipped in linear_only. Server profile:
-  those kernels 42% → ~4%; total GPU kernel time 3.48 s → 2.07 s.
-- **Now GEMM-bound:** `T = Boᵀ·Bx` (d884 f64 tensor core, K=n split-K Gram) is
-  ~73% of GPU, the projection ~18%. FP64-emulation toggle added (commit 9ebd149,
-  MARS_CUDA_FP64_EMULATE=1) — **pending server (sm_120) validation** of accuracy
-  (cancellation tests) + that it engages + speedup. No-op on the sm_75 dev box
-  (cuBLAS falls back to native there).
-- **Next bottleneck after the GEMM:** host-side per-eval overhead is already ~equal
-  to GPU time (pageable transfers + 2 syncs/eval). Once the GEMM shrinks: pinned
-  staging for x/ybx, fewer syncs, and/or batching multiple X-columns per GPU
-  dispatch.
-
-### cuBLAS FP64 emulation — REJECTED on perf (2026-06-16), accuracy was fine
-
-Wired the f64 GEMMs through cublasGemmEx with CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT
-(commit 7eb437c, opt-in MARS_CUDA_FP64_EMULATE=1; left in as an off-by-default
-toggle). On sm_120 it **engages** (kernels become `cublasLt_fused_imma_dgemm_*`)
-and **passes the cancellation gate** (all 5 CUDA tests at 1e-5, incl. DGKS +
-collinear/degenerate). But it is **~30× slower**: GPU kernel time 2.1 s → ~66 s.
-The Ozaki/fixed-point scheme's per-GEMM overhead (int8 slice packing,
-max_scale/minmax passes, per-call cudaMallocAsync workspace, epilogue
-reconstruction) dwarfs the matmul because our GEMMs are small/skinny (T is m×p≈
-100×100 output, K=n large). Emulation targets *large dense* f64 GEMMs; it is the
-wrong tool here. Do not enable by default. (cuBLASLt with a hand-tuned emulation
-descriptor / fewer mantissa bits is unlikely to fix the per-call overhead on
-these shapes -- not worth pursuing.)
-
-Reframe: native d884 is already ~8.7 TFLOPS f64 (cuBLAS uses the f64 tensor cores
-well); the cost is the *count* (~7200 small GEMMs) + equal host overhead, not
-per-GEMM inefficiency. So the chunked-f32 split-K idea also won't beat d884's
-throughput and carries the cancellation risk -- deprioritized.
-
-### Batch X-columns into one GEMM per block -- IMPLEMENTED (2026-06-16, commit e650049)
-
-Within an epoch all X-columns share Bo, so stack their candidate matrices and do
-ONE set of GEMMs per block (T_all = Boᵀ·[Bx_1|…], M=m, N=Σp, K=n) instead of
-~7200 thin ones -- a healthy tensor-core shape AND amortized launches/transfers/
-syncs (hits both the GEMM and host-side bottleneck). Python API unchanged: the
-eval binding hands the full (p_X, m) mask to MarsAlgo::eval_batch (cuda &&
-linear_only), which blocks X-columns by a VRAM cap (MARS_CUDA_BLOCK_GB, default
-8) and calls mars::cuda::orthonormalize_batch per block. Shared post-fill
-pipeline (project_reduce) is reused by both per-column and batched paths.
-
-Correctness validated (batched vs CPU/per-column ~1e-9, single + multi-block).
-**Speed: to be measured on the server** -- re-profile and compare wall-clock +
-the GEMM kernel count/shape vs the per-eval baseline. Expected: the ~7200 small
-d884 GEMMs collapse to ~M·(few blocks) large ones, and the host-side per-eval
-overhead (was ~equal to GPU) largely disappears. If a single block per epoch is
-too large for VRAM, lower MARS_CUDA_BLOCK_GB; if GPU is underused, raise it.
-
-If still not beating the CPU after this, the remaining levers are pinned host
-staging for the x/ybx transfers and reducing the per-block syncs (the DGKS gate
-still does one mid-block host round-trip).
-
-### Resident scaled X -- DONE (2026-06-16, commit d7f362b)
-
-Batching profile at n=300k,p=1k exposed the next bottleneck: candidate X columns
-re-uploaded every epoch -- 43 GB HtoD total (~36× the 1.2 GB X), host transfer
-~6.9 s > GPU 4.7 s. Fixed: context_sync_xcols() uploads+scales each candidate
-x_c = X[:,c]·s[c] once into a resident dXscaled (n×p_x), lazily by column;
-orthonormalize_batch indexes it by global X column (no per-block X upload). Each
-used column now transfers once per fit instead of per epoch.
-
-**Memory note:** dXscaled is n·p_x·4 bytes (1.2 GB at n=300k,p_x=1k; ~16 GB at
-n=4M,p_x=1k; scales with p_x). With resident dBo_f64 (n·max_terms·8) + dB + the
-n·p_cap batch scratch, very large n·p_x could pressure the 96 GB. If so: cap/evict
-dXscaled to the active working set, or fall back to per-block upload. Fine at
-current scales.
-
-After this the GPU GEMMs (T = Boᵀ·Bx ~49%, projection ~30%) dominate again, with
-fill_batch + round_reduce ~19%. Re-profile to confirm HtoD collapsed; next levers
-if needed: pinned ybx/src transfers, on-device DGKS gate (kill the per-block
-sync), bigger MARS_CUDA_BLOCK_GB for fewer/larger GEMMs.
-
-### Blocked-f32 T GEMM -- DONE, ON BY DEFAULT (2026-06-16, commits f0a3181 + default flip)
-
-Native f64 is pinned at the GB202 workstation card's ~1.44 TFLOP/s f64 ceiling
-(no real f64-tensor acceleration on sm_120). MARS_CUDA_BLOCK_GB sweeps plateaued
-(~5%) -- it's f64-compute-bound. The win is doing the T = Boᵀ·Bx GEMM in f32:
-split K=n into MARS_CUDA_KCHUNK-sized chunks, cublasSgemm each in f32, accumulate
-the chunk results in f64 (gram()-style). The cross-chunk f64 sum handles T's
-*global* cancellation exactly; only the within-chunk f32 error (~sqrt(kchunk)*
-eps_f32) remains. Default kchunk=2048 (on); MARS_CUDA_KCHUNK=0 = native-f64
-reference.
-
-Server (n=500k, m=400): 580 -> 298 ms/block = ~1.95x; kchunk 2048 ~= 8192 (not
-launch-bound). Gates: all 6 CUDA tests at 1e-5; fit-equivalence well-conditioned
-= bit-identical to f64; correlated/ill-conditioned = identical final R^2 but a
-different (equally good) term ordering (f32 flips near-tied ΔSSE argmaxes; CPU and
-GPU-f64 agree there). Accepted: quality preserved, not bit-reproducible vs CPU on
-correlated features. Now the f64 *projection* GEMM (~174 ms of the 298) is the
-bottleneck, then fill_batch+round_reduce (~110 ms).
-
-### Projection GEMM in f32 -- DONE, ON BY DEFAULT (MARS_CUDA_PROJ_F32=0 opts out)
-
-proj = Bo·T as one cublasSgemm (K=m small), subtracted from Bx in f64 (dBx_f32 --
-the spent phase-0 fill -- is reused as the proj scratch). The a-priori risk was
-spurious ΔSSE peaks on near-degenerate columns (residual cancellation), so it was
-gated hard. Result: it held up. Speed (dev box, n=200k m=400): T-only 381 ->
-T+proj 63 ms/block (~6x more; ~12.7x over the f64 baseline) -- the f64 projection
-was the post-T bottleneck and f32 makes it nearly free, leaving fill_batch +
-round_reduce (memory-bound) as the floor. Accuracy: all 6 CUDA tests at 1e-5
-(incl. degenerate+collinear MatchesCpuKernel); fit R^2 **identical to f64** on
-correlated features AND a 0.98-collinearity stress (Δ=0) -- the feared
-degradation didn't appear (near-degenerate columns lose the argmax anyway; DGKS /
-degeneracy-tol still catch them). Term ordering differs on correlated features
-(same as T-f32). Defaulted ON after the gates held + a 12.3x server speedup at
-m=400 (580 -> 47 us/col). Full f64 reference = MARS_CUDA_KCHUNK=0 and
-MARS_CUDA_PROJ_F32=0. The residual-cancellation risk is real but didn't appear on
-the synthetic stresses -- watch real-data fits.
-
-After T+proj-f32 the GEMMs are no longer the bottleneck; fill_batch + round_reduce
-(memory-bound passes over n×P) are the floor (~63 ms/block on the dev box).
+**Still pending — the hinge sweep on GPU.** Only `linear_only` is accelerated.
+The hinge sweep (`covariates`, `linear_only=False`) stays on the CPU; porting it
+is a much bigger pass (sorting / segmented scan / per-cut argmax) and is the next
+CUDA frontier.
 
 ## Phase 1 GEMM (`T = Boᵀ·Bx`) is store-port-bound
 

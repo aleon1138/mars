@@ -128,6 +128,34 @@ relative error vs f64's ~1e-10 (persists even for bf16 inputs; f64 accumulation
 is load-bearing). The CUDA port (TODO.md) is the real speedup. Archived on the
 unmerged `refactor/bf16-basis-seam` / `feat/bf16-linear-only` branches.
 
+**Performance note (2026-06-16) — CUDA `linear_only` forward pass (branch
+`feat/cuda-orthonormalize`, opt-in `-DUSE_CUDA=ON` / `make configure-cuda`):** A
+GPU `mars::cuda::orthonormalize` path behind `fit(cuda=True)`; the CPU kernel
+stays the oracle. ~12× over native f64 at n=500k, m=400 on the sm_120 server
+(RTX PRO 6000 Blackwell, ~96 GB, *weak* f64 ≈1.44 TFLOP/s — no f64-tensor accel,
+which is why f32 matters). Wins: batch the X-columns into one set of GEMMs per
+block, keep scaled `X` + `Bo`/`B` resident, and compute `ybx=Bxᵀy` on-device so
+the n×p `Bx` never crosses PCIe. The lever past the f64 ceiling is **blocked-f32
+GEMMs**: `T=Boᵀ·Bx` as chunked `cublasSgemm` with f64 cross-chunk accumulation
+(gram()-style), and the projection `Bx-=Bo·T` in f32 — **ON by default**
+(`MARS_CUDA_KCHUNK=2048`, `MARS_CUDA_PROJ_F32=1`); the full-f64 reference is
+`MARS_CUDA_KCHUNK=0 MARS_CUDA_PROJ_F32=0`. The f32 path preserves fit *quality*
+(R² bit-identical to f64 on well-conditioned, correlated, and 0.98-collinear
+stresses) but **reorders near-tied ΔSSE terms** on correlated features, so the
+GPU fit is not bit-reproducible vs the CPU there (equal quality, different
+ordering).
+
+**Performance note (2026-06-16) — cuBLAS FP64 emulation REJECTED, do not retry:**
+We wired the f64 GEMMs through `cublasGemmEx` with
+`CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT` (env-gated `MARS_CUDA_FP64_EMULATE=1`)
+and benchmarked it. On sm_120 it **engages** and is **accurate** (passes the
+cancellation gate — DGKS + collinear/degenerate at 1e-5), but it is **~30×
+slower** for our small/skinny GEMMs (`T` is ~100×100 out, K=n large): the Ozaki
+fixed-point packing/scaling/per-call workspace malloc dwarfs the matmul, which
+targets *large dense* f64 GEMMs. The toggle has since been removed from
+`context_create()` — the blocked-f32 split-K path above is the correct lever;
+emulation is the wrong tool for these shapes.
+
 **Data requirements:** `X` must be `float32`, **column-major** (Fortran order).
 `y` and `w` must be `float32` column-major 1D arrays. The bindings assert these
 layouts explicitly.
