@@ -4,7 +4,7 @@ Ideas and notes for future performance/quality work — not planned for a specif
 release. Completed work lives in git history; rejected approaches and why they
 were rejected live in CLAUDE.md's performance notes.
 
-## CUDA port — status
+## I) CUDA port — status
 
 The `linear_only` forward pass runs on the GPU behind `fit(cuda=True)` (opt-in
 `-DUSE_CUDA=ON`, `make configure-cuda`); the CPU kernel stays the correctness
@@ -70,7 +70,7 @@ path — which nothing covered before.
   columns; cutting it further needs an algorithmic change (re-orthogonalize
   against only the relevant `Bo` columns) — high risk for the remaining slice.
 
-## Phase 1 GEMM (`T = Boᵀ·Bx`) is store-port-bound
+## II) Phase 1 GEMM (`T = Boᵀ·Bx`) is store-port-bound
 
 **Finding:** Phase 1 of `orthonormalize()` (the `axpy_m` sweep building
   `T = Boᵀ·Bx`) is limited by store-port throughput, not DRAM bandwidth or FMA.

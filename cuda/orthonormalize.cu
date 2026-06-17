@@ -385,10 +385,6 @@ struct Context {
     size_t  kchunk   = 2048;
     float  *dTc_f32  = nullptr;  // (max_terms, p_cap) per-chunk f32 T / cast of dT
 
-    // f32 projection Bx -= Bo·T. Default ON; MARS_CUDA_PROJ_F32=0 selects the
-    // native-f64 projection. (Full f64 reference = KCHUNK=0 and PROJ_F32=0.)
-    int     proj_f32 = 1;
-
     // per-call scratch (sized for the worst case p == p_cap; the per-eval path
     // uses the leading <= max_terms columns, the batched path up to p_cap)
     float  *dBx_f32 = nullptr;  // (n, p_cap) col-major, ld n
@@ -502,9 +498,6 @@ Context *context_create(size_t n, size_t max_terms, double tol)
             if (v >= 0) {
                 ctx->kchunk = (size_t)v;  // 0 disables (native f64)
             }
-        }
-        if (const char *pf = std::getenv("MARS_CUDA_PROJ_F32")) {
-            ctx->proj_f32 = (pf[0] == '0') ? 0 : 1;  // 0 selects native-f64 projection
         }
         if (std::getenv("MARS_CUDA_PROFILE")) {
             ctx->profile = 1;
@@ -751,27 +744,22 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     // f32, stores it, and reduces ‖Bx[:,j]‖² (ds) and Σ Bx·y (ybx_raw), split
     // over rows AND columns (atomic f64 partials) so the whole GPU is used.
     prof_mark(ctx, 1);
-    if (!ctx->proj_f32) {
-        gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_N, CUBLAS_OP_N,
-               (int)n, (int)P, (int)m, &neg_one, ctx->dBo_f64, (int)n,
-               ctx->dT, (int)ldT, &one, ctx->dBx_f64, (int)n);
-    }
-    else {
-        // f32 projection: proj = Bo·T (f32 sgemm, K=m), subtract in f64. dBx_f32
-        // (the phase-0 fill, no longer needed) is reused as the proj scratch.
-        const float one_f = 1.0f, zero_f = 0.0f;
-        const size_t nmp = m * P;
-        cast_f64_to_f32_kernel<<<(unsigned)((nmp + BLOCK - 1) / BLOCK), block, 0, s>>>(
-            ctx->dT, ldT, ctx->dTc_f32, m, P);
-        check_launch();
-        // proj = Bo·T into dBx_f32. The subtract (dBx_f64 - proj) is fused into
-        // round_reduce below -- no separate n×P pass.
-        CUBLAS_CHECK(cublasSgemm(ctx->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                 (int)n, (int)P, (int)m,
-                                 &one_f, ctx->dBo_f32, (int)n,
-                                 ctx->dTc_f32, (int)m,
-                                 &zero_f, ctx->dBx_f32, (int)n));
-    }
+
+    // f32 projection: proj = Bo·T (f32 sgemm, K=m), subtract in f64. dBx_f32
+    // (the phase-0 fill, no longer needed) is reused as the proj scratch.
+    const float one_f = 1.0f, zero_f = 0.0f;
+    const size_t nmp = m * P;
+    cast_f64_to_f32_kernel<<<(unsigned)((nmp + BLOCK - 1) / BLOCK), block, 0, s>>>(
+        ctx->dT, ldT, ctx->dTc_f32, m, P);
+    check_launch();
+    // proj = Bo·T into dBx_f32. The subtract (dBx_f64 - proj) is fused into
+    // round_reduce below -- no separate n×P pass.
+    CUBLAS_CHECK(cublasSgemm(ctx->handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                             (int)n, (int)P, (int)m,
+                             &one_f, ctx->dBo_f32, (int)n,
+                             ctx->dTc_f32, (int)m,
+                             &zero_f, ctx->dBx_f32, (int)n));
+
     unsigned tiles = (unsigned)std::min<size_t>(64, (n + BLOCK - 1) / BLOCK);
     if (tiles == 0) {
         tiles = 1;
@@ -786,7 +774,7 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     prof_mark(ctx, 2);
     round_reduce_kernel<<<grid_reduce, block, 0, s>>>(
         ctx->dBx_f64, ctx->dBx_f32, ctx->dy, n, ctx->ds, ctx->dybx_raw, want_dot,
-        ctx->proj_f32 ? ctx->dBx_f32 : nullptr);
+        ctx->dBx_f32);
     check_launch();
     prof_mark(ctx, 3);
 

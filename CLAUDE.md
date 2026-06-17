@@ -137,9 +137,8 @@ which is why f32 matters). Wins: batch the X-columns into one set of GEMMs per
 block, keep scaled `X` + `Bo`/`B` resident, and compute `ybx=Bxᵀy` on-device so
 the n×p `Bx` never crosses PCIe. The lever past the f64 ceiling is **blocked-f32
 GEMMs**: `T=Boᵀ·Bx` as chunked `cublasSgemm` with f64 cross-chunk accumulation
-(gram()-style), and the projection `Bx-=Bo·T` in f32 — **ON by default**
-(`MARS_CUDA_KCHUNK=2048`, `MARS_CUDA_PROJ_F32=1`); the full-f64 reference is
-`MARS_CUDA_KCHUNK=0 MARS_CUDA_PROJ_F32=0`. The f32 path preserves fit *quality*
+(gram()-style), and the projection `Bx-=Bo·T` in f32 (`MARS_CUDA_KCHUNK=2048`); 
+the full-f64 reference is `MARS_CUDA_KCHUNK=0`. The f32 path preserves fit *quality*
 (R² bit-identical to f64 on well-conditioned, correlated, and 0.98-collinear
 stresses) but **reorders near-tied ΔSSE terms** on correlated features, so the
 GPU fit is not bit-reproducible vs the CPU there (equal quality, different
