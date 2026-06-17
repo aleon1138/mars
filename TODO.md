@@ -18,6 +18,58 @@ The hinge sweep (`covariates`, `linear_only=False`) stays on the CPU; porting it
 is a much bigger pass (sorting / segmented scan / per-cut argmax) and is the next
 CUDA frontier.
 
+### Production profile + the DGKS retry fix (2026-06-17)
+
+The headline ~12× (n=500k, m=400, random-`Bo` bench) did **not** transfer to a
+real production fit (n≈700k, m=250, correlated features): only ~2× over the CPU.
+
+**Diagnosis.** `MARS_CUDA_PROFILE=1` — per-phase GPU `cudaEvent` timers + host
+sync timers dumped at `context_destroy`, plus a Python `fit()`
+eval-vs-orchestration split; both gated on the env var, zero overhead when unset
+— localized it immediately: the DGKS re-orthogonalization retry was **75% of GPU
+time (88.9s of 119s)**, fired 20,921×.
+
+**Root cause.** The `fired>0` branch in `project_reduce` recomputed the WHOLE
+candidate block in native f64 (`CUBLAS_COMPUTE_64F`, the weak ~1.44 TFLOP/s path)
+whenever *any* column tripped the gate, then discarded all but the flagged
+columns. Correlated/collinear production features fire the gate constantly; the
+random-`Bo` benches never hit it (the gate "stays quiet" by construction — see
+`tests/bench_ortho`), so the single most expensive path was dormant in every
+benchmark. This is the trap: **the perf benchmark must exercise DGKS**, or it
+measures a code path production never takes.
+
+**Fix (commit `3d27433`).** Surgical retry: gather only the `fired` flagged
+columns into a compact n×fired f64 buffer (`gather_widen_kernel`, reusing the
+dead `dBx_f64`), run the two f64 retry GEMMs at width `fired` instead of P
+(reusing `dT`), then round + scatter the refined columns back to their global
+slots (`round_reduce_scatter_kernel`). Cost now scales with the rare cancelling
+columns, not the batch width. Per-column math is unchanged → oracle-faithful (not
+bit-identical: cuBLAS may select a different GEMM kernel at width `fired` vs P,
+differing at f64 ULP, well inside the 1e-5 f32 floor). New test
+`BatchDgksRetryMatchesPerColumn` forces interleaved fires through the batched
+path — which nothing covered before.
+
+**Result.** Production fit **130.5s → 48.4s (2.70×)**; DGKS phase 88.9s → 7.2s
+(12.3× less, same 20,921 fires); roughly **~2× → ~5.4× vs the 64-core CPU**.
+
+**Where the time goes now (flat — no dominant phase):** T GEMM 28%, round/norm
+24%, fill 23%, DGKS 19%, projection 6%. Remaining levers, all diminishing returns:
+
+- **`fill` f64-write drop (~7% of fit).** `fill` writes both an f32 and an f64
+  copy of `Bx` (~20 B/elem). On the default blocked-f32 path the f64 copy is
+  consumed only by `round_reduce` (as the original `B·x` for the f32-projection
+  subtract) and could instead read the intact f32 `dBx_f32` and widen at load —
+  bit-identical, drops `fill` to ~12 B/elem. Delicate precision/aliasing change
+  for a small slice; low ROI.
+- **Orchestration is now ~16% (Amdahl).** ~132 ms/epoch of Python, dominated by
+  the per-epoch `bmask` list-comprehensions (see "Python scalar loop builds
+  `bmask`" below) and the user `xfilter`. Best *risk-adjusted* next target — it's
+  outside the precision-sensitive core and grows in relative cost as the GPU
+  speeds up.
+- **DGKS 19%** is now genuine f64 re-orthogonalization of real near-collinear
+  columns; cutting it further needs an algorithmic change (re-orthogonalize
+  against only the relevant `Bo` columns) — high risk for the remaining slice.
+
 ## Phase 1 GEMM (`T = Boᵀ·Bx`) is store-port-bound
 
 **Finding:** Phase 1 of `orthonormalize()` (the `axpy_m` sweep building
