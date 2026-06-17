@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>    // host-side phase timing (MARS_CUDA_PROFILE)
 #include <cmath>
 #include <cstdio>    // fprintf
 #include <cstdlib>   // getenv
@@ -216,24 +217,38 @@ __global__ void round_reduce_kernel(const double *in, float *out,
     }
 }
 
-// DGKS retry commit (rare): recompute ds[j]/ybx_raw[j] for flagged columns only,
-// one block per column (direct write, no atomics -- a single block does the full
-// column reduction). Non-flagged columns are left untouched (uniform return).
-__global__ void round_reduce_masked_kernel(const double *in, float *out,
-        const float *y, size_t n,
-        double *ds, double *ybx_raw,
-        const int *flags, int want_dot)
+// DGKS retry, gather half: pack the `fired` flagged columns into a COMPACT f64
+// buffer for the retry GEMMs -- dst[:,c] = (double) src[:, idx[c]]. The retry
+// then runs at width `fired` instead of the full block P, so its cost scales
+// with the (rare) cancelling columns, not the batch. blockIdx.y = compact col c.
+__global__ void gather_widen_kernel(const float *src, size_t n,
+                                    const int *idx, double *dst)
 {
-    const size_t j = blockIdx.x;
-    if (!flags[j]) {
+    const size_t c = blockIdx.y;
+    const int    j = idx[c];
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
         return;
     }
-    const double *cin  = in  + j * n;
-    float        *cout = out + j * n;
+    dst[c * n + i] = (double)src[(size_t)j * n + i];
+}
+
+// DGKS retry, scatter half: round each compact retry column c to f32, SCATTER it
+// back to its global column idx[c] in `out`, and recompute ds/ybx_raw there. One
+// block per compact column (direct write, no atomics). Mirrors the f32-rounding
+// semantics of round_reduce_kernel exactly; only flagged globals are touched.
+__global__ void round_reduce_scatter_kernel(const double *cin, size_t n,
+        const int *idx, float *out, const float *y,
+        double *ds, double *ybx_raw, int want_dot)
+{
+    const size_t c    = blockIdx.x;
+    const int    j    = idx[c];
+    const double *col  = cin + c * n;
+    float        *ocol = out + (size_t)j * n;
     double s_norm = 0.0, s_dot = 0.0;
     for (size_t i = threadIdx.x; i < n; i += blockDim.x) {
-        const float  v  = (float)cin[i];
-        cout[i] = v;
+        const float  v  = (float)col[i];
+        ocol[i] = v;
         const double vb = (double)v;
         s_norm += vb * vb;
         if (want_dot) {
@@ -386,7 +401,7 @@ struct Context {
     double *dybx_raw = nullptr;  // (p_cap) Σ Bx·y on the un-normalized column
     double *dybx     = nullptr;  // (p_cap) scale·ybx_raw -- the ΔSSE input
     float  *dscale   = nullptr;  // (p_cap)
-    int    *dflags  = nullptr;  // (p_cap)
+    int    *didx    = nullptr;  // (p_cap) compact global indices of DGKS-flagged cols
 
     // batched path: resident scaled candidates (x_c = X[:,c]·s[c]) and the
     // per-output-column source maps. dXscaled is allocated (n, p_x) on the first
@@ -401,8 +416,49 @@ struct Context {
     std::vector<float>  h_stage;    // (n) gather one Bo column
     std::vector<double> h_ds;       // (p_cap)
     std::vector<double> h_tnorm2;   // (p_cap)
-    std::vector<int>    h_flags;    // (p_cap)
+    std::vector<int>    h_idx;      // (p_cap) compact flagged-column indices
+
+    // --- profiling (MARS_CUDA_PROFILE): per-phase GPU time, accumulated over
+    // the whole fit and dumped at context_destroy. Zero overhead when off.
+    int         profile = 0;
+    cudaEvent_t ev[8] = {};         // per-call phase markers (created when on)
+    double ms_fill = 0, ms_gemmT = 0, ms_proj = 0, ms_round = 0,
+           ms_dgks = 0, ms_scale = 0;       // GPU phases (cudaEvent deltas)
+    double ms_sync_basis = 0, ms_sync_xcols = 0;  // host-side (std::chrono)
+    long   n_calls = 0, n_dgks_fired = 0;
+    size_t prof_cols = 0;           // total candidate columns processed
 };
+
+// --- profiling helpers ------------------------------------------------------
+// Record a stream marker; read the GPU ms between two markers (valid only after
+// a stream sync, so callers accumulate after their end-of-call synchronize).
+static inline void prof_mark(Context *ctx, int i)
+{
+    if (ctx->profile) {
+        cudaEventRecord(ctx->ev[i], ctx->stream);
+    }
+}
+
+static inline double prof_span(Context *ctx, int a, int b)
+{
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, ctx->ev[a], ctx->ev[b]);
+    return (double)ms;
+}
+
+// Fold one call's six markers (set in project_reduce + the fill site) into the
+// running per-phase totals. Call only when profiling, after a full stream sync.
+static void prof_accumulate(Context *ctx, size_t cols)
+{
+    ctx->ms_fill  += prof_span(ctx, 6, 7);
+    ctx->ms_gemmT += prof_span(ctx, 0, 1);
+    ctx->ms_proj  += prof_span(ctx, 1, 2);
+    ctx->ms_round += prof_span(ctx, 2, 3);
+    ctx->ms_dgks  += prof_span(ctx, 3, 4);
+    ctx->ms_scale += prof_span(ctx, 4, 5);
+    ctx->n_calls++;
+    ctx->prof_cols += cols;
+}
 
 Context *context_create(size_t n, size_t max_terms, double tol)
 {
@@ -450,6 +506,12 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         if (const char *pf = std::getenv("MARS_CUDA_PROJ_F32")) {
             ctx->proj_f32 = (pf[0] == '0') ? 0 : 1;  // 0 selects native-f64 projection
         }
+        if (std::getenv("MARS_CUDA_PROFILE")) {
+            ctx->profile = 1;
+            for (int i = 0; i < 8; ++i) {
+                CUDA_CHECK(cudaEventCreate(&ctx->ev[i]));
+            }
+        }
         if (std::getenv("MARS_CUDA_VERBOSE")) {
             std::fprintf(stderr,
                          "[mars-cuda] context: n=%zu max_terms=%zu block_gb=%.3g "
@@ -474,7 +536,7 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         CUDA_CHECK(cudaMalloc(&ctx->dybx_raw,  p_cap * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&ctx->dybx,      p_cap * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&ctx->dscale,    p_cap * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&ctx->dflags,    p_cap * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&ctx->didx,      p_cap * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ctx->dsrc_xcol, p_cap * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ctx->dsrc_basis, p_cap * sizeof(int)));
         // dXscaled is allocated lazily in context_sync_xcols (needs p_x).
@@ -482,7 +544,7 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         ctx->h_stage.resize(n);
         ctx->h_ds.resize(p_cap);
         ctx->h_tnorm2.resize(p_cap);
-        ctx->h_flags.resize(p_cap);
+        ctx->h_idx.resize(p_cap);
     }
     catch (...) {
         context_destroy(ctx);
@@ -495,6 +557,30 @@ void context_destroy(Context *ctx)
 {
     if (!ctx) {
         return;
+    }
+    if (ctx->profile) {
+        const double gpu = ctx->ms_fill + ctx->ms_gemmT + ctx->ms_proj +
+                           ctx->ms_round + ctx->ms_dgks + ctx->ms_scale;
+        std::fprintf(stderr,
+                     "[mars-cuda] PROFILE: %ld batch calls, %zu cand-cols total\n"
+                     "  fill  B*x  (n*P)    %10.1f ms\n"
+                     "  T = Boᵀ*Bx GEMM     %10.1f ms\n"
+                     "  projection GEMM     %10.1f ms\n"
+                     "  round/norm/dot      %10.1f ms\n"
+                     "  DGKS gate + retry   %10.1f ms  (%ld fired)\n"
+                     "  scale-fold          %10.1f ms\n"
+                     "  --- GPU total       %10.1f ms\n"
+                     "  sync_basis (host)   %10.1f ms\n"
+                     "  sync_xcols (host)   %10.1f ms\n",
+                     ctx->n_calls, ctx->prof_cols,
+                     ctx->ms_fill, ctx->ms_gemmT, ctx->ms_proj, ctx->ms_round,
+                     ctx->ms_dgks, ctx->n_dgks_fired, ctx->ms_scale, gpu,
+                     ctx->ms_sync_basis, ctx->ms_sync_xcols);
+        for (int i = 0; i < 8; ++i) {
+            if (ctx->ev[i]) {
+                cudaEventDestroy(ctx->ev[i]);
+            }
+        }
     }
     cudaFree(ctx->dB);
     cudaFree(ctx->dBo_f32);
@@ -511,7 +597,7 @@ void context_destroy(Context *ctx)
     cudaFree(ctx->dybx_raw);
     cudaFree(ctx->dybx);
     cudaFree(ctx->dscale);
-    cudaFree(ctx->dflags);
+    cudaFree(ctx->didx);
     cudaFree(ctx->dXscaled);
     cudaFree(ctx->dsrc_xcol);
     cudaFree(ctx->dsrc_basis);
@@ -531,6 +617,7 @@ void context_sync_basis(Context *ctx, size_t m,
     if (m <= ctx->m_synced) {
         return;
     }
+    const auto   t0    = std::chrono::steady_clock::now();
     const size_t n     = ctx->n;
     const size_t start = ctx->m_synced;
     const size_t cnt   = m - start;
@@ -562,6 +649,10 @@ void context_sync_basis(Context *ctx, size_t m,
     }
 
     ctx->m_synced = m;
+    if (ctx->profile) {
+        ctx->ms_sync_basis += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count();
+    }
 }
 
 size_t context_batch_capacity(Context *ctx)
@@ -584,6 +675,7 @@ void context_sync_xcols(Context *ctx, size_t p_x,
                         const float *X, size_t ldX, const float *s,
                         const int *cols, size_t ncols)
 {
+    const auto   t0 = std::chrono::steady_clock::now();
     const size_t n = ctx->n;
     if (!ctx->dXscaled) {
         CUDA_CHECK(cudaMalloc(&ctx->dXscaled, n * p_x * sizeof(float)));
@@ -605,6 +697,10 @@ void context_sync_xcols(Context *ctx, size_t p_x,
         ctx->x_resident[c] = 1;
     }
     CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+    if (ctx->profile) {
+        ctx->ms_sync_xcols += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count();
+    }
 }
 
 // Shared post-fill pipeline for P candidate columns already laid out in
@@ -623,6 +719,7 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     const dim3 block(BLOCK);
 
     // Phase 1: T = Boᵀ · Bx  (m×P).
+    prof_mark(ctx, 0);
     if (ctx->kchunk == 0) {
         // Native f64 (exact dot of the f32-stored inputs).
         gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -653,6 +750,7 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     // Phase 2a: Bx -= Bo·T (in place, f64), then one fused pass that rounds to
     // f32, stores it, and reduces ‖Bx[:,j]‖² (ds) and Σ Bx·y (ybx_raw), split
     // over rows AND columns (atomic f64 partials) so the whole GPU is used.
+    prof_mark(ctx, 1);
     if (!ctx->proj_f32) {
         gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_N, CUBLAS_OP_N,
                (int)n, (int)P, (int)m, &neg_one, ctx->dBo_f64, (int)n,
@@ -685,12 +783,18 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     }
     // f32-projection path: dBx_f32 holds proj; fuse the f64 subtract here (out and
     // proj are the same buffer -- each thread reads then writes its own index).
+    prof_mark(ctx, 2);
     round_reduce_kernel<<<grid_reduce, block, 0, s>>>(
         ctx->dBx_f64, ctx->dBx_f32, ctx->dy, n, ctx->ds, ctx->dybx_raw, want_dot,
         ctx->proj_f32 ? ctx->dBx_f32 : nullptr);
     check_launch();
+    prof_mark(ctx, 3);
 
-    // Phase 2b: DGKS gate. s[j] > tol && s[j]*9 < ‖T[:,j]‖² -> retry.
+    // Phase 2b: DGKS gate. s[j] > tol && s[j]*9 < ‖T[:,j]‖² -> retry. Build the
+    // compact list of flagged columns on the host so the (rare) retry runs only
+    // over those, not the whole P-wide block -- the f64 retry GEMMs are the weak
+    // path on this card, so their cost must scale with the cancelling columns,
+    // not the batch width.
     colsumsq_f64_kernel<<<(unsigned)P, block, 0, s>>>(ctx->dT, ldT, m, ctx->dtnorm2);
     check_launch();
     CUDA_CHECK(cudaMemcpyAsync(ctx->h_ds.data(), ctx->ds, P * sizeof(double),
@@ -699,40 +803,53 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
                                P * sizeof(double), cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
 
-    long fired = 0;
+    int fired = 0;
     for (size_t j = 0; j < P; ++j) {
         const bool flag = ctx->h_ds[j] > tol &&
                           ctx->h_ds[j] * mars::DGKS_GATE_RATIO_SQ < ctx->h_tnorm2[j];
-        ctx->h_flags[j] = flag ? 1 : 0;
-        fired += flag ? 1 : 0;
+        if (flag) {
+            ctx->h_idx[fired++] = (int)j;
+        }
     }
 
     if (fired > 0) {
-        CUDA_CHECK(cudaMemcpyAsync(ctx->dflags, ctx->h_flags.data(),
-                                   P * sizeof(int), cudaMemcpyHostToDevice, s));
-        const size_t total = n * P;
-        const dim3 grid_total((unsigned)((total + BLOCK - 1) / BLOCK));
-        widen_kernel<<<grid_total, block, 0, s>>>(ctx->dBx_f32, ctx->dBx_f64, total);
+        // Surgical retry: gather the `fired` flagged residual columns (rounded,
+        // in dBx_f32) into a compact n×fired f64 buffer -- reusing dBx_f64, which
+        // is dead after the main round_reduce. Re-orthogonalize ONLY those in f64
+        // (T = Boᵀ·Bx then Bx -= Bo·T at width `fired`, reusing dT), then round
+        // and scatter each refined column back to its global slot with fresh
+        // ds/ybx_raw. Per-column math matches the old whole-block masked retry.
+        CUDA_CHECK(cudaMemcpyAsync(ctx->didx, ctx->h_idx.data(),
+                                   (size_t)fired * sizeof(int),
+                                   cudaMemcpyHostToDevice, s));
+        const dim3 grid_gather((unsigned)((n + BLOCK - 1) / BLOCK), (unsigned)fired);
+        gather_widen_kernel<<<grid_gather, block, 0, s>>>(
+            ctx->dBx_f32, n, ctx->didx, ctx->dBx_f64);
         check_launch();
         gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_T, CUBLAS_OP_N,
-               (int)m, (int)P, (int)n, &one, ctx->dBo_f64, (int)n,
+               (int)m, fired, (int)n, &one, ctx->dBo_f64, (int)n,
                ctx->dBx_f64, (int)n, &zero, ctx->dT, (int)ldT);
         gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_N, CUBLAS_OP_N,
-               (int)n, (int)P, (int)m, &neg_one, ctx->dBo_f64, (int)n,
+               (int)n, fired, (int)m, &neg_one, ctx->dBo_f64, (int)n,
                ctx->dT, (int)ldT, &one, ctx->dBx_f64, (int)n);
-        round_reduce_masked_kernel<<<(unsigned)P, block, 0, s>>>(
-            ctx->dBx_f64, ctx->dBx_f32, ctx->dy, n,
-            ctx->ds, ctx->dybx_raw, ctx->dflags, want_dot);
+        round_reduce_scatter_kernel<<<(unsigned)fired, block, 0, s>>>(
+            ctx->dBx_f64, n, ctx->didx, ctx->dBx_f32, ctx->dy,
+            ctx->ds, ctx->dybx_raw, want_dot);
         check_launch();
         if (dgks_counter) {
             dgks_counter->fetch_add(fired, std::memory_order_relaxed);
         }
     }
+    if (ctx->profile) {
+        ctx->n_dgks_fired += fired;
+    }
+    prof_mark(ctx, 4);
 
     // Phase 2c: scale, folded into ybx (= scale·Σ Bx·y).
     scale_fold_kernel<<<(unsigned)((P + BLOCK - 1) / BLOCK), block, 0, s>>>(
         ctx->ds, ctx->dscale, ctx->dybx_raw, ctx->dybx, P, tol, want_dot);
     check_launch();
+    prof_mark(ctx, 5);
 }
 
 void orthonormalize(Context *ctx, size_t m, size_t p,
@@ -755,9 +872,11 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
                                cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(ctx->dmask, mask, p * sizeof(int),
                                cudaMemcpyHostToDevice, s));
+    prof_mark(ctx, 6);
     fill_kernel<<<grid_np, block, 0, s>>>(ctx->dB, n, ctx->dx, ctx->dmask,
                                           ctx->dBx_f32, ctx->dBx_f64);
     check_launch();
+    prof_mark(ctx, 7);
 
     project_reduce(ctx, m, p, want_dot, dgks_counter);
 
@@ -777,6 +896,9 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
                        cudaMemcpyDeviceToHost, s));
     }
     CUDA_CHECK(cudaStreamSynchronize(s));
+    if (ctx->profile) {
+        prof_accumulate(ctx, p);
+    }
 }
 
 void orthonormalize_batch(Context *ctx, size_t m, size_t P,
@@ -802,16 +924,21 @@ void orthonormalize_batch(Context *ctx, size_t m, size_t P,
     CUDA_CHECK(cudaMemcpyAsync(ctx->dsrc_basis, src_basis, P * sizeof(int),
                                cudaMemcpyHostToDevice, s));
     const dim3 grid_nP((n + BLOCK - 1) / BLOCK, (unsigned)P);
+    prof_mark(ctx, 6);
     fill_batch_kernel<<<grid_nP, block, 0, s>>>(
         ctx->dB, n, ctx->dXscaled, ctx->dsrc_xcol, ctx->dsrc_basis,
         ctx->dBx_f32, ctx->dBx_f64);
     check_launch();
+    prof_mark(ctx, 7);
 
     project_reduce(ctx, m, P, /*want_dot=*/1, dgks_counter);
 
     CUDA_CHECK(cudaMemcpyAsync(ybx, ctx->dybx, P * sizeof(double),
                                cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
+    if (ctx->profile) {
+        prof_accumulate(ctx, P);
+    }
 }
 
 }  // namespace cuda

@@ -385,3 +385,103 @@ TEST(CudaKernelsTest, BatchMatchesPerColumn)
     }
     mars::cuda::context_destroy(ctx);
 }
+
+/*
+ *  Surgical DGKS retry through the BATCHED path. Stack many (X-column, basis)
+ *  pairs where a controlled subset is near-dependent on Bo (fires DGKS) while the
+ *  rest are well-conditioned (do not). The retry must gather ONLY the flagged
+ *  columns, re-orthogonalize them in f64 at width `fired`, and scatter the refined
+ *  ybx back to the correct global slots interleaved among the untouched ones. So
+ *  the batched ybx must still match the per-column orthonormalize for every pair,
+ *  and the same pairs must fire in both paths. This is the production path the
+ *  random-Bo benches never exercised (their gate stays quiet), which is why the
+ *  whole-block f64 retry cost went unnoticed.
+ */
+TEST(CudaKernelsTest, BatchDgksRetryMatchesPerColumn)
+{
+    if (!cuda_available()) {
+        GTEST_SKIP() << "no CUDA device available";
+    }
+    const int n = 2048;
+    const int m = 8;
+    const int n_x = 4;
+    const int P = n_x * m;
+    constexpr double TOL = 1e-14;
+
+    std::mt19937 rng(0xD6C5);
+    MatrixXfC Bo = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+    MatrixXd  Bod = Bo.cast<double>();
+
+    // Even basis columns are near-dependent on Bo (98%/2% energy split -> DGKS
+    // fires); odd ones are well-conditioned random (no fire). x is constant per
+    // X-column, so the candidate B[:,k]*x preserves that span relationship and
+    // firing is deterministic and interleaved across the P stacked columns.
+    MatrixXf B(n, m);
+    B.setZero();
+    for (int k = 0; k < m; ++k) {
+        if (k % 2 == 0) {
+            VectorXd v_perp = VectorXd::Random(n);
+            for (int t = 0; t < m; ++t) {
+                v_perp -= (Bod.col(t).dot(v_perp)) * Bod.col(t);
+            }
+            v_perp.normalize();
+            B.col(k) = (std::sqrt(0.98) * Bod.col(k) +
+                        std::sqrt(0.02) * v_perp).cast<float>();
+        }
+        else {
+            B.col(k) = VectorXf::Random(n);
+        }
+    }
+
+    ArrayXf  y = ArrayXf::Random(n);
+    MatrixXf X = MatrixXf::Ones(n, n_x);   // constant cols keep span alignment
+    std::vector<float> s(n_x);
+    for (int c = 0; c < n_x; ++c) {
+        s[c] = 0.5f + 0.5f * (float)(c + 1);  // distinct positive scales
+    }
+
+    std::vector<int> src_xcol(P), src_basis(P);
+    for (int j = 0, xc = 0; xc < n_x; ++xc) {
+        for (int k = 0; k < m; ++k, ++j) {
+            src_xcol[j]  = xc;
+            src_basis[j] = k;
+        }
+    }
+
+    mars::cuda::Context *ctx = mars::cuda::context_create(n, m, TOL);
+    mars::cuda::context_set_target(ctx, y.data());
+    mars::cuda::context_sync_basis(ctx, m,
+                                   B.data(),  (size_t)B.outerStride(),
+                                   Bo.data(), (size_t)Bo.outerStride());
+    std::vector<int> all_cols(n_x);
+    std::iota(all_cols.begin(), all_cols.end(), 0);
+    mars::cuda::context_sync_xcols(ctx, (size_t)n_x, X.data(),
+                                   (size_t)X.outerStride(), s.data(),
+                                   all_cols.data(), (size_t)n_x);
+
+    std::atomic<long> batch_counter{0};
+    std::vector<double> ybx_batch(P, 0.0);
+    mars::cuda::orthonormalize_batch(ctx, m, P, src_xcol.data(), src_basis.data(),
+                                     ybx_batch.data(), &batch_counter);
+
+    std::atomic<long> percol_counter{0};
+    for (int j = 0; j < P; ++j) {
+        const int xc = src_xcol[j];
+        const int k  = src_basis[j];
+        std::vector<float> x(n);
+        for (int i = 0; i < n; ++i) {
+            x[i] = X(i, xc) * s[xc];
+        }
+        double ref = 0.0;
+        mars::cuda::orthonormalize(ctx, m, 1, x.data(), &k,
+                                   /*Bx=*/nullptr, 0, &ref, &percol_counter);
+        EXPECT_NEAR(ybx_batch[j], ref, 1e-6 * (1.0 + std::abs(ref)));
+    }
+    mars::cuda::context_destroy(ctx);
+
+    // The retry actually fired (else this proves nothing), and the SAME pairs
+    // fired in the batched and per-column paths (the gate is per-column, so the
+    // surgical gather/scatter must not change which columns are refined).
+    ASSERT_GT(batch_counter.load(), 0);
+    ASSERT_EQ(batch_counter.load(), percol_counter.load());
+}

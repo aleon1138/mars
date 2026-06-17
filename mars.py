@@ -3,6 +3,8 @@
 Multivariate Adaptive Regression Splines
 """
 
+import os
+import sys
 import time
 import numpy as np
 import scipy.linalg
@@ -213,6 +215,12 @@ def fit(X, y, w=None, **kwargs):
 
     start_t = time.time()
 
+    # Coarse profiling (MARS_CUDA_PROFILE): split fit() wall time into the
+    # algo.eval() forward-search call (GPU-accelerated under cuda=True) vs all
+    # the surrounding CPU orchestration, to tell GPU-bound from Amdahl-bound.
+    _profile = bool(os.environ.get("MARS_CUDA_PROFILE"))
+    _eval_t = 0.0
+
     # For reference, see Eq. (43) in the original MARS paper
     if min_span is None:
         alpha = 1 / X.shape[1]
@@ -317,9 +325,11 @@ def fit(X, y, w=None, **kwargs):
         # Find the delta-SSE for the entire block
         # 'sse1' is the improvement by adding a linear term
         # 'sse2' is the improvement by adding two disjoint hinges
+        _e0 = time.perf_counter()
         sse0, sse1, sse2, cut = algo.eval(
             bmask, min_span, tail, linear_only, threads, cuda=cuda
         )
+        _eval_t += time.perf_counter() - _e0
 
         # Update the delta-SSE cache
         # TODO - should we really be using GCV adjusted SSE instead?
@@ -394,6 +404,15 @@ def fit(X, y, w=None, **kwargs):
             and r2_cvs[-r2_window:].max() < r2_cvs.max() - r2_thresh
         ):
             break
+
+    if _profile:
+        total = time.time() - start_t
+        pct = (100.0 * _eval_t / total) if total else 0.0
+        sys.stderr.write(
+            "[mars] fit: %.2fs total | %.2fs in algo.eval() (%.0f%%) | "
+            "%.2fs orchestration (%d epochs)\n"
+            % (total, _eval_t, pct, total - _eval_t, epoch)
+        )
 
     return model[: algo.nbasis()]
 
