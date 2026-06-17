@@ -103,7 +103,9 @@ VectorXd orthonormalize_col_reference(VectorXd v, const MatrixXfC &Bo, int m,
         v_norm2 = v.squaredNorm();
     }
     const double w = std::sqrt(v_norm2);
-    if (w * w > tol) v /= w;
+    if (w * w > tol) {
+        v /= w;
+    }
     w_out = w;
     return v;
 }
@@ -189,8 +191,9 @@ TEST(KernelsTest, OrthonormalizeRespectsLeadingDims)
     std::mt19937 rng(42);
     MatrixXdC Bo_full_d(n, max_terms);
     Bo_full_d.setRandom();
-    {  // orthonormalize the leading m cols of Bo_full in place (f64 for
-       // construction precision, then cast to f32 for the kernel call).
+    {
+        // orthonormalize the leading m cols of Bo_full in place (f64 for
+        // construction precision, then cast to f32 for the kernel call).
         Bo_full_d.col(0) *= invnorm(Bo_full_d.col(0));
         for (int j = 1; j < m; ++j) {
             Bo_full_d.col(j) *= invnorm(Bo_full_d.col(j));
@@ -278,7 +281,8 @@ TEST(KernelsTest, OrthonormalizeFiresDgksOnSevereCancellation)
     B.col(0) = (std::sqrt(0.95) * Bod.col(0) + std::sqrt(0.05) * v_perp).cast<float>();
 
     ArrayXf x = ArrayXf::Ones(n);                // x=1 so B*x just selects col 0
-    ArrayXi mask(p); mask[0] = 0;
+    ArrayXi mask(p);
+    mask[0] = 0;
 
     MatrixXf Bx(n, p);
     MatrixXd T(m, p);
@@ -433,7 +437,9 @@ TEST(KernelsTest, OrthonormalizePrecisionStressBaseline)
     {
         std::vector<int> rest;
         for (int j = 0; j < m; ++j) {
-            if (j != DGKS_COL && j != DEGEN_COL) rest.push_back(j);
+            if (j != DGKS_COL && j != DEGEN_COL) {
+                rest.push_back(j);
+            }
         }
         std::shuffle(rest.begin(), rest.end(), rng);
         idx.insert(idx.end(), rest.begin(), rest.begin() + (p - 2));
@@ -442,15 +448,21 @@ TEST(KernelsTest, OrthonormalizePrecisionStressBaseline)
     ArrayXi mask = Map<ArrayXi>(idx.data(), p);
     int dgks_j = -1, degen_j = -1;
     for (int j = 0; j < p; ++j) {
-        if (mask[j] == DGKS_COL)  dgks_j  = j;
-        if (mask[j] == DEGEN_COL) degen_j = j;
+        if (mask[j] == DGKS_COL) {
+            dgks_j  = j;
+        }
+        if (mask[j] == DEGEN_COL) {
+            degen_j = j;
+        }
     }
     ASSERT_GE(dgks_j,  0);
     ASSERT_GE(degen_j, 0);
 
     /* Run the kernel. */
-    MatrixXf Bx(n, p); Bx.setZero();
-    MatrixXd T(m, p);  T.setZero();
+    MatrixXf Bx(n, p);
+    Bx.setZero();
+    MatrixXd T(m, p);
+    T.setZero();
     VectorXd s(p);
     std::atomic<long> dgks_counter{0};
     mars::orthonormalize(
@@ -480,10 +492,12 @@ TEST(KernelsTest, OrthonormalizePrecisionStressBaseline)
 
     /* (2) Non-degenerate columns are unit-norm. */
     for (int j = 0; j < p; ++j) {
-        if (j == degen_j) continue;
+        if (j == degen_j) {
+            continue;
+        }
         const double norm_err = std::abs(Bxd.col(j).squaredNorm() - 1.0);
         EXPECT_LT(norm_err, NORM_TOL)
-            << "col " << j << " (mask=" << mask[j] << ") norm_err=" << norm_err;
+                << "col " << j << " (mask=" << mask[j] << ") norm_err=" << norm_err;
     }
 
     /*
@@ -491,7 +505,7 @@ TEST(KernelsTest, OrthonormalizePrecisionStressBaseline)
      *      whose squared norm falls below tol — the kernel uses scale=0.
      */
     EXPECT_EQ(Bx.col(degen_j).squaredNorm(), 0.0f)
-        << "degenerate column was not zeroed";
+            << "degenerate column was not zeroed";
 
     /*
      *  (4) Well-conditioned columns agree with a one-pass Eigen reference. We
@@ -501,10 +515,12 @@ TEST(KernelsTest, OrthonormalizePrecisionStressBaseline)
      */
     MatrixXd Bx_ref = eigen_reference(n, m, p, B, x, mask, Bo, KERNEL_TOL);
     for (int j = 0; j < p; ++j) {
-        if (j == dgks_j || j == degen_j) continue;
+        if (j == dgks_j || j == degen_j) {
+            continue;
+        }
         const double diff = (Bxd.col(j) - Bx_ref.col(j)).cwiseAbs().maxCoeff();
         EXPECT_LT(diff, VS_REF_TOL)
-            << "col " << j << " (mask=" << mask[j] << ") vs-ref=" << diff;
+                << "col " << j << " (mask=" << mask[j] << ") vs-ref=" << diff;
     }
 }
 
@@ -525,9 +541,14 @@ TEST(KernelsTest, DotWidenAccumulatesInF64)
      */
     std::uniform_real_distribution<float> uni(0.25f, 1.25f);
 
-    for (int n : {0, 1, 7, 8, 9, 31, 1024, 50000}) {
+    for (int n : {
+                0, 1, 7, 8, 9, 31, 1024, 50000
+            }) {
         ArrayXf a(n), b(n);
-        for (int i = 0; i < n; ++i) { a[i] = uni(rng); b[i] = uni(rng); }
+        for (int i = 0; i < n; ++i) {
+            a[i] = uni(rng);
+            b[i] = uni(rng);
+        }
 
         const double got = mars::dot_widen(a.data(), b.data(), n);
 
@@ -569,7 +590,7 @@ TEST(KernelsTest, OrthonormalizeColMatchesEigen)
     VectorXd v = v0;
     std::atomic<long> counter{0};
     const double w = mars::orthonormalize_col(
-        n, m, v.data(), Bo.data(), (int)Bo.outerStride(), TOL, &counter);
+                         n, m, v.data(), Bo.data(), (int)Bo.outerStride(), TOL, &counter);
 
     double w_ref = 0.0;
     VectorXd v_ref = orthonormalize_col_reference(v0, Bo, m, TOL, w_ref);
@@ -597,7 +618,9 @@ TEST(KernelsTest, OrthonormalizeColFiresDgksOnSevereCancellation)
     MatrixXd  Bod = Bo.cast<double>();
 
     VectorXd v_perp = VectorXd::Random(n);
-    for (int k = 0; k < m; ++k) v_perp -= Bod.col(k).dot(v_perp) * Bod.col(k);
+    for (int k = 0; k < m; ++k) {
+        v_perp -= Bod.col(k).dot(v_perp) * Bod.col(k);
+    }
     v_perp.normalize();
 
     /* 95% in span(Bo), 5% outside -> residual*9 = 0.45 < projected 0.95. */
@@ -605,7 +628,7 @@ TEST(KernelsTest, OrthonormalizeColFiresDgksOnSevereCancellation)
 
     std::atomic<long> counter{0};
     const double w = mars::orthonormalize_col(
-        n, m, v.data(), Bo.data(), (int)Bo.outerStride(), TOL, &counter);
+                         n, m, v.data(), Bo.data(), (int)Bo.outerStride(), TOL, &counter);
 
     EXPECT_EQ(counter.load(), 1);
     EXPECT_GT(w, 0.0);
@@ -631,7 +654,7 @@ TEST(KernelsTest, OrthonormalizeColLeavesDegenerateUnnormalized)
 
     std::atomic<long> counter{0};
     const double w = mars::orthonormalize_col(
-        n, m, v.data(), Bo.data(), (int)Bo.outerStride(), TOL, &counter);
+                         n, m, v.data(), Bo.data(), (int)Bo.outerStride(), TOL, &counter);
 
     EXPECT_LE(w * w, TOL);        // below the degeneracy floor
     EXPECT_LT(v.norm(), 1e-3);    // left un-normalized (still the tiny residual)

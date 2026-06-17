@@ -478,7 +478,8 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
 #else
         verify(false, "marslib was built without CUDA support (configure with -DUSE_CUDA=ON)");
 #endif
-    } else {
+    }
+    else {
         mars::orthonormalize(
             n, _m, p,
             _data->B.data(),  _data->n,
@@ -750,7 +751,8 @@ void MarsAlgo::eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge
         a0 = a1;
     }
 #else
-    (void)mask; (void)mask_row_stride;
+    (void)mask;
+    (void)mask_row_stride;
     verify(false, "marslib was built without CUDA support (configure with -DUSE_CUDA=ON)");
 #endif
 }
