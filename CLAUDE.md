@@ -116,17 +116,25 @@ localized a planted knot at −0.96 instead of 0.25. (The macOS *scalar* path
 masked this — it stayed under the 1e-5 scalar `HINGE_DSSE_TOL`; only the AVX
 server at 1e-6 exposed it, so validate numerics on the server.) `f`/`g` stay f64.
 
-**Performance note (2026-06-15) — bf16 basis storage REJECTED on CPU, do not
-retry:** We built bf16 storage for `B`/`Bo`/`Bx` (storage only, widen to f32/f64
-to compute) to halve the basis load volume. It caps at **parity** with f32, so
-it's not in `master`. A SIMD bf16 widen-load fixed the initial scalar slowdown
-(~1.4× → parity) but can't beat f32: with f64 accumulation the `T = Boᵀ·Bx` GEMM
-is bound by f64 `T` traffic + 4-wide f64 FMA, not the `Bo`/`Bx` load. The ~2×
-needs **f32 accumulation**, which is numerically unacceptable — `T` is full of
-near-zero (cancelling) projection entries and f32 accumulation gives 1e-2…4.6e-1
-relative error vs f64's ~1e-10 (persists even for bf16 inputs; f64 accumulation
-is load-bearing). The CUDA port (TODO.md) is the real speedup. Archived on the
-unmerged `refactor/bf16-basis-seam` / `feat/bf16-linear-only` branches.
+**Performance note (2026-06-15) — bf16 basis storage REJECTED, a performance
+dead end, do not retry:** We built bf16 storage for `B`/`Bo`/`Bx` (storage only,
+widen to f32/f64 to compute) to halve the basis load volume. It caps at
+**parity** with f32 on CPU, so it's not in `master`. A SIMD bf16 widen-load
+fixed the initial scalar slowdown (~1.4× → parity) but can't beat f32: with f64
+accumulation the `T = Boᵀ·Bx` GEMM is bound by f64 `T` traffic + 4-wide f64 FMA,
+not the `Bo`/`Bx` load. The ~2× needs **f32 accumulation**, which is numerically
+unacceptable — `T` is full of near-zero (cancelling) projection entries and f32
+accumulation gives 1e-2…4.6e-1 relative error vs f64's ~1e-10 (persists even for
+bf16 inputs; f64 accumulation is load-bearing). The dead end is fundamental, not
+CPU-specific: any bf16 scheme only pays off if it accumulates in ≤f32, and the
+cancelling `T` forbids that. By the same argument the obvious GPU move should
+fail too — bf16 tensor cores accumulate in f32 at best — but that's predicted
+from the numerics, not benchmarked (only the CPU experiment and the GPU
+FP64-emulation path were actually measured). That precision contract is why the
+CUDA lever is blocked-**f32** GEMMs with f64 cross-chunk accumulation, not bf16
+(2026-06-16 CUDA note). The CUDA port (TODO.md) is the real speedup. Archived on
+the unmerged
+`refactor/bf16-basis-seam` / `feat/bf16-linear-only` branches.
 
 **Performance note (2026-06-16) — CUDA `linear_only` forward pass (branch
 `feat/cuda-orthonormalize`, opt-in `-DUSE_CUDA=ON` / `make configure-cuda`):** A

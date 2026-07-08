@@ -17,6 +17,18 @@ license         = "MIT"
 [project.urls]
 Source = "https://github.com/aleon1138/mars"
 
+# This replaces the old setup.py: scikit-build-core drives CMake (CMakeLists.txt
+# is the source of truth for the build) and installs mars.py + marslib.so into
+# the wheel. `pip install .` produces a CPU-only build by default.
+#
+# CUDA is opt-in. To build the GPU kernels into the wheel, forward the CMake
+# option through pip's config settings:
+#
+#   pip install . -C cmake.define.USE_CUDA=ON
+#
+# Pin a single GPU target by also passing
+#   -C cmake.define.CMAKE_CUDA_ARCHITECTURES=<arch>
+# (default: 7.5 and 12.0). See README.md and the Makefile for dev builds.
 [tool.scikit-build]
 minimum-version = "0.10"
 cmake.version   = ">=3.18"
