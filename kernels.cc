@@ -303,17 +303,13 @@ void orthonormalize(
     }
 
     /*
-     *  Phase 1: T = Bo^T * Bx
-     *  Bo is row-major, so the outer loop over i loads bo_row once and reuses
-     *  it across all p columns -- amortizes the row fetch. Bx[i,j] is f32,
-     *  upcast to f64 at the axpy_m call site; T stays f64.
-     *
-     *  This is essentially a GEMM call, how would this compare to a tuned BLAS
-     *  implementation? For `p`, `k` in 100–500 and `n` in the millions, we'll
-     *  get 80–90% of the CPU's single-thread peak, which is essentially where
-     *  OpenBLAS would land too. The remaining 10–20% is packing. The gap is
-     *  small because `Bo` and `Bx` have good access patterns so the cache/TLB
-     *  benefits of packing are muted compared to square GEMMs.
+     *  Phase 1: T = Bo^T * Bx, an f32-in / f64-accumulate GEMM no BLAS offers
+     *  (sgemm accumulates in f32, dgemm needs f64 inputs). Bo is row-major, so
+     *  the outer loop over i loads bo_row once and reuses it across all p
+     *  columns; Bx[i,j] is upcast at the axpy_m call site. With i outermost
+     *  every T element is stored on every FMA, which makes this phase
+     *  store-port-bound (~2.6x off the FMA peak); an i-blocked register tile
+     *  would fix that -- TODO.md item 3.
      */
     for (size_t j = 0; j < p; ++j) {
         std::fill_n(T + j * ldT, m, 0.0);

@@ -304,20 +304,18 @@ struct MarsData {
 constexpr size_t JB = 4;
 
 /*
- *  Relative floor on the hinge-sweep denominator den = ||h+||^2 - ||proj h+||^2
- *  (the energy of the candidate hinge outside span(Bo, Bx)). den is a
- *  difference of two O(||h+||^2) sums, so for a hinge that lies in the span it
- *  comes out as noise of either sign at ~||Bo^T Bo - I||*||h+||^2 -- about
- *  eps_f32/sqrt(n) of ||h+||^2 for the f32-stored Bo -- while the matching
- *  numerator uw = -<h+_perp, y> is noise of the same origin, so sse = uw^2/den
- *  can land anywhere up to ||y_perp||^2 (observed: spurious cuts at
- *  den/||h+||^2 ~ 1e-11 scoring 1e-2, above every legitimate cut). The
- *  absolute _tol cannot catch this (it scales with n, the noise floor shrinks
- *  with n). Require instead that at least this fraction of the hinge's energy
- *  be new: below it the candidate is a near-duplicate of terms already in the
- *  model whose coefficient would be O(1/sqrt(den)), and its gain cannot be
- *  resolved in f32 anyway. 8*eps_f32 ~ 1e-6 sits ~4 decades above the floor
- *  and well below any cut min_span would admit.
+ *  Relative floor on the hinge-sweep denominator den = ||h+||^2 - ||proj h+||^2,
+ *  the energy of the candidate hinge outside span(Bo, Bx). For a hinge inside
+ *  the span, den is the difference of two O(||h+||^2) sums and comes out as
+ *  noise of either sign at ~eps_f32/sqrt(n) of ||h+||^2 (the orthonormality
+ *  defect of the f32 Bo); the numerator uw is noise of the same origin, so
+ *  uw^2/den can score anywhere up to ||y_perp||^2 -- observed: in-span cuts at
+ *  den/||h+||^2 ~ 1e-11 scoring 1e-2, above every legitimate cut. The absolute
+ *  _tol (which grows with n while this floor shrinks) cannot catch it, so
+ *  require that at least this fraction of the hinge's energy be new. 8*eps_f32
+ *  ~ 1e-6 sits ~4 decades above the floor and well below any cut min_span
+ *  admits; below it the term would be a near-duplicate with an O(1/sqrt(den))
+ *  coefficient whose gain f32 cannot resolve anyway.
  */
 constexpr double HINGE_DEN_REL = 8.0 * FLT_EPSILON;
 
@@ -415,17 +413,15 @@ struct Scratch {
 };
 
 /*
- *  Degeneracy threshold on squared norms. Every quantity it gates -- the
- *  residual energy of a candidate column in orthonormalize()/append() and the
- *  hinge-sweep denominator -- is O(1) by construction (unit-norm basis, unit-rms
- *  x, unit-norm y), so one absolute threshold serves all three. The n-scaled
- *  term covers f64 summation error over n rows; the floor covers the f32
- *  storage of B/Bo/Bx: an exactly degenerate candidate (its parent times an
- *  input already in the model) leaves a residual of pure f32 rounding noise,
- *  ~0.5*eps_f32^2 in energy, which must be zeroed rather than normalized into a
- *  unit "basis" of noise. Below n ~ 1000 the n-scaled term alone sits under
- *  that noise (observed: a duplicate input scored ~1/n at n=300), hence the
- *  floor; above n ~ 25k the n-scaled term dominates and nothing changes.
+ *  Degeneracy threshold on squared norms. Everything it gates -- the residual
+ *  energy of a candidate column in orthonormalize()/append() and the
+ *  hinge-sweep denominator -- is O(1) by construction (unit-norm basis,
+ *  unit-rms x, unit-norm y), so one absolute threshold serves all three. The
+ *  n-scaled term covers f64 summation error; the floor covers f32 storage: an
+ *  exactly degenerate candidate leaves a residual of pure f32 rounding noise,
+ *  ~0.5*eps_f32^2 in energy, which must be zeroed rather than normalized into
+ *  a unit "basis" of noise. Below n ~ 1000 the n-scaled term sits under that
+ *  noise (a duplicate input scored ~1/n at n=300); above n ~ 25k it dominates.
  */
 static double degeneracy_tol(size_t n)
 {

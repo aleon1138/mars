@@ -29,7 +29,7 @@ constexpr double DGKS_GATE_RATIO_SQ = 9.0;
  *  arithmetic (projection, dot products, norms) stays in f64 -- Bo and Bx
  *  entries are upcast at the load. The cancellation in (Bx -= Bo*Bo^T*Bx)
  *  is bounded by the DGKS retry, so the rounded f32 storage keeps
- *  O(eps_f32) orthogonality against Bo -- see DGKS_GATE_RATIO_SQ below.
+ *  O(eps_f32) orthogonality against Bo -- see DGKS_GATE_RATIO_SQ above.
  *
  *  Layouts (caller's responsibility):
  *      B     : (n, *) col-major float;  col stride ldB.   Only columns mask[j] are read.

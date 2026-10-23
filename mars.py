@@ -232,29 +232,27 @@ def fit(X, y, w=None, **kwargs):
     gcv_adj = lambda mse, m: mse / (1.0 - get_dof(m) / n_true) ** 2  # Eq. (30)
 
     # Clamp the requested term budget so the DOF never exceed the sample count.
-    i = np.arange(1, max_terms + 1)
-    max_terms = i[get_dof(i) < n_true].max()
+    terms = np.arange(1, max_terms + 1)
+    max_terms = int(terms[get_dof(terms) < n_true].max())
 
     n, n_inputs = X.shape
-    basis = [[]]  # inputs of each basis, in insertion order (for xfilter)
-
-    # The candidate filter as arrays, maintained alongside `basis` on every
-    # append: degree[k] = len(basis[k]) caps the polynomial degree, and
-    # contains[i, k] = (i in basis[k]) blocks self-interaction. Evaluating them
-    # as block operations replaces two Python list comprehensions per input per
-    # epoch, which dominated the per-epoch orchestration cost.
-    degree   = np.zeros(max_terms, dtype=np.int64)
-    contains = np.zeros((n_inputs, max_terms), dtype=bool)
-    tail = max(int(n * tail_span), 1)
+    end_span = max(int(n * tail_span), 1)
     algo = marslib.MarsAlgo(X, y, w, max_terms)
     var_y = algo.yvar()
 
-    # Fast-MARS parent cache: the best delta-SSE each basis produced as a parent
-    # the last time it was scored, and that epoch. A new basis enters at +inf so
-    # it is scored at least once before competing on its own improvement.
+    # Per-basis state, preallocated to max_terms and sliced to the live count m.
+    # `basis` keeps each term's inputs in insertion order for xfilter; `degree`
+    # and `contains[i, k] = (i in basis[k])` are the same information as arrays
+    # so the degree / self-interaction filter is a block operation. The
+    # Fast-MARS parent cache holds the best delta-SSE each basis produced as a
+    # parent the last time it was scored, and that epoch; a new basis enters at
+    # +inf so it is scored at least once before competing on its own gain.
+    basis     = [[]]
+    degree    = np.zeros(max_terms, dtype=np.int64)
+    contains  = np.zeros((n_inputs, max_terms), dtype=bool)
+    basis_sse = np.full(max_terms, np.inf)
+    basis_age = np.zeros(max_terms, dtype=np.int64)
     epoch = 0
-    basis_sse = np.array([np.inf])
-    basis_age = np.array([0])
 
     # Define output data structure
     # fmt: off
@@ -283,32 +281,32 @@ def fit(X, y, w=None, **kwargs):
         return r
 
     while algo.nbasis() < max_terms:
+        m0 = m = algo.nbasis()
+
         # Fast MARS (Friedman 1993, sec 3.0-3.1; earth's fast.k / fast.beta):
         # reconsider only the `max_basis` parents of highest priority, where
         # priority = rank of the cached improvement + aging_factor * epochs since
         # it was last scored. Without the aging term a parent that once fell out
         # of the top K keeps a stale score and is never retried. With
         # max_basis=None every parent is selected and the order is irrelevant.
-        priority = _ranks(basis_sse) + aging_factor * (epoch - basis_age)
+        priority = _ranks(basis_sse[:m]) + aging_factor * (epoch - basis_age[:m])
         basis_to_use = np.argsort(priority, kind="stable")[::-1][:max_basis]
 
-        # Build the (input, basis) candidate mask for this epoch.
-        M = len(basis)
-        bmask = np.zeros((n_inputs, M), dtype=bool)
+        # The (input, basis) candidate mask for this epoch.
+        bmask = np.zeros((n_inputs, m), dtype=bool)
         bmask[:, basis_to_use] = True
-        bmask &= degree[None, :M] < max_degree
+        bmask &= degree[None, :m] < max_degree
         if not self_interact:
-            bmask &= ~contains[:, :M]
+            bmask &= ~contains[:, :m]
         if xfilter is not None:
             for i, k in zip(*np.nonzero(bmask)):
                 bmask[i, k] = bool(xfilter(i, basis[k]))
 
-        # Find the delta-SSE for the entire block
-        # 'sse1' is the improvement by adding a linear term
-        # 'sse2' is the improvement by adding two disjoint hinges
+        # Delta-SSE of every candidate: sse1 for a linear term, sse2 for the
+        # mirrored hinge pair at the best cut.
         _e0 = time.perf_counter()
         sse0, sse1, sse2, cut = algo.eval(
-            bmask, min_span, tail, linear_only, threads, cuda=cuda
+            bmask, min_span, end_span, linear_only, threads, cuda=cuda
         )
         _eval_t += time.perf_counter() - _e0
 
@@ -328,7 +326,6 @@ def fit(X, y, w=None, **kwargs):
             break  # all input data is filtered or zero
 
         # Estimate the out-sample error with Generalized Cross-Validation
-        m0 = m = algo.nbasis()
         mse1 = gcv_adj((1.0 - sse0 - sse1[j1]) / n, m + 1)
         mse2 = gcv_adj((1.0 - sse0 - sse2[j2]) / n, m + 2)
         if mse1 <= mse2:
@@ -344,15 +341,17 @@ def fit(X, y, w=None, **kwargs):
             # only guarantees room for one).
             if algo.nbasis() >= max_terms:
                 break
+            # append() returns -1 for a numerically degenerate column; an exact
+            # 0 (noise-free y) is a valid fit.
             mse = algo.append(htype, xcol, bcol, hcut)
-
-            # If 'y' is noise-free then MSE might be 0.0; handle this edge case.
             if mse >= 0:
                 # fmt:off
                 basis.append(basis[bcol] + [xcol])
                 degree[m]         = degree[bcol] + 1
                 contains[:, m]    = contains[:, bcol]
                 contains[xcol, m] = True
+                basis_sse[m]      = np.inf
+                basis_age[m]      = epoch
                 model[m] = (
                     htype,                              # type
                     bcol,                               # basis
@@ -364,16 +363,14 @@ def fit(X, y, w=None, **kwargs):
                     degree[m],                          # order
                     dt,                                 # time
                 )
-                basis_sse = np.append(basis_sse, [np.inf])
-                basis_age = np.append(basis_age, [epoch])
                 m += 1
                 # fmt:on
         assert algo.nbasis() == len(basis) == m
 
         if logger:
-            _dump_row(logger, epoch, len(basis), dt, model[m - 1], labels)
+            _dump_row(logger, epoch, m, dt, model[m - 1], labels)
         if callback:
-            callback(epoch, len(basis), max_terms, model[m - 1])
+            callback(epoch, m, max_terms, model[m - 1])
 
         # Stopping conditions
         if m == m0:
