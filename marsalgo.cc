@@ -3,11 +3,12 @@
 #ifdef MARS_USE_CUDA
 #   include "cuda/mars_cuda.h"
 #endif
-#include <numeric>          // for std::iota
-#include <cfloat>           // for DBL_EPSILON
+#include <cstdint>
+#include <cstring>          // for std::memcpy
+#include <cfloat>           // for DBL_EPSILON, FLT_EPSILON
 #include <cmath>            // for std::sqrt, std::isfinite
 #include <vector>
-#include <algorithm>        // for std::fill_n, std::max, std::stable_sort
+#include <algorithm>        // for std::fill_n, std::max, std::min
 #include <cstdio>           // for snprintf
 #include <cstddef>          // for size_t
 #ifdef __SSE__
@@ -15,9 +16,9 @@
 #endif
 
 /*
- *  Fused Multiply-Add (FMA) incurs only half the error of computing them
- *  separately. If the below macro is not available, then the implementation
- *  provided by the standard library will be much slower than the macro below.
+ *  The scalar accumulators below use fma() for its single rounding. Without a
+ *  hardware FMA (FP_FAST_FMA undefined) std::fma is a slow library call, so
+ *  fall back to the plain expression, which the compiler may still contract.
  */
 #ifndef FP_FAST_FMA
 #   undef fma
@@ -28,14 +29,73 @@ inline double fma(double x, double y, double z)
 #endif
 
 /*
- *  Return sort indexes in stable descending order.
+ *  Flush denormals to zero for the duration of eval(): the sweep accumulators
+ *  never need them and they are slow. Restored on every exit path, including
+ *  exceptions.
+ */
+struct FtzDazScope {
+#ifdef __SSE__
+    const unsigned csr;
+    FtzDazScope() : csr(_mm_getcsr())
+    {
+        _mm_setcsr(csr | 0x8040);
+    }
+    ~FtzDazScope()
+    {
+        _mm_setcsr(csr);
+    }
+#endif
+};
+
+/*
+ *  Return sort indexes in stable descending order (ties keep ascending row
+ *  order), as a comparison sort on `v[i] > v[j]` would. Implemented as an LSD
+ *  radix sort on the float bit pattern: three 11-bit passes over packed
+ *  (key, index) words, O(n) with sequential access, versus an indirect
+ *  std::stable_sort whose comparisons gather v at random. -0.0 is folded into
+ *  +0.0 so the two compare equal as they do for floats. `v` must be free of
+ *  NaN (the constructor verifies X is finite). Scratch is function-local and
+ *  thread-local, so this is safe from the OpenMP eval() loop.
  */
 void argsort(int32_t *idx, const float *v, size_t n)
 {
-    std::iota(idx, idx+n, 0);
-    std::stable_sort(idx, idx+n, [&v](size_t i, size_t j) {
-        return v[i] > v[j];
-    });
+    thread_local std::vector<uint64_t> a, b;
+    a.resize(n);
+    b.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t u;
+        std::memcpy(&u, v + i, sizeof u);
+        if (u == 0x80000000u) {
+            u = 0;
+        }
+        const uint32_t asc = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+        a[i] = ((uint64_t)(~asc) << 32) | (uint32_t)i;
+    }
+    uint64_t *src = a.data(), *dst = b.data();
+    for (int shift = 32; shift < 64; shift += 11) {
+        size_t count[2048] = {};
+        for (size_t i = 0; i < n; ++i) {
+            ++count[(src[i] >> shift) & 2047];
+        }
+        size_t sum = 0;
+        bool single = false;
+        for (size_t &c : count) {
+            single |= (c == n);
+            const size_t t = c;
+            c = sum;
+            sum += t;
+        }
+        if (single) {
+            continue;   // every key shares this digit: the pass is the identity
+        }
+        for (size_t i = 0; i < n; ++i) {
+            dst[count[(src[i] >> shift) & 2047]++] = src[i];
+        }
+        std::swap(src, dst);
+    }
+    for (size_t i = 0; i < n; ++i) {
+        idx[i] = (int32_t)(uint32_t)src[i];
+    }
 }
 
 /*
@@ -51,6 +111,18 @@ size_t nonzero(int *out, const bool *mask, size_t n)
         }
     }
     return count;
+}
+
+/*
+ *  Exact count of nonzero entries in a stored basis column.
+ */
+int64_t count_nonzero(const float *b, size_t n)
+{
+    int64_t cnt = 0;
+    for (size_t i = 0; i < n; ++i) {
+        cnt += (b[i] != 0.0f);
+    }
+    return cnt;
 }
 
 struct cov_t {
@@ -89,6 +161,7 @@ struct cov_t {
  *      basis value at the current sorted position: `B[k[i], bcol]`.
  */
 template <bool need_sse>
+__attribute__((always_inline)) inline
 cov_t covariates_impl(double *f, double *g, const float *x, const double *y,
                       double xm, double ym, double k0, float k1, size_t m)
 {
@@ -151,9 +224,10 @@ cov_t covariates_impl(double *f, double *g, const float *x, const double *y,
 }
 
 /*
- *  Non-template wrapper preserving the original symbol used by the unit test
- *  link. Internal callers should use `covariates_impl<...>` directly so the
- *  SSE-reduction path can be elided.
+ *  Non-template, out-of-line wrapper for the unit tests. The sweep calls the
+ *  template directly (and forces it inline: it runs once per sorted row and
+ *  basis column, ~25 vector iterations at m=100, so the 9-argument call and
+ *  struct return are a measurable share).
  */
 cov_t covariates(double *f, double *g, const float *x, const double *y,
                  double xm, double ym, double k0, float k1, size_t m)
@@ -186,7 +260,8 @@ struct MarsData {
     MarsData(const float *x, size_t n, size_t m, size_t ldx, size_t max_terms)
         : n(n), p(m), ldX(ldx), X(x)
         , B (n*max_terms, 0.0f)
-        , Bo(n*max_terms, 0.0f) {}
+        , Bo(n*max_terms, 0.0f)
+        , nnz(max_terms, 0) {}
 
     const size_t n;             // rows in X / length of y / rows of B, Bo
     const size_t p;             // columns in X (candidate regressors)
@@ -198,47 +273,84 @@ struct MarsData {
     std::vector<float>  Bo;     // orthonormalized basis (ROW-major; row stride == bo_stride)
     std::vector<double> ybo;    // dot product of basis Bo with Y target
     std::vector<float>  s;      // normalization constant for columns of 'X' (1/rms)
+    std::vector<int64_t> nnz;   // exact nonzero count of each stored B column (support size)
 };
 
 /*
+ *  Basis columns swept per gathered Bo row in the hinge sweep (see eval()).
+ *  Each column carries 2*(m+1) f64 accumulators, so JB=4 keeps the working set
+ *  (~16 KB at m=250, plus the 1 KB Bo row) inside L1 while cutting the random
+ *  Bo-row traffic by 4x.
+ */
+constexpr size_t JB = 4;
+
+/*
+ *  Relative floor on the hinge-sweep denominator den = ||h+||^2 - ||proj h+||^2
+ *  (the energy of the candidate hinge outside span(Bo, Bx)). den is a
+ *  difference of two O(||h+||^2) sums, so for a hinge that lies in the span it
+ *  comes out as noise of either sign at ~||Bo^T Bo - I||*||h+||^2 -- about
+ *  eps_f32/sqrt(n) of ||h+||^2 for the f32-stored Bo -- while the matching
+ *  numerator uw = -<h+_perp, y> is noise of the same origin, so sse = uw^2/den
+ *  can land anywhere up to ||y_perp||^2 (observed: spurious cuts at
+ *  den/||h+||^2 ~ 1e-11 scoring 1e-2, above every legitimate cut). The
+ *  absolute _tol cannot catch this (it scales with n, the noise floor shrinks
+ *  with n). Require instead that at least this fraction of the hinge's energy
+ *  be new: below it the candidate is a near-duplicate of terms already in the
+ *  model whose coefficient would be O(1/sqrt(den)), and its gain cannot be
+ *  resolved in f32 anyway. 8*eps_f32 ~ 1e-6 sits ~4 decades above the floor
+ *  and well below any cut min_span would admit.
+ */
+constexpr double HINGE_DEN_REL = 8.0 * FLT_EPSILON;
+
+inline double *align64(double *p)
+{
+    return reinterpret_cast<double *>((reinterpret_cast<uintptr_t>(p) + 63) & ~uintptr_t(63));
+}
+
+/*
  *  Per-thread working memory, function-local and thread-local inside `eval()`,
- *. so each thread owns one for its lifetime and `ensure()` reallocates only
- *  when the problem grows. Basis-sized buffers grow geometrically, so a full
- *  forward pass triggers O(log m) reallocations per thread. This keeps the
- *  large allocation traffic off the hot path without an explicit preallocated
- *  scratch pool.
+ *  so each thread owns one for its lifetime and the ensure*() calls reallocate
+ *  only when the problem grows. Basis-sized buffers grow geometrically, so a
+ *  full forward pass triggers O(log m) reallocations per thread.
  *
- *  All basis-dimensioned buffers are over-allocated to `cap` (>= live m); the
- *  hot loops slice leading left and top sub-blocks, so the slack is invisible.
+ *  Two capacities: `cap` (>= live m) sizes the small per-basis buffers; `pcap`
+ *  (>= active columns p, <= cap) sizes the n-row Bx workspace and the Bo^T*Bx
+ *  intermediate. Keeping Bx at p rather than m matters under Fast-MARS, where
+ *  p (the active parents) is a small fraction of m and Bx is by far the largest
+ *  per-thread buffer (n * pcap floats). The hot loops slice leading sub-blocks,
+ *  so the slack is invisible.
+ *
  *  Bx (and Bo, in MarsData) are stored as f32 but all Gram-Schmidt arithmetic
- *  in `orthonormalize()`/`append()` operate in f64.
- *
+ *  in `orthonormalize()`/`append()` is f64:
  *    - DGKS retry (kernels.cc) and `append()`: orthogonality is bounded by
  *      eps(f32) (~1e-7) against Bo.
- *    - linear_dsse: ybx = Bxᵀ * y accumulates in f64.
+ *    - linear_dsse: ybx = Bx^T * y accumulates in f64.
  *    - hinge sweep: bx_k = (double)Bx[k[i], j] upcasts at the load; Bo rows
- *      are gathered on the fly via Bo_data + k[i]*ldBo (ldBo == live m now) with
- *      a software prefetch a few iterations ahead.
+ *      are gathered on the fly via Bo_data + k[i]*ldBo with a software
+ *      prefetch a few iterations ahead.
  */
 struct Scratch {
-    size_t n   = 0;                // row count the n-sized buffers are sized for
-    size_t cap = 0;                // basis capacity the m-sized buffers are sized for
+    size_t n    = 0;               // row count the n-sized buffers are sized for
+    size_t cap  = 0;               // basis capacity of the m-sized buffers
+    size_t pcap = 0;               // column capacity of Bx / BoTBx (<= cap)
+    size_t fg_stride = 0;          // row stride of f/g: cap+1 rounded up to 8 doubles (64 B)
     std::vector<float>   x;        // normalized candidate column (n)
     std::vector<int32_t> k;        // sort permutation of x (n)
     std::vector<float>   d;        // adjacent deltas of x along sort order (n), d[0] unused
-    std::vector<float>   Bx;       // (n, cap) column-major (col stride n), B*x, ortho-normalized
-    std::vector<double>  f;        // (cap+1) hinge projection accumulator
-    std::vector<double>  g;        // (cap+1) basis-weighted ortho-accumulator
+    std::vector<float>   Bx;       // (n, pcap) column-major (col stride n), B*x, ortho-normalized
+    std::vector<double>  f_buf;    // backing store of f (JB rows + alignment slack)
+    std::vector<double>  g_buf;    // backing store of g
+    double *f = nullptr;           // (JB, fg_stride) hinge projection accumulators, 64 B aligned
+    double *g = nullptr;           // (JB, fg_stride) basis-weighted ortho-accumulators, 64 B aligned
     std::vector<int>     bcols;    // (cap) indexes of non-ignored basis (output of nonzero)
-    std::vector<double>  ybx;      // (cap) Bxᵀ * y, leading p entries used
+    std::vector<double>  ybx;      // (cap) Bx^T * y, leading p entries used
     std::vector<int>     hinge_idx;// (cap) best hinge sort position per j (leading p)
     std::vector<double>  hinge_sse;// (cap) best hinge delta-SSE per j (leading p)
-    std::vector<double>  BoTBx;    // (cap, cap) column-major (col stride cap) -- Boᵀ*Bx workspace
+    std::vector<double>  BoTBx;    // (cap, pcap) column-major (col stride cap) -- Bo^T*Bx workspace
 
     /*
-     *  Grow all buffers to hold `n_` rows and at least `m` basis columns. The
-     *  n-sized buffers reallocate only when the row count changes. The buffers
-     *  grow geometrically so a forward pass triggers O(log m) reallocations.
+     *  Grow the n-sized buffers to `n_` rows and the basis-sized buffers to at
+     *  least `m` columns. A new row count invalidates everything.
      */
     void ensure(size_t n_, size_t m)
     {
@@ -247,25 +359,65 @@ struct Scratch {
             x.resize(n);
             k.resize(n);
             d.resize(n);
-            cap = 0;    // force the basis-sized buffers below to reallocate
+            cap = pcap = 0;
         }
         if (m > cap) {
-            cap = m > 2 * cap ? m : 2 * cap;
-            Bx.resize(n * cap);
-            f.resize(cap + 1);
-            g.resize(cap + 1);
+            cap = std::max(m, 2 * cap);
+            /*
+             *  f/g rows are read and written as 256-bit vectors every sweep
+             *  step; keep each row 64-byte aligned so none of those accesses
+             *  straddle a cache line (~20% of the inner loop otherwise).
+             */
+            fg_stride = (cap + 1 + 7) & ~size_t(7);
+            f_buf.resize(JB * fg_stride + 8);
+            g_buf.resize(JB * fg_stride + 8);
+            f = align64(f_buf.data());
+            g = align64(g_buf.data());
             bcols.resize(cap);
             ybx.resize(cap);
             hinge_idx.resize(cap);
             hinge_sse.resize(cap);
-            BoTBx.resize(cap * cap);
+            BoTBx.resize(cap * pcap);
+        }
+    }
+
+    /*
+     *  Grow Bx / BoTBx to hold `p` candidate columns (p <= cap). Called after
+     *  the mask is counted, so the n-row workspace tracks the active columns.
+     */
+    void ensure_cols(size_t p)
+    {
+        if (p > pcap) {
+            pcap = std::min(std::max(p, 2 * pcap), cap);
+            Bx.resize(n * pcap);
+            BoTBx.resize(cap * pcap);
         }
     }
 };
 
+/*
+ *  Degeneracy threshold on squared norms. Every quantity it gates -- the
+ *  residual energy of a candidate column in orthonormalize()/append() and the
+ *  hinge-sweep denominator -- is O(1) by construction (unit-norm basis, unit-rms
+ *  x, unit-norm y), so one absolute threshold serves all three. The n-scaled
+ *  term covers f64 summation error over n rows; the floor covers the f32
+ *  storage of B/Bo/Bx: an exactly degenerate candidate (its parent times an
+ *  input already in the model) leaves a residual of pure f32 rounding noise,
+ *  ~0.5*eps_f32^2 in energy, which must be zeroed rather than normalized into a
+ *  unit "basis" of noise. Below n ~ 1000 the n-scaled term alone sits under
+ *  that noise (observed: a duplicate input scored ~1/n at n=300), hence the
+ *  floor; above n ~ 25k the n-scaled term dominates and nothing changes.
+ */
+static double degeneracy_tol(size_t n)
+{
+    const double f64_sum  = (n * 0.02) * DBL_EPSILON;
+    const double f32_floor = 8.0 * FLT_EPSILON * FLT_EPSILON;
+    return std::max(f64_sum, f32_floor);
+}
+
 MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, size_t m, size_t p, size_t ldx)
     : _data(new MarsData(x, n, m, ldx, p))
-    , _tol((n*0.02)*DBL_EPSILON) // rough guess
+    , _tol(degeneracy_tol(n))
 {
     _max_terms = p;
     verify(!std::isfinite(NAN), "NAN check is disabled, recompile without --fast-math");
@@ -287,10 +439,11 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
     }
 
     /*
-     *  TODO - these row-order reductions (y_norm, w_norm, _yvar below, and the
-     *  column norms in _data->s) are sensitive to the input row order.
-     *  Structured inputs (sorted, time-correlated, grouped) accumulate biased
-     *  running sums and lose precision versus shuffled inputs.
+     *  The reductions here (y_norm, w_norm, _yvar, the column norms in s) are
+     *  plain f64 sums; their row-order sensitivity is ~sqrt(n)*eps_f64 and not
+     *  a source of fit variation. The row-order dependence that
+     *  tests/repro_shuffle.py measures comes from the hinge sweep: ties in x
+     *  are broken by row index (stable sort), which moves candidate cuts.
      */
     double y_sq = 0.0, w_sq = 0.0;
     for (size_t i = 0; i < n; ++i) {
@@ -320,21 +473,18 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
     /*
      *  Initialize the first basis column (the intercept) with sqrt(w), in both
      *  B and its ortho-normalized copy Bo (both n x 1 here, so each column is
-     *  contiguous). ybo is then the f64 dot of the *stored* f32 intercept with
-     *  the *stored* f32 target -- each upcast on the load.
+     *  contiguous). ybo is the f64 dot of the *stored* f32 intercept with the
+     *  *stored* f32 target, deliberately not of the f64 originals: dsse() and
+     *  the linear delta-SSE in eval() are built from the stored values, so ybo
+     *  has to be too or the two would disagree at the f32 floor.
      */
     float *b0  = _data->B.data();   // col 0 of col-major B is the base
     float *bo0 = _data->Bo.data();  // col 0 of Bo is contiguous at bo_stride==1
     for (size_t i = 0; i < n; ++i) {
         b0[i] = bo0[i] = (float)sqrt_w[i];
     }
-
-    double ybo0 = 0.0;
-    for (size_t i = 0; i < n; ++i) {
-        ybo0 += (double)bo0[i] * (double)yp[i]; // TODO - avoid the round-trip f64->f32->f64?
-    }
-    _data->ybo.resize(1);
-    _data->ybo[0] = ybo0;
+    _data->ybo.assign(1, mars::dot_widen(bo0, yp, n));
+    _data->nnz[0] = count_nonzero(b0, n);
 
     /*
      *  Compute the sample variance of the (normalized) target 'y'.
@@ -422,13 +572,10 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     if (p == 0) {
         return;
     }
+    S.ensure_cols(p);
     int *bcols = S.bcols.data();
     const size_t n = _data->n;
-
-#ifdef __SSE__
-    const unsigned csr = _mm_getcsr();
-    _mm_setcsr(csr | 0x8040);   // enable FTZ and DAZ
-#endif
+    FtzDazScope ftz;
 
     /*
      *  Scale the candidate column by its normalization constant into scratch.
@@ -442,10 +589,9 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
 
     /*
      *  Evaluate `B[:,bcols] * x` and ortho-normalize against `Bo`. BoTBx is
-     *  the (m, p) workspace for the Boᵀ*Bx intermediate; sized at
-     *  (max_terms, max_terms) so the leading m×p block is what the kernel uses.
+     *  the (m, p) workspace for the Bo^T*Bx intermediate, col stride S.cap.
      */
-    float *Bx  = S.Bx.data();   // (n, cap) col-major, col stride n
+    float *Bx  = S.Bx.data();   // (n, pcap) col-major, col stride n
 
     /*
      *  `S.ybx` is reused as the per-column squared-norm scratch for
@@ -513,9 +659,8 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         std::fill_n(hinge_sse, p, 0.0);
 
         /*
-         *  Get sort indexes (into scratch)
-         *  TODO - we should keep a LRU cache as we usually pick from the
-         *         same pool of regressors in Fast-MARS.
+         *  Sort order of the raw X column (descending, ties by row index).
+         *  Scaling by s > 0 is monotone, so it is also the sort order of x.
          */
         int32_t *k = S.k.data();
         argsort(k, _data->X + xcol*_data->ldX, n);
@@ -534,14 +679,30 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         const float *y = _data->y.data(); // f32 storage; each y[k[i]] upcasts into double y_k below
 
         /*
-         *  Bo rows are now gathered on the fly inside the inner sweep(no Bok
-         *  scratch). Each iteration reads Bo.row(k[i]) at a random offset; the
-         *  access pattern forfeits HW prefetch, so we issue software prefetch
-         *  a few iterations ahead.
+         *  The sweep walks the rows in sorted order, so Bo.row(k[i]), b[k[i]],
+         *  bx[k[i]] and y[k[i]] are all random gathers the HW prefetcher cannot
+         *  predict; each is software-prefetched a few rows ahead. One gathered
+         *  Bo row (and y, d) serves a block of JB basis columns, dividing the
+         *  random Bo traffic by JB. See TODO.md for what this loop still leaves
+         *  on the table.
          */
         const float *Bo_data = _data->Bo.data();
         const size_t ldBo    = _data->bo_stride;
-        constexpr int PREFETCH_DIST = 4;
+        constexpr size_t PREFETCH_DIST = 4;
+        auto prefetch_ahead = [&](size_t i, const float *const *b, const float *const *bx, size_t jn) {
+            if (i + PREFETCH_DIST < n) {
+                const size_t kk  = (size_t)k[i + PREFETCH_DIST];
+                const float *row = Bo_data + kk*ldBo;
+                for (size_t off = 0; off < _m; off += 16) {
+                    __builtin_prefetch(row + off, 0, 3);
+                }
+                __builtin_prefetch(y + kk, 0, 3);
+                for (size_t jj = 0; jj < jn; ++jj) {
+                    __builtin_prefetch(b[jj]  + kk, 0, 3);
+                    __builtin_prefetch(bx[jj] + kk, 0, 3);
+                }
+            }
+        };
 
         /*
          *  For each parent basis column b = B[:,bcols[j]], sweep potential
@@ -571,78 +732,104 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
          *    sse = uw^2 / den  (extra gain from the hinge beyond the linear candidate)
          *
          *  The final hinge_dsse = linear_dsse + hinge_sse captures the combined
-         *  gain from the full hinge pair (h_plus and h_minus together).
+         *  gain from the full hinge pair (h_plus and h_minus together): h_minus
+         *  = h_plus - b*(x-h) lies in span(Bo, Bx[:,j], h_plus), so the pair
+         *  adds exactly the linear candidate plus h_plus.
+         *
+         *  Cuts are evaluated on a grid spaced by `min_span` along the sorted
+         *  index, anchored at `head+1` (the first eligible position). The
+         *  accumulators are running sums over every sample, so they update
+         *  every iteration regardless of the grid; only the SSE reduction
+         *  (o.ff, o.fy) is gated, since it is only consumed at on-grid
+         *  positions. `next_grid` walks the grid points so the per-sample test
+         *  is an equality, not a modulo.
          */
-        for (size_t j = 0; j < p; ++j) {
-            double *f = S.f.data();
-            std::fill_n(f, _m+1, 0.0);
-            double *g = S.g.data();
-            std::fill_n(g, _m+1, 0.0);
-            const float  *b  = B + bcols[j]*n;
-            const float  *bx = Bx + j*n;
+        /*
+         *  Support tracking: once every nonzero row of the parent b lies above
+         *  the cut, every later hinge equals b*x - h*b on the support and zero
+         *  off it -- exactly in span(Bo, Bx[:,j]) -- so den is 0 in exact
+         *  arithmetic and the remaining cuts are all degenerate. Stop sweeping
+         *  that column there (`done`): it is both the exact answer and, for
+         *  hinge parents with small support, most of the work.
+         */
+        for (size_t j0 = 0; j0 < p; j0 += JB) {
+            const size_t jn = std::min(JB, p - j0);
+            double       *f[JB], *g[JB];
+            const float  *b[JB], *bx[JB];
+            double  ybxj[JB], k0[JB], k1[JB], w[JB], bd[JB], vb[JB], b2[JB];
+            int64_t nz[JB], nnz[JB];
+            bool    done[JB];
+            size_t  n_done = 0;
 
-            double b_k  = b [k[0]];
-            double bx_k = bx[k[0]];
-            double y_k  = y [k[0]];
-            covariates_impl<false>(f,g,Bo_data + k[0]*ldBo,ybo,bx_k,ybx[j],0,b_k,_m);
+            const size_t kk0 = (size_t)k[0];
+            const float *bo0 = Bo_data + kk0*ldBo;
+            const double y0  = y[kk0];
+            for (size_t jj = 0; jj < jn; ++jj) {
+                const size_t j = j0 + jj;
+                f[jj]  = S.f + jj*S.fg_stride;
+                g[jj]  = S.g + jj*S.fg_stride;
+                std::fill_n(f[jj], _m+1, 0.0);
+                std::fill_n(g[jj], _m+1, 0.0);
+                b[jj]    = B  + (size_t)bcols[j]*n;
+                bx[jj]   = Bx + j*n;
+                ybxj[jj] = ybx[j];
+                nnz[jj]  = _data->nnz[bcols[j]];
+                const double b_k  = b[jj][kk0];
+                const double bx_k = bx[jj][kk0];
+                covariates_impl<false>(f[jj],g[jj],bo0,ybo,bx_k,ybxj[jj],0,b_k,_m);
+                k0[jj] = k1[jj] = w[jj] = bd[jj] = 0;
+                vb[jj] = b_k*y0;
+                b2[jj] = b_k*b_k;
+                nz[jj]   = (b_k != 0.0);
+                done[jj] = (nz[jj] == nnz[jj]);
+                n_done  += done[jj];
+            }
 
-            double k0 = 0;
-            double k1 = 0;
-            double w  = 0;
-            double bd = 0;
-            double vb = b_k*y_k;
-            double b2 = b_k*b_k;
-
-            /*
-             *  Cuts are evaluated on a grid spaced by `min_span` along the
-             *  sorted index, anchored at `head+1` (the first eligible
-             *  position). The f/g/k0/k1/w/b2/vb/bd accumulators are running
-             *  sums that depend on every sample, so they must update every
-             *  iteration regardless of whether this `i` is on the grid; only
-             *  the SSE reduction (o.ff, o.fy) is gated, since it is only
-             *  consumed at on-grid positions. `next_grid` walks the grid
-             *  points (head+1, head+1+min_span, ...) so the per-sample test is
-             *  an equality, not a modulo.
-             */
             size_t next_grid = head + 1;
-            for (size_t i = 1; i < tail; ++i) {
-                /*
-                 *  Prefetch the Bo row we'll need PREFETCH_DIST iterations
-                 *  ahead; the HW prefetcher fills the rest of the row once
-                 *  we touch the first cache line.
-                 */
-                if (i + PREFETCH_DIST < n) {
-                    __builtin_prefetch(Bo_data + k[i + PREFETCH_DIST] * ldBo, 0, 3);
-                }
-
-                b_k  = b [k[i]];
-                bx_k = bx[k[i]];
-                y_k  = y [k[i]];
-                const double di = d[i]; // upcast f32 delta once for the FMA chain
-
+            for (size_t i = 1; i < tail && n_done < jn; ++i) {
+                prefetch_ahead(i, b, bx, jn);
+                const size_t kk  = (size_t)k[i];
+                const double y_k = y[kk];
+                const double di  = d[i]; // upcast f32 delta once for the FMA chain
                 const bool on_grid = (i == next_grid);
                 if (on_grid) {
                     next_grid += min_span;
                 }
-                const float *bo_row = Bo_data + k[i]*ldBo;
-                cov_t o = on_grid
-                          ? covariates_impl<true >(f,g,bo_row,ybo,bx_k,ybx[j],di,b_k,_m)
-                          : covariates_impl<false>(f,g,bo_row,ybo,bx_k,ybx[j],di,b_k,_m);
+                const float *bo_row = Bo_data + kk*ldBo;
 
-                k0 = fma(di*di,b2,k0);  // build up ||h_plus||^2 incrementally
-                k1 = fma(di*2,bd,k1);
-                w  = fma(di,vb,w);      // w = h_plusᵀ * y
-                bd = fma(di,b2,bd);
-                b2 = fma(b_k,b_k,b2);
-                vb = fma(y_k,b_k,vb);
+                for (size_t jj = 0; jj < jn; ++jj) {
+                    if (done[jj]) {
+                        continue;
+                    }
+                    const double b_k  = b[jj][kk];
+                    const double bx_k = bx[jj][kk];
+                    cov_t o = on_grid
+                              ? covariates_impl<true >(f[jj],g[jj],bo_row,ybo,bx_k,ybxj[jj],di,b_k,_m)
+                              : covariates_impl<false>(f[jj],g[jj],bo_row,ybo,bx_k,ybxj[jj],di,b_k,_m);
 
-                if (on_grid) {
-                    const double uw  = o.fy - w;
-                    const double den = (k0+k1) - o.ff;
-                    const double sse = den > _tol? (uw*uw)/(den+_tol) : 0;
-                    if (sse > hinge_sse[j]) {
-                        hinge_sse[j] = sse;
-                        hinge_idx[j] = i;
+                    k0[jj] = fma(di*di,b2[jj],k0[jj]);  // build up ||h_plus||^2 incrementally
+                    k1[jj] = fma(di*2,bd[jj],k1[jj]);
+                    w[jj]  = fma(di,vb[jj],w[jj]);      // w = h_plusᵀ * y
+                    bd[jj] = fma(di,b2[jj],bd[jj]);
+                    b2[jj] = fma(b_k,b_k,b2[jj]);
+                    vb[jj] = fma(y_k,b_k,vb[jj]);
+
+                    if (on_grid) {
+                        const double uw  = o.fy - w[jj];
+                        const double h2  = k0[jj] + k1[jj];
+                        const double den = h2 - o.ff;
+                        const double sse = den > std::max(_tol, HINGE_DEN_REL*h2)
+                                           ? (uw*uw)/(den+_tol) : 0;
+                        if (sse > hinge_sse[j0+jj]) {
+                            hinge_sse[j0+jj] = sse;
+                            hinge_idx[j0+jj] = i;
+                        }
+                    }
+
+                    nz[jj] += (b_k != 0.0);
+                    if (nz[jj] == nnz[jj]) {
+                        done[jj] = true;
+                        ++n_done;
                     }
                 }
             }
@@ -656,9 +843,6 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         }
     }
 
-#ifdef __SSE__
-    _mm_setcsr(csr); // revert
-#endif
 }
 
 void MarsAlgo::eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
@@ -794,20 +978,25 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
     const float *xp = _data->X        + xcol*_data->ldX;    // candidate X column
     float       *Bm = _data->B.data() + _m*n;               // new basis column
 
+    /*
+     *  Form the raw column in f32 with the same operation order eval() uses
+     *  (scale x first, then multiply by the parent), so the appended linear
+     *  column is bit-identical to the candidate that was scored.
+     */
     switch(type) {
         case 'l':
             for (size_t i = 0; i < n; ++i) {
-                Bm[i] = s*bp[i]*xp[i];
+                Bm[i] = bp[i]*(xp[i]*s);
             }
             break;
         case '+':
             for (size_t i = 0; i < n; ++i) {
-                Bm[i] = s*bp[i]*std::max(xp[i]-h, 0.0f);
+                Bm[i] = bp[i]*(std::max(xp[i]-h, 0.0f)*s);
             }
             break;
         case '-':
             for (size_t i = 0; i < n; ++i) {
-                Bm[i] = s*bp[i]*std::max(h-xp[i], 0.0f);
+                Bm[i] = bp[i]*(std::max(h-xp[i], 0.0f)*s);
             }
             break;
         default:
@@ -816,19 +1005,21 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
 
     /*
      *  Gram-Schmidt with a DGKS retry (mars::orthonormalize_col). The eval()
-     *  side assumes Boᵀ Bo = I, so any orthogonality drift accumulates across
+     *  side assumes Bo^T Bo = I, so any orthogonality drift accumulates across
      *  the whole fit. Bo is f32 storage; the residual v and the dot products
      *  stay f64. The stored f32 B column is separately normalized by its own
-     *  pre-projection norm (matching the prior B.col(_m) /= v.norm()).
+     *  pre-projection norm. A column with no energy at all (e.g. a hinge whose
+     *  cut lies outside the parent's support) is rejected before it can be
+     *  divided by zero.
      */
     std::vector<double> v(n);
-    for (size_t i = 0; i < n; ++i) {
-        v[i] = (double)Bm[i];
-    }
-
     double v_raw_norm2 = 0.0;
     for (size_t i = 0; i < n; ++i) {
+        v[i] = (double)Bm[i];
         v_raw_norm2 += v[i] * v[i];
+    }
+    if (!(v_raw_norm2 > _tol)) {
+        return -1.;
     }
     const float v_raw_norm = (float)std::sqrt(v_raw_norm2);
     for (size_t i = 0; i < n; ++i) {
@@ -853,7 +1044,8 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
          *  Extend the cached ybo with one new entry; relies on ||y|| == 1 so
          *  mse = (||y||^2 - ||ybo||^2) / n collapses to (1 - ||ybo||^2) / n.
          *  The new entry is the f64 dot of the *stored* f32 Bo column with the
-         *  *stored* f32 target (each upcast on the load).
+         *  *stored* f32 target (each upcast on the load), for the same reason
+         *  as ybo[0] in the constructor.
          */
         const float *y = _data->y.data();
         double ybo_m = 0.0;
@@ -866,6 +1058,7 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
         }
         const double mse = (1. - ybo_sq) / n;
         if (mse >= -_tol) { // gracefully handle values close to zero
+            _data->nnz[_m] = count_nonzero(Bm, n);
             _m += 1;
             _data->ybo.push_back(ybo_m); // extend the cache for next iteration
             return std::max(mse,0.0);

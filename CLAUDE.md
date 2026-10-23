@@ -43,7 +43,9 @@ explicit BLAS-style strides (see the 2026-06-09 note). Key internal state (in
 Three methods drive the algorithm:
 - `eval()` — for each candidate `X` column, computes the delta-SSE improvement
   from adding a linear term or a pair of mirror hinges (`+`/`-`). Uses AVX/FMA
-  intrinsics in the inner loop (`covariates()`).
+  intrinsics in the inner loop (`covariates()`); sweeps `JB=4` basis columns per
+  gathered `Bo` row and stops a column once the cut passes below its parent's
+  support (every later hinge is then in the span -- see the 2026-10-22 note).
 - `append()` — commits a chosen basis (type `'l'`, `'+'`, or `'-'`), updates `Bo` and `ybo`.
 - `nbasis()` / `dsse()` / `yvar()` — read-only accessors.
 
@@ -53,7 +55,7 @@ GIL. It accepts a boolean mask matrix `(p, m)` controlling which `(input, basis)
 pairs to evaluate (Fast-MARS cache).
 
 **Python orchestration (`mars.py`)** — implements the full MARS forward pass loop
-on top of `marslib`. Uses `numba` for `expand()`. Key public API:
+on top of `marslib` (pure numpy/scipy, no numba). Key public API:
 - `fit(X, y, ...)` → structured numpy array `model` of basis nodes
 - `expand(X, model)` → basis matrix `B` for a new dataset
 - `prune(B, y, ...)` → backward pass / GCV pruning (returns a coefficient vector,
@@ -95,8 +97,9 @@ repack (`restride_rows`). This keeps the random Bo-row gather in the hinge sweep
 near the live count while dropping the repack cost from O(n·m²) over a fit to
 O(n·m) — the sweep takes the stride (`ldBo`) and the column count (`m`)
 separately, so it never assumes `stride == count`.
-`append()`'s Gram-Schmidt is now `mars::orthonormalize_col` (single-column
-modified GS + DGKS), validated against an Eigen oracle in the tests. The `s`
+`append()`'s Gram-Schmidt is now `mars::orthonormalize_col` (single-column GS +
+DGKS; modified GS at the time, classical since 2026-10-22 -- see that note),
+validated against an Eigen oracle in the tests. The `s`
 column norms were widened f32→f64 (the prior Eigen `colwise().squaredNorm()`
 accumulated in f32). `marsalgo.cc`/`marslib.cc`/`kernels.{h,cc}` are Eigen-free;
 `find_package(Eigen3)` is scoped to the `BUILD_TESTING` block, so a library/wheel
@@ -162,6 +165,52 @@ fixed-point packing/scaling/per-call workspace malloc dwarfs the matmul, which
 targets *large dense* f64 GEMMs. The toggle has since been removed from
 `context_create()` — the blocked-f32 split-K path above is the correct lever;
 emulation is the wrong tool for these shapes.
+
+**Review pass (2026-10-22) — numerics + CPU performance:**
+- **Hinge sweep had a real f32 failure mode, now gated.** Once a cut passes below
+  the parent's support, `h+ = b·x − h·b` lies exactly in span(Bo, Bx), so
+  `den = ‖h+‖² − ‖proj h+‖²` is 0 in exact arithmetic and the computed value is
+  noise of either sign at ~eps_f32/√n·‖h+‖² (the orthonormality defect of the
+  f32 `Bo`; the two sums it differences are O(‖h+‖²)). `den > _tol` (∝ n·eps_f64)
+  let positive noise through, and `uw²/den` — noise over noise — scored up to
+  1e-2, above every legitimate cut (seen on 2 of 100 bases in `bench_sweep` at
+  n=5e5; such cuts *would have been selected*). Fix: a relative gate
+  `den > HINGE_DEN_REL·‖h+‖²` (8·eps_f32 ≈ 1e-6) plus **support tracking** (each
+  basis column keeps its exact nonzero count `nnz`; the sweep stops a column
+  when all its nonzero rows are above the cut). Results are bit-identical at
+  every non-degenerate cut. This is a plausible contributor to the "unreliable
+  at order ≥ 3" symptom in TODO.md (small-support parents hit it most).
+- **`_tol` floored at 8·eps_f32²** (`degeneracy_tol()`): below n≈1000 the
+  n-scaled term sat under the f32 rounding noise of an exactly degenerate
+  candidate (a duplicate input scored ~1/n at n=300 and `append()` accepted it
+  as a basis). Nothing changes above n≈25k. Covered by
+  `MarsTest.DegenerateCandidateIsZeroAtSmallN`.
+- **`append()` is 13–16× faster**: classical GS (two streaming sweeps over the
+  row-major `Bo`) replaces modified GS, whose per-column walk touched one cache
+  line per row per column. 172→14 ms at n=5e5, m=100; 447→29 ms at m=250. It
+  had become the dominant per-epoch cost on the GPU path (where eval is ~0.1 s).
+  Same DGKS gate; with `Bo` orthonormal to f32 precision the two agree to that
+  floor (the test cross-checks both references).
+- **Sweep 1.3× faster, bit-exact:** JB=4 columns per gathered `Bo` row,
+  full-row + gather prefetch, 64-byte-aligned `f`/`g`, forced inline of
+  `covariates_impl`. A standalone microbench of the identical loop (same
+  DRAM-resident random rows and gathers) runs **3× faster** than the in-situ
+  loop; the gap is not memory (the gather pass is cheap, prefetch depth and
+  huge pages change nothing) and is TODO item 1.
+- Smaller: `argsort` is a stable LSD radix sort (51→~5 ms at n=5e5; the
+  planned LRU cache is moot); per-thread `Bx` is sized by the active columns
+  `p` rather than `m` (Fast-MARS memory); `fit()` caches `max(sse1, sse2)`
+  (with `linear_only` or no admissible cut, `sse2` is 0 and the Fast-MARS
+  ranking was running on all-zero scores); the appended linear column is
+  formed as `b·(x·s)` like the candidate, so it is bit-identical to what was
+  scored; `threads` is clamped to ≥1; the MXCSR FTZ/DAZ state is restored by
+  RAII; CUDA f64 GEMMs call `cublasDgemm` directly (the emulation compute-type
+  plumbing is gone).
+- `tests/bench_sweep.cc` (`bench_sweep` target under `BUILD_TESTING`) times
+  `append()`, `eval(linear)` and `eval(hinge)` at a fit-like basis and dumps the
+  outputs for bit-exact A/B. On the EPYC box, pin with `taskset` and run
+  variants sequentially on the same core: concurrent runs on different cores
+  disagree by ±20%.
 
 **Data requirements:** `X` must be `float32`, **column-major** (Fortran order).
 `y` and `w` must be `float32` column-major 1D arrays. The bindings assert these

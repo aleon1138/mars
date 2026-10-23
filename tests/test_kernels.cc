@@ -79,27 +79,37 @@ MatrixXd eigen_reference(int n, int m, int p,
 }
 
 /*
- *  Eigen MGS reference mirroring mars::orthonormalize_col (and MarsAlgo::append):
- *  modified Gram-Schmidt against the f32 Bo (upcast to f64), a single DGKS retry,
- *  then v/||v|| (no +tol) when above the degeneracy floor. Reports the
- *  pre-normalization length in w_out.
+ *  Eigen reference mirroring mars::orthonormalize_col (and MarsAlgo::append):
+ *  one classical Gram-Schmidt pass against the f32 Bo (upcast to f64), a single
+ *  DGKS retry on the same gate, then v/||v|| (no +tol) when above the degeneracy
+ *  floor. Reports the pre-normalization length in w_out. `modified` selects a
+ *  modified-GS pass instead (each projection updates v before the next): with
+ *  Bo orthonormal to f32 precision the two agree to that floor, which the test
+ *  below checks.
  */
 VectorXd orthonormalize_col_reference(VectorXd v, const MatrixXfC &Bo, int m,
-                                      double tol, double &w_out)
+                                      double tol, double &w_out,
+                                      bool modified = false)
 {
     const MatrixXd Bod = Bo.leftCols(m).cast<double>();
-    double proj_norm2 = 0.0;
-    for (int j = 0; j < m; ++j) {
-        const double c = Bod.col(j).dot(v);
-        v -= c * Bod.col(j);
-        proj_norm2 += c * c;
-    }
+    auto pass = [&](VectorXd &u) {
+        if (modified) {
+            double e = 0.0;
+            for (int j = 0; j < m; ++j) {
+                const double c = Bod.col(j).dot(u);
+                u -= c * Bod.col(j);
+                e += c * c;
+            }
+            return e;
+        }
+        const VectorXd c = Bod.transpose() * u;
+        u -= Bod * c;
+        return c.squaredNorm();
+    };
+    const double proj_norm2 = pass(v);
     double v_norm2 = v.squaredNorm();
     if (v_norm2 > tol && v_norm2 * mars::DGKS_GATE_RATIO_SQ < proj_norm2) {
-        for (int j = 0; j < m; ++j) {
-            const double c = Bod.col(j).dot(v);
-            v -= c * Bod.col(j);
-        }
+        pass(v);
         v_norm2 = v.squaredNorm();
     }
     const double w = std::sqrt(v_norm2);
@@ -569,9 +579,10 @@ TEST(KernelsTest, DotWidenAccumulatesInF64)
 
 /*
  *  orthonormalize_col: the single-column GS used by append(). A well-conditioned
- *  column must match the Eigen MGS reference, be orthogonal to Bo and unit-norm,
- *  and must NOT trip the DGKS retry. v is f64; Bo is f32, so orthogonality is
- *  floored at ~eps_f32 while the vs-reference agreement is at the f64 floor.
+ *  column must match the Eigen classical-GS reference, be orthogonal to Bo and
+ *  unit-norm, and must NOT trip the DGKS retry. v is f64; Bo is f32, so
+ *  orthogonality is floored at ~eps_f32 while the vs-reference agreement is at
+ *  the f64 floor. A modified-GS reference must agree to the f32 floor too.
  */
 TEST(KernelsTest, OrthonormalizeColMatchesEigen)
 {
@@ -600,6 +611,11 @@ TEST(KernelsTest, OrthonormalizeColMatchesEigen)
     EXPECT_LT((Bod.transpose() * v).cwiseAbs().maxCoeff(), ORTH_TOL);
     EXPECT_NEAR(v.norm(), 1.0, REF_TOL);
     EXPECT_EQ(counter.load(), 0);  // well-conditioned: no retry
+
+    double w_mgs = 0.0;
+    VectorXd v_mgs = orthonormalize_col_reference(v0, Bo, m, TOL, w_mgs, /*modified=*/true);
+    EXPECT_NEAR(w, w_mgs, ORTH_TOL * (1.0 + std::abs(w_mgs)));
+    EXPECT_TRUE(v.isApprox(v_mgs, ORTH_TOL));
 }
 
 /*

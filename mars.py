@@ -331,11 +331,15 @@ def fit(X, y, w=None, **kwargs):
         )
         _eval_t += time.perf_counter() - _e0
 
-        # Update the delta-SSE cache
-        # TODO - should we really be using GCV adjusted SSE instead?
+        # Update the delta-SSE caches with the best gain seen per basis / input.
+        # sse2 (hinge pair) is >= sse1 wherever a cut was found, but it is 0 in
+        # linear_only mode and wherever no admissible cut exists, so take the
+        # elementwise max -- otherwise the Fast-MARS ranking degenerates to
+        # all-zero scores in those cases.
+        sse_best = np.maximum(sse1, sse2)
         basis_active = bmask.any(axis=0)
-        basis_sse[basis_active] = sse2[:, basis_active].max(axis=0)
-        input_sse[input_to_use] = sse2[input_to_use].max(axis=1)
+        basis_sse[basis_active] = sse_best[:, basis_active].max(axis=0)
+        input_sse[input_to_use] = sse_best[input_to_use].max(axis=1)
         input_age[input_to_use] = epoch
         epoch += 1
 
@@ -469,7 +473,7 @@ def gram(A, B=None, chunk_size=128):
     if B is None:
         B = A
     if len(A) != len(B):
-        raise ValueError("shapes are not aligned: {A.shape} x {B.shape}")
+        raise ValueError(f"shapes are not aligned: {A.shape} x {B.shape}")
 
     A2 = A[:, np.newaxis] if A.ndim == 1 else A
     B2 = B[:, np.newaxis] if B.ndim == 1 else B
@@ -756,7 +760,7 @@ def pprint(model, beta=None, labels=None):
     def get_inputs(i: int):
         row = model[i]
         if row["type"] == b"+":
-            node = "MAX(%s-%g,0)" % (xcol(row["input"]), row["hinge"])
+            node = "MAX(%s%+g,0)" % (xcol(row["input"]), -row["hinge"])
         elif row["type"] == b"-":
             node = "MAX(%g-%s,0)" % (row["hinge"], xcol(row["input"]))
         else:

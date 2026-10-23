@@ -63,23 +63,22 @@ void orthonormalize(
 
 /*
  *  Single-column Gram-Schmidt: orthonormalize one new basis column against the
- *  m existing orthonormal columns of `Bo`, in place. This is the per-append
- *  counterpart of orthonormalize() (which batches p candidate columns for
- *  eval()); it mirrors the math in MarsAlgo::append().
- *
- *  Uses MODIFIED Gram-Schmidt (each projection updates v before the next is
- *  computed) plus one DGKS retry when the residual energy is small relative to
- *  what was projected out (see DGKS_GATE_RATIO_SQ). With Bo orthonormal, MGS
- *  and classical GS coincide up to O(eps); MGS is chosen to match append()
- *  bit-for-bit. On return:
+ *  m orthonormal columns of `Bo`, in place. This is the per-append counterpart
+ *  of orthonormalize() (which batches p candidate columns for eval()) and uses
+ *  the same scheme: one classical Gram-Schmidt pass (c = Bo^T v, v -= Bo c)
+ *  plus one DGKS retry when the residual energy is small relative to what was
+ *  projected out (see DGKS_GATE_RATIO_SQ). With Bo orthonormal to f32 storage
+ *  precision, classical and modified GS agree to that same floor; classical GS
+ *  is chosen because both halves stream Bo row by row (two sequential sweeps),
+ *  whereas modified GS walks Bo column by column -- a strided access that costs
+ *  one cache line per row per column, m times the traffic. On return:
  *      v        <- v_perp / ||v_perp||   if ||v_perp||^2 > tol  (unit residual)
  *               <- v_perp (unchanged)    otherwise              (degenerate)
  *      returns     ||v_perp||            (pre-normalization; caller accepts the
  *                                         column iff w*w > tol and stores v)
  *
- *  All arithmetic is f64; Bo is f32 storage, upcast on the load. Scalar: this
- *  runs once per accepted basis (cold), and the per-column Bo access is strided
- *  (Bo is row-major), so there is nothing to vectorize.
+ *  All arithmetic is f64; Bo is f32 storage, upcast on the load. Allocates an
+ *  m-length f64 workspace (cold path: once per accepted basis).
  *
  *  Layouts:
  *      v    : (n)    double, in/out -- the raw new column; residual on return

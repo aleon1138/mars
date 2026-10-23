@@ -5,6 +5,7 @@
 #include <random>
 #include <thread>
 #include <cmath>
+#include <numeric>
 
 /*
  *  Hinge-sweep delta-SSE goes through covariates_impl(). With AVX the f/g
@@ -112,6 +113,38 @@ TEST(MarsTest, ArgSort)
 
     for (int i = 0; i < n; ++i) {
         ASSERT_EQ(x[k[i]],y[i]);
+    }
+}
+
+/*
+ *  argsort is a radix sort standing in for a stable comparison sort: on data
+ *  with heavy ties, both signed zeros, negatives, infinities and a large n it
+ *  must reproduce std::stable_sort's permutation exactly (ties in ascending row
+ *  order), not just the sorted values.
+ */
+TEST(MarsTest, ArgSortMatchesStableSort)
+{
+    std::mt19937 rng(7);
+    std::normal_distribution<float> gauss;
+    for (int n : {1, 2, 1000, 100003}) {
+        std::vector<float> x(n);
+        for (int i = 0; i < n; ++i) {
+            const float v = gauss(rng);
+            switch (rng() % 8) {
+                case 0:  x[i] = std::round(v * 4) / 4;  break;   // ties
+                case 1:  x[i] = 0.0f;                   break;
+                case 2:  x[i] = -0.0f;                  break;
+                case 3:  x[i] = (rng() & 1) ? INFINITY : -INFINITY; break;
+                default: x[i] = v;
+            }
+        }
+        std::vector<int32_t> ref(n), got(n);
+        std::iota(ref.begin(), ref.end(), 0);
+        std::stable_sort(ref.begin(), ref.end(), [&](int32_t i, int32_t j) {
+            return x[i] > x[j];
+        });
+        argsort(got.data(), x.data(), n);
+        ASSERT_EQ(got, ref) << "n=" << n;
     }
 }
 
@@ -395,6 +428,49 @@ TEST(MarsTest, DeltaSSE)
         ASSERT_TRUE(res.linear_dsse.isApprox(foo.linear_dsse));
         ASSERT_TRUE(res.hinge_dsse.isApprox(foo.hinge_dsse));
         ASSERT_TRUE(res.hinge_cut.isApprox(foo.hinge_cut));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+/*
+ *  Degenerate candidates must score exactly zero, at small n too. Once a linear
+ *  term x_j is in the model, the candidate (x_j, intercept) -- and any exact
+ *  multiple of x_j -- lies in span(Bo) up to f32 rounding noise. The
+ *  orthonormalize tolerance must zero that noise rather than normalize it into
+ *  a unit "basis"; and append() of the same term must be rejected. At n=300 the
+ *  n-scaled part of the tolerance alone (~1e-15) sits below the f32 noise floor
+ *  (observed: ~1/n ~ 4e-3 of spurious delta-SSE), which is what the f32 floor in
+ *  degeneracy_tol() guards.
+ */
+TEST(MarsTest, DegenerateCandidateIsZeroAtSmallN)
+{
+    for (int N : {300, 1000, 5891}) {
+        srand(N);
+        const int M = 4;
+        MatrixXd X(MatrixXd::Random(N, M));
+        X.col(3) = 1.7 * X.col(2);  // an exact (scaled) duplicate input
+        VectorXd y = (0.3 * X.col(0).array() - 0.2 * X.col(1).array()
+                      + 0.25 * X.col(0).array() * X.col(1).array()).matrix();
+        y += VectorXd::Random(N);
+
+        MatrixXf X32 = X.cast<float>();
+        VectorXf y32 = y.cast<float>();
+        ArrayXf  w32 = ArrayXf::Ones(N);
+        MarsAlgo algo(X32.data(), y32.data(), w32.data(), N, M, 10, N);
+        ASSERT_GE(algo.append('l', 0, 0, 0), 0.0);
+        ASSERT_GE(algo.append('l', 2, 0, 0), 0.0);
+
+        ArrayXb mask = ArrayXb::Constant(algo.nbasis(), true);
+        for (int xcol : {0, 2, 3}) {
+            Result res(algo, xcol, mask, /*linear_only=*/true);
+            EXPECT_EQ(res.linear_dsse[0], 0.0) << "N=" << N << " xcol=" << xcol;
+        }
+        Result real(algo, 1, mask, /*linear_only=*/true);
+        EXPECT_GT(real.linear_dsse[0], 1e-3) << "N=" << N;   // the genuine candidate still scores
+
+        EXPECT_LT(algo.append('l', 3, 0, 0), 0.0) << "N=" << N;  // duplicate rejected
+        EXPECT_EQ(algo.nbasis(), 3) << "N=" << N;
     }
 }
 

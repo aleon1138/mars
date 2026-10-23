@@ -3,13 +3,19 @@
  *  pass. See cuda/mars_cuda.h for the host-facing contract and kernels.cc for
  *  the CPU oracle this must match (within the ~1e-5 f32 storage floor).
  *
- *  Precision contract (load-bearing): the T = Boᵀ·Bx contraction accumulates in
- *  f64 (cublasDgemm on f64 copies of Bo/Bx). f32 accumulation corrupts the
- *  near-zero projection entries via cancellation (1e-2…4.6e-1 rel error -- see
- *  CLAUDE.md). The per-element f32 *rounding* points are matched to the CPU
- *  kernel exactly: the B·x product is rounded to f32 before the GEMM widen, the
- *  projection residual is rounded to f32 before its squared norm accumulates,
- *  and the normalize scale is computed in f64 (1/sqrt(s+tol), not rsqrtf).
+ *  Precision contract (load-bearing): the near-zero entries of T = Boᵀ·Bx
+ *  cancel, so T must be accumulated in f64 -- a single f32 GEMM over K=n gives
+ *  1e-2…4.6e-1 relative error (see CLAUDE.md). The default path therefore
+ *  splits K into chunks of MARS_CUDA_KCHUNK rows, runs each chunk as an f32
+ *  cublasSgemm, and sums the chunk results into the f64 T; only the
+ *  within-chunk f32 error (~sqrt(kchunk)·eps_f32) remains. MARS_CUDA_KCHUNK=0
+ *  selects the native-f64 cublasDgemm reference, bit-reproducible against the
+ *  CPU kernel. The projection Bx -= Bo·T runs as an f32 sgemm whose result is
+ *  subtracted from the f64 B·x inside the fused round/reduce pass; the DGKS
+ *  retry (rare, cancelling columns) stays entirely in f64. The per-element f32
+ *  rounding points match the CPU kernel: the B·x product is rounded to f32
+ *  before the GEMM, the residual is rounded to f32 before its squared norm
+ *  accumulates, and the normalize scale is 1/sqrt(s+tol) in f64.
  */
 
 #include "../kernels.h"   // mars::DGKS_GATE_RATIO_SQ
@@ -53,22 +59,6 @@ namespace {
     } while (0)
 
 constexpr int BLOCK = 256;
-
-// f64 GEMM via cublasGemmEx so the compute type is explicit per call: native
-// CUBLAS_COMPUTE_64F (d884 DMMA) or CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT
-// (integer-tensor-core emulation on Blackwell). All operands stay CUDA_R_64F.
-inline void gemm64(cublasHandle_t h, cublasComputeType_t ct,
-                   cublasOperation_t ta, cublasOperation_t tb,
-                   int m, int n, int k, const double *alpha,
-                   const double *A, int lda, const double *B, int ldb,
-                   const double *beta, double *C, int ldc)
-{
-    CUBLAS_CHECK(cublasGemmEx(h, ta, tb, m, n, k,
-                              alpha, A, CUDA_R_64F, lda,
-                              B, CUDA_R_64F, ldb,
-                              beta, C, CUDA_R_64F, ldc,
-                              ct, CUBLAS_GEMM_DEFAULT));
-}
 
 // --- reductions -------------------------------------------------------------
 
@@ -124,9 +114,10 @@ __inline__ __device__ void blockReduceSum2(double &a, double &b)
 
 // --- kernels ----------------------------------------------------------------
 
-// Bx[i,j] = B[i, mask[j]] * x[i], stored both as f32 (the kernel output) and as
-// the f64 widening of that rounded f32 value (the cublasDgemm input). Matches
-// the CPU: an f32 multiply, stored f32, then upcast at the GEMM load.
+// Bx[i,j] = B[i, mask[j]] * x[i], stored both as f32 (the GEMM operand and the
+// kernel output) and as the f64 widening of that rounded value (the minuend of
+// the fused projection subtract, and the f64 reference GEMM's operand). Matches
+// the CPU: an f32 multiply, stored f32, then upcast at the load.
 __global__ void fill_kernel(const float *B, size_t n, const float *x,
                             const int *mask, float *bx32, double *bx64)
 {
@@ -363,7 +354,6 @@ inline void check_launch()
 struct Context {
     cublasHandle_t handle = nullptr;
     cudaStream_t   stream = nullptr;
-    cublasComputeType_t compute_type = CUBLAS_COMPUTE_64F;  // or _EMULATED_FIXEDPOINT
 
     size_t n         = 0;
     size_t max_terms = 0;
@@ -383,7 +373,7 @@ struct Context {
     // accumulate the chunk results into the f64 dT. Default 2048 (on);
     // MARS_CUDA_KCHUNK=0 selects the native-f64 T GEMM.
     size_t  kchunk   = 2048;
-    float  *dTc_f32  = nullptr;  // (max_terms, p_cap) per-chunk f32 T / cast of dT
+    float  *dTc_f32  = nullptr;  // (max_terms, p_cap) per-chunk f32 T, then the f32 cast of dT
 
     // per-call scratch (sized for the worst case p == p_cap; the per-eval path
     // uses the leading <= max_terms columns, the batched path up to p_cap)
@@ -714,10 +704,10 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     // Phase 1: T = Boᵀ · Bx  (m×P).
     prof_mark(ctx, 0);
     if (ctx->kchunk == 0) {
-        // Native f64 (exact dot of the f32-stored inputs).
-        gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_T, CUBLAS_OP_N,
-               (int)m, (int)P, (int)n, &one, ctx->dBo_f64, (int)n,
-               ctx->dBx_f64, (int)n, &zero, ctx->dT, (int)ldT);
+        // Native f64 reference (exact dot of the f32-stored inputs).
+        CUBLAS_CHECK(cublasDgemm(ctx->handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                                 (int)m, (int)P, (int)n, &one, ctx->dBo_f64, (int)n,
+                                 ctx->dBx_f64, (int)n, &zero, ctx->dT, (int)ldT));
     }
     else {
         // Blocked f32: split K=n into chunks, cublasSgemm each in f32 (fast on
@@ -740,20 +730,18 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
         }
     }
 
-    // Phase 2a: Bx -= Bo·T (in place, f64), then one fused pass that rounds to
-    // f32, stores it, and reduces ‖Bx[:,j]‖² (ds) and Σ Bx·y (ybx_raw), split
+    // Phase 2a: project out Bo. proj = Bo·T as an f32 sgemm (K=m) into dBx_f32,
+    // whose phase-0 contents (the f32 B·x) are no longer needed; the subtract
+    // residual = (f64 B·x) - proj is fused into the round/reduce pass below, so
+    // there is no separate n×P read-modify-write. That pass rounds the residual
+    // to f32, stores it, and reduces ‖Bx[:,j]‖² (ds) and Σ Bx·y (ybx_raw), split
     // over rows AND columns (atomic f64 partials) so the whole GPU is used.
     prof_mark(ctx, 1);
-
-    // f32 projection: proj = Bo·T (f32 sgemm, K=m), subtract in f64. dBx_f32
-    // (the phase-0 fill, no longer needed) is reused as the proj scratch.
     const float one_f = 1.0f, zero_f = 0.0f;
     const size_t nmp = m * P;
     cast_f64_to_f32_kernel<<<(unsigned)((nmp + BLOCK - 1) / BLOCK), block, 0, s>>>(
         ctx->dT, ldT, ctx->dTc_f32, m, P);
     check_launch();
-    // proj = Bo·T into dBx_f32. The subtract (dBx_f64 - proj) is fused into
-    // round_reduce below -- no separate n×P pass.
     CUBLAS_CHECK(cublasSgemm(ctx->handle, CUBLAS_OP_N, CUBLAS_OP_N,
                              (int)n, (int)P, (int)m,
                              &one_f, ctx->dBo_f32, (int)n,
@@ -769,8 +757,8 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     if (want_dot) {
         CUDA_CHECK(cudaMemsetAsync(ctx->dybx_raw, 0, P * sizeof(double), s));
     }
-    // f32-projection path: dBx_f32 holds proj; fuse the f64 subtract here (out and
-    // proj are the same buffer -- each thread reads then writes its own index).
+    // `out` and `proj` are the same buffer (dBx_f32): each thread reads then
+    // writes its own index, so the aliasing is benign.
     prof_mark(ctx, 2);
     round_reduce_kernel<<<grid_reduce, block, 0, s>>>(
         ctx->dBx_f64, ctx->dBx_f32, ctx->dy, n, ctx->ds, ctx->dybx_raw, want_dot,
@@ -780,9 +768,7 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
 
     // Phase 2b: DGKS gate. s[j] > tol && s[j]*9 < ‖T[:,j]‖² -> retry. Build the
     // compact list of flagged columns on the host so the (rare) retry runs only
-    // over those, not the whole P-wide block -- the f64 retry GEMMs are the weak
-    // path on this card, so their cost must scale with the cancelling columns,
-    // not the batch width.
+    // over those, not the whole P-wide block.
     colsumsq_f64_kernel<<<(unsigned)P, block, 0, s>>>(ctx->dT, ldT, m, ctx->dtnorm2);
     check_launch();
     CUDA_CHECK(cudaMemcpyAsync(ctx->h_ds.data(), ctx->ds, P * sizeof(double),
@@ -806,7 +792,8 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
         // is dead after the main round_reduce. Re-orthogonalize ONLY those in f64
         // (T = Boᵀ·Bx then Bx -= Bo·T at width `fired`, reusing dT), then round
         // and scatter each refined column back to its global slot with fresh
-        // ds/ybx_raw. Per-column math matches the old whole-block masked retry.
+        // ds/ybx_raw. The f64 GEMMs are the weak path on this card, so their
+        // cost must scale with the cancelling columns, not the batch width.
         CUDA_CHECK(cudaMemcpyAsync(ctx->didx, ctx->h_idx.data(),
                                    (size_t)fired * sizeof(int),
                                    cudaMemcpyHostToDevice, s));
@@ -814,12 +801,12 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
         gather_widen_kernel<<<grid_gather, block, 0, s>>>(
             ctx->dBx_f32, n, ctx->didx, ctx->dBx_f64);
         check_launch();
-        gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_T, CUBLAS_OP_N,
-               (int)m, fired, (int)n, &one, ctx->dBo_f64, (int)n,
-               ctx->dBx_f64, (int)n, &zero, ctx->dT, (int)ldT);
-        gemm64(ctx->handle, ctx->compute_type, CUBLAS_OP_N, CUBLAS_OP_N,
-               (int)n, fired, (int)m, &neg_one, ctx->dBo_f64, (int)n,
-               ctx->dT, (int)ldT, &one, ctx->dBx_f64, (int)n);
+        CUBLAS_CHECK(cublasDgemm(ctx->handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                                 (int)m, fired, (int)n, &one, ctx->dBo_f64, (int)n,
+                                 ctx->dBx_f64, (int)n, &zero, ctx->dT, (int)ldT));
+        CUBLAS_CHECK(cublasDgemm(ctx->handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                 (int)n, fired, (int)m, &neg_one, ctx->dBo_f64, (int)n,
+                                 ctx->dT, (int)ldT, &one, ctx->dBx_f64, (int)n));
         round_reduce_scatter_kernel<<<(unsigned)fired, block, 0, s>>>(
             ctx->dBx_f64, n, ctx->didx, ctx->dBx_f32, ctx->dy,
             ctx->ds, ctx->dybx_raw, want_dot);

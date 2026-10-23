@@ -147,6 +147,11 @@ if(BUILD_TESTING)
     find_package(Threads REQUIRED)
     add_executable(unittest tests/unittest.cc tests/test_kernels.cc
                             marsalgo.cc kernels.cc)
+
+    # CPU microbench for append() and the eval() hinge sweep at a pre-grown
+    # basis (no Eigen/GTest); see the usage comment in the source.
+    add_executable(bench_sweep tests/bench_sweep.cc marsalgo.cc kernels.cc)
+    target_link_libraries(bench_sweep PRIVATE mars_common)
     target_compile_definitions(unittest PRIVATE EIGEN_DONT_PARALLELIZE)
     target_link_libraries(unittest PRIVATE
         mars_common GTest::gtest GTest::gtest_main Threads::Threads)

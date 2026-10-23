@@ -10,11 +10,13 @@
  *  cuda/orthonormalize.cu and are opaque here (PIMPL across the static-lib
  *  boundary).
  *
- *  First pass scope: a GPU drop-in for mars::orthonormalize() only, behind the
- *  `cuda=True` flag on MarsAlgo.eval(). The CPU kernel in kernels.cc stays the
- *  correctness oracle; this path must match it within the f32 storage floor
- *  (~1e-5), which means the T = Boᵀ·Bx contraction MUST accumulate in f64
- *  (cublasDgemm) -- f32 accumulation corrupts the near-zero projection entries.
+ *  Scope: a GPU drop-in for mars::orthonormalize() (the linear_only regime),
+ *  behind the `cuda=True` flag on MarsAlgo.eval(). The CPU kernel in kernels.cc
+ *  stays the correctness oracle; this path must match it within the f32
+ *  storage floor (~1e-5). The T = Boᵀ·Bx contraction is therefore accumulated
+ *  in f64 -- as blocked f32 GEMMs summed in f64 across K-chunks by default, or
+ *  natively with MARS_CUDA_KCHUNK=0 -- because a single f32 accumulation
+ *  corrupts the near-zero projection entries (see orthonormalize.cu).
  */
 
 #include <atomic>
@@ -25,10 +27,11 @@ namespace cuda {
 
 /*
  *  Opaque per-MarsAlgo GPU context. Owns a cuBLAS handle + stream, resident
- *  device copies of B (f32) and Bo (widened to f64), and per-call scratch sized
- *  for up to `max_terms` columns. One context drives one GPU stream's worth of
- *  resident state; it is NOT thread-safe -- the binding serializes the cuda
- *  path to a single host thread.
+ *  device copies of B (f32) and Bo (f32 for the blocked GEMMs, f64 for the
+ *  DGKS retry), the scaled candidate X-columns, and per-call scratch sized for
+ *  the batch capacity. One context drives one GPU stream's worth of resident
+ *  state; it is NOT thread-safe -- the binding serializes the cuda path to a
+ *  single host thread.
  */
 struct Context;
 
@@ -99,10 +102,10 @@ void context_sync_xcols(Context *ctx, size_t p_x,
 /*
  *  GPU counterpart of mars::orthonormalize(). For each j in [0, p):
  *      Bx[:,j]  = B[:, mask[j]] .* x                    (f32 multiply, f32 store)
- *      Bx[:,j] -= Bo * (Boᵀ * Bx[:,j])                  (f64 GEMM, f32 round)
+ *      Bx[:,j] -= Bo * (Boᵀ * Bx[:,j])                  (f64-accumulated T, f32 round)
  *      s        = ||Bx[:,j]||^2  over the rounded f32
  *      Bx[:,j] *= (s > tol) ? 1/sqrt(s + tol) : 0
- *  with one DGKS retry per column whose residual energy is < 1/9 of its
+ *  with one f64 DGKS retry per column whose residual energy is < 1/9 of its
  *  projection energy (matching the CPU gate). Requires context_sync_basis to
  *  have brought columns [0, m) of B/Bo onto the device first.
  *

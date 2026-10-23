@@ -7,6 +7,7 @@
 #include <algorithm>  // fill_n
 #include <cmath>      // sqrt
 #include <cstddef>    // size_t
+#include <vector>
 #if defined(__AVX__)
 #  include <immintrin.h>
 #endif
@@ -185,29 +186,31 @@ inline void compute_BoT_bx_col(
 }
 
 /*
- *  One modified Gram-Schmidt sweep of the single column v against the m
- *  orthonormal columns of Bo (row-major, row stride ldBo): each projection
- *  updates v before the next is computed. Column j of row i is at
- *  Bo[i*ldBo + j], so the per-column walk is strided (cold path -- once per
- *  append). Returns the projected energy sum_j c_j^2 (feeds the DGKS gate).
+ *  One classical Gram-Schmidt pass of the f64 column v against the m
+ *  orthonormal columns of Bo: c = Bo^T v, then v -= Bo c. Both halves walk Bo
+ *  row by row (row-major, stride ldBo), so the whole pass is two streaming
+ *  sweeps over Bo regardless of m -- a per-column walk would touch one cache
+ *  line per row per column (m times the traffic). Returns the projected energy
+ *  sum_j c_j^2 (feeds the DGKS gate) and the residual energy ||v||^2 in v_norm2.
+ *  `c` is an m-length workspace.
  */
-inline double mgs_project_col(
+inline double cgs_project_col(
     size_t n, size_t m,
     double *v,
-    const float *Bo, size_t ldBo)
+    const float *Bo, size_t ldBo,
+    double *c, double &v_norm2)
 {
-    double proj_norm2 = 0.0;
-    for (size_t j = 0; j < m; ++j) {
-        double c = 0.0;
-        for (size_t i = 0; i < n; ++i) {
-            c += (double)Bo[i*ldBo + j] * v[i];
-        }
-        for (size_t i = 0; i < n; ++i) {
-            v[i] -= c * (double)Bo[i*ldBo + j];
-        }
-        proj_norm2 += c * c;
+    std::fill_n(c, m, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        axpy_m(c, Bo + i * ldBo, v[i], m);
     }
-    return proj_norm2;
+    v_norm2 = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double r = v[i] - dot_bo(Bo + i * ldBo, c, m);
+        v[i] = r;
+        v_norm2 += r * r;
+    }
+    return dot_m(c, c, m);
 }
 
 } // namespace
@@ -243,17 +246,9 @@ double orthonormalize_col(
     double tol,
     std::atomic<long> *dgks_counter)
 {
-    /*
-     *  Modified Gram-Schmidt against the m orthonormal columns of Bo, matching
-     *  MarsAlgo::append(): each projection updates v before the next, and the
-     *  projected energy feeds the DGKS gate. See mgs_project_col.
-     */
-    const double proj_norm2 = mgs_project_col(n, m, v, Bo, ldBo);
-
+    std::vector<double> c(m);
     double v_norm2 = 0.0;
-    for (size_t i = 0; i < n; ++i) {
-        v_norm2 += v[i] * v[i];
-    }
+    const double proj_norm2 = cgs_project_col(n, m, v, Bo, ldBo, c.data(), v_norm2);
 
     /*
      *  DGKS retry: re-orthogonalize once when the residual energy is small
@@ -264,11 +259,7 @@ double orthonormalize_col(
         if (dgks_counter) {
             dgks_counter->fetch_add(1, std::memory_order_relaxed);
         }
-        mgs_project_col(n, m, v, Bo, ldBo);
-        v_norm2 = 0.0;
-        for (size_t i = 0; i < n; ++i) {
-            v_norm2 += v[i] * v[i];
-        }
+        cgs_project_col(n, m, v, Bo, ldBo, c.data(), v_norm2);
     }
 
     const double w = std::sqrt(v_norm2);

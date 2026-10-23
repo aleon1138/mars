@@ -1,441 +1,217 @@
 # TODO
 
-Ideas and notes for future performance/quality work — not planned for a specific
+Ideas and notes for future performance/quality work, not planned for a specific
 release. Completed work lives in git history; rejected approaches and why they
-were rejected live in CLAUDE.md's performance notes.
+were rejected live in CLAUDE.md's performance notes. Items are ordered by
+expected value per unit of risk as of the 2026-10-22 review. Timings below are
+single-threaded on the EPYC 9845 server (`tests/bench_sweep`, n=5e5, pinned to
+one core); see the benchmarking note at the end before trusting any A/B.
 
-## I) CUDA port — status
+## 1. Hinge sweep: close the in-situ gap (CPU hinge fits)
 
-The `linear_only` forward pass runs on the GPU behind `fit(cuda=True)` (opt-in
-`-DUSE_CUDA=ON`, `make configure-cuda`); the CPU kernel stays the correctness
-oracle. It beats the 64-core CPU — ~12× over native f64 at n=500k, m=400 on the
-sm_120 server. The design, the f32-GEMM default and its accepted tradeoff, and
-the FP64-emulation rejection are recorded in CLAUDE.md's 2026-06-16 CUDA
-performance note; the full running record is in git history.
+The sweep (`covariates_impl` over sorted rows) is ~75% of `eval(hinge)` at
+m=100–250 and is the dominant cost of a CPU hinge fit. The 2026-10-22 pass made
+it 1.3× faster (4 basis columns per gathered `Bo` row, full-row and gather
+prefetch, 64-byte-aligned `f`/`g`, forced inline) and bit-exact, but left a
+measured, unexplained gap:
 
-**Still pending — the hinge sweep on GPU.** Only `linear_only` is accelerated.
-The hinge sweep (`covariates`, `linear_only=False`) stays on the CPU; porting it
-is a much bigger pass (sorting / segmented scan / per-cut argmax) and is the next
-CUDA frontier.
+| per (sorted row, basis column), m=100            | ns  |
+|--------------------------------------------------|-----|
+| in situ (`eval(hinge)` minus `eval(linear)`)     | 68  |
+| in situ with the gathered values replaced by constants | 31 |
+| standalone microbench, identical loop, same DRAM-resident random `Bo` rows and `b`/`bx`/`y` gathers, prefetched | 23 |
+| same, gathers pre-sorted into sweep order        | 28  |
+| pure compute floor (L1-resident)                 | 20  |
 
-### Production profile + the DGKS retry fix (2026-06-17)
+What was ruled out in situ: memory (the pre-sort gather pass costs 0.09 s of a
+3.1 s sweep; prefetch distance 4/8/16 and first-line vs full-row make no
+difference; `MADV_HUGEPAGE` on `B`/`Bo`/`Bx` did not help; dTLB miss rate is
+*lower* in situ than in the microbench), inlining (+5%), pre-sorting (+10%),
+f/g alignment (20% in the microbench). `perf annotate` spreads the cycles evenly
+over the eight inner-loop instructions (IPC ~1 vs ~3 in the microbench). So the
+in-situ loop body is slow for a reason that is not the memory system.
 
-The headline ~12× (n=500k, m=400, random-`Bo` bench) did **not** transfer to a
-real production fit (n≈700k, m=250, correlated features): only ~2× over the CPU.
+**Next step:** bisect between `tests/bench_sweep.cc` and a standalone copy of
+the loop, one difference at a time: the `thread_local Scratch*` indirection; the
+per-column pointer/accumulator arrays (`k0..vb[JB]` cannot stay in registers
+while `jj` is a runtime loop — unroll `jj` by `JB` with a compile-time count);
+the `on_grid` branch and `<true>` instantiation; the `nz`/`done` bookkeeping;
+`_tol`/`hinge_sse` double stores forcing reloads. Expected gain if the
+microbench number is reached: ~2.5× on the sweep, ~2× on a CPU hinge fit.
 
-**Diagnosis.** `MARS_CUDA_PROFILE=1` — per-phase GPU `cudaEvent` timers + host
-sync timers dumped at `context_destroy`, plus a Python `fit()`
-eval-vs-orchestration split; both gated on the env var, zero overhead when unset
-— localized it immediately: the DGKS re-orthogonalization retry was **75% of GPU
-time (88.9s of 119s)**, fired 20,921×.
+## 2. CUDA: the hinge sweep
 
-**Root cause.** The `fired>0` branch in `project_reduce` recomputed the WHOLE
-candidate block in native f64 (`CUBLAS_COMPUTE_64F`, the weak ~1.44 TFLOP/s path)
-whenever *any* column tripped the gate, then discarded all but the flagged
-columns. Correlated/collinear production features fire the gate constantly; the
-random-`Bo` benches never hit it (the gate "stays quiet" by construction — see
-`tests/bench_ortho`), so the single most expensive path was dormant in every
-benchmark. This is the trap: **the perf benchmark must exercise DGKS**, or it
-measures a code path production never takes.
+Only `linear_only` runs on the GPU (`fit(cuda=True)`); the hinge sweep stays on
+the CPU. Porting it is a much bigger pass (sort / segmented scan / per-cut
+argmax) and the next CUDA frontier. With `append()` now 15× faster on the CPU
+(it had become the dominant per-epoch cost under the GPU path), re-profile a
+production `linear_only` fit with `MARS_CUDA_PROFILE=1` before deciding; the
+GPU phases were flat (T GEMM 28%, round/norm 24%, fill 23%, DGKS 19%,
+projection 6%) and Python orchestration ~16% as of 2026-06-17.
 
-**Fix (commit `3d27433`).** Surgical retry: gather only the `fired` flagged
-columns into a compact n×fired f64 buffer (`gather_widen_kernel`, reusing the
-dead `dBx_f64`), run the two f64 retry GEMMs at width `fired` instead of P
-(reusing `dT`), then round + scatter the refined columns back to their global
-slots (`round_reduce_scatter_kernel`). Cost now scales with the rare cancelling
-columns, not the batch width. Per-column math is unchanged → oracle-faithful (not
-bit-identical: cuBLAS may select a different GEMM kernel at width `fired` vs P,
-differing at f64 ULP, well inside the 1e-5 f32 floor). New test
-`BatchDgksRetryMatchesPerColumn` forces interleaved fires through the batched
-path — which nothing covered before.
+Lesson kept from that profile (commit `3d27433`): the random-`Bo` benches never
+fire the DGKS retry, so a perf benchmark must exercise it or it measures a path
+production never takes. `CudaKernelsTest.BatchDgksRetryMatchesPerColumn` covers
+the batched retry.
 
-**Result.** Production fit **130.5s → 48.4s (2.70×)**; DGKS phase 88.9s → 7.2s
-(12.3× less, same 20,921 fires); roughly **~2× → ~5.4× vs the 64-core CPU**.
+Small CUDA items, all untested on-device until the GPU is free:
 
-**Where the time goes now (flat — no dominant phase):** T GEMM 28%, round/norm
-24%, fill 23%, DGKS 19%, projection 6%. Remaining levers, all diminishing returns:
-
-- **`fill` f64-write drop (~7% of fit).** `fill` writes both an f32 and an f64
-  copy of `Bx` (~20 B/elem). On the default blocked-f32 path the f64 copy is
-  consumed only by `round_reduce` (as the original `B·x` for the f32-projection
-  subtract) and could instead read the intact f32 `dBx_f32` and widen at load —
-  bit-identical, drops `fill` to ~12 B/elem. Delicate precision/aliasing change
-  for a small slice; low ROI.
-- **Orchestration is now ~16% (Amdahl).** ~132 ms/epoch of Python, dominated by
-  the per-epoch `bmask` list-comprehensions (see "Python scalar loop builds
-  `bmask`" below) and the user `xfilter`. Best *risk-adjusted* next target — it's
-  outside the precision-sensitive core and grows in relative cost as the GPU
-  speeds up.
-- **DGKS 19%** is now genuine f64 re-orthogonalization of real near-collinear
+- **Deterministic reductions.** `round_reduce_kernel` sums `ds`/`ybx_raw` with
+  f64 `atomicAdd` across up to 64 row tiles, so GPU results vary at f64 ULP from
+  run to run (not just vs the CPU). A per-tile partials buffer (64×P doubles)
+  plus a fixed-order second pass makes them reproducible; cheap.
+- **`fill` f64-write drop (~7% of GPU time).** `fill` writes both an f32 and an
+  f64 `Bx`; on the blocked-f32 path the f64 copy is read only by `round_reduce`
+  as the minuend of the fused subtract. Reading the f32 `Bx` instead needs the
+  f32 projection to land in its own buffer (it currently overwrites `dBx_f32`).
+  Bit-identical result, delicate aliasing change, low ROI.
+- **`context_sync_basis` host gather.** The new `Bo` column is gathered on the
+  host from the row-major `Bo` (one cache line per row); `append()` has the same
+  column contiguous as f64 `v` just before scattering it. Staging a contiguous
+  f32 copy on `MarsData` and uploading that avoids the gather. A few ms/epoch.
+- **DGKS 19%** is genuine f64 re-orthogonalization of real near-collinear
   columns; cutting it further needs an algorithmic change (re-orthogonalize
-  against only the relevant `Bo` columns) — high risk for the remaining slice.
+  against only the relevant `Bo` columns). High risk for the remaining slice.
 
-## II) Phase 1 GEMM (`T = Boᵀ·Bx`) is store-port-bound
+## 3. Orthonormalize Phase 1/2a GEMMs are store-port-bound (CPU)
 
-**Finding:** Phase 1 of `orthonormalize()` (the `axpy_m` sweep building
-  `T = Boᵀ·Bx`) is limited by store-port throughput, not DRAM bandwidth or FMA.
-  It writes a `T` element on ~every FMA, and x86 retires only ~1 store/cycle.
-  Keeping `i` outermost gives the *optimal* DRAM pattern (`Bo`/`Bx` read exactly
-  once), but then `T` (m×p f64, ~80 KB at m=p=100) can't live in registers, so
-  the per-FMA store is unavoidable.
+`eval(linear)` is 1.14 s at n=5e5, m=100 and 5.8 s at m=250 (23 ms per basis),
+~2.6× off the FMA bound. Phase 1 (`axpy_m` building `T = Boᵀ·Bx` with `i`
+outermost) stores a `T` element on every FMA and x86 retires ~1 store/cycle;
+Phase 2a is load-bound the same way. Keeping `i` outermost reads `Bo`/`Bx`
+exactly once, but `T` (m×p f64) cannot live in registers.
 
-**Fix:** A register-tiled, `i`-blocked GEMM — hold a `T` tile in YMM
-  accumulators across an `i`-panel, and block `i` into L2-sized chunks so the
-  `Bo`/`Bx` panels are re-read from L2 (cheap) instead of re-storing `T` from
-  the hot loop. That removes the store-port bottleneck.
+**Fix:** an `i`-blocked, register-tiled kernel: hold a `T` tile in YMM
+accumulators across a panel of 8–16 rows, so each `T` load/store serves 8–16
+FMAs and the `Bo` panel is re-read from L1. Same shape for Phase 2a. ~100 lines
+of AVX with three tail cases; tune the panel on the server (the arm64 dev box
+takes the scalar path).
 
 **Why it can't just call BLAS:** `Bo`/`Bx` are f32 storage but `T` must
-  accumulate in f64 (the precision contract behind narrowing the big buffers).
-  `sgemm` accumulates in f32; `dgemm` needs f64 inputs. The f32-in/f64-accumulate
-  combo has no library primitive — hence the hand-rolled widening kernels.
+accumulate in f64 (the precision contract behind the f32 buffers); `sgemm`
+accumulates in f32 and `dgemm` needs f64 inputs.
 
-**Why deferred:** ~100 lines of intricate AVX with three levels of edge handling
-  (i/k/j tails) plus hardware-specific tile tuning (i-panel size for L2, the
-  register tile). The AVX-512 experiment (see CLAUDE.md, 2026-05-16) showed
-  these kernels go port/setup-bound, so the win may evaporate.
+**Value:** the whole cost of CPU `linear_only` (production uses the GPU there)
+and ~25% of a hinge eval. Expected ~2× on Phase 1/2a.
 
-**Before investing:** profile Phase 1's actual share of `eval()` on the EPYC
-  server — the hinge sweep and Phase 2a are comparable O(n·p·m) costs, so Phase 1
-  may not dominate. Only worth the complexity if it's a hot fraction. If you do
-  it, validate the AVX path + tune tiles on the server; it can't be exercised on
-  the arm64 dev box.
+## 4. Python orchestration: `bmask` list comprehensions
 
-## III) `argsort` redone on every `eval()` call
+`fit()` rebuilds the mask each epoch with two Python list comprehensions per
+input (`basic_filter`, `aux_filter`) over all bases; ~130 ms/epoch on the
+production fit, ~16% under the GPU path and growing as the GPU gets faster.
+Precompute per epoch `degree = [len(b) for b in basis]` and a `(p, M)` bool
+`contains[i, k] = (i in basis[k])`, then vectorize the basic filter:
 
-**Location:** the `argsort()` call in `MarsAlgo::eval()` (`marsalgo.cc`).
-
-**Issue:** Per-xcol sort order depends only on `X`, which is immutable for the
-  lifetime of `MarsAlgo`. Yet `argsort()` runs again every epoch for every
-  candidate column.
-
-**Constraint:** A full `p × n` int32 cache is 4·p·n bytes -- 2.4 GB for the
-  n=6M, p=100 case. Although feasible to cache everything, it seems wasteful.
-
-**Fix:** A Fast-MARS LRU sized to the current `max_inputs` cap covers the inputs
-  we actually re-evaluate. Eviction by age matches Friedman's Fast-MARS
-  recipe.
-
-## IV) Python scalar loop builds `bmask` each epoch
-
-**Location:** `mars.py:306-308` (the `for i in input_to_use:` loop in `fit()`).
-
-**Issue:**
-```python
-for i in input_to_use:
-    bmask[i] &= np.array([basic_filter(i, b) for b in basis])
-    bmask[i] &= np.array([aux_filter(i, b) for b in basis])
-```
-Two Python list comprehensions per input per epoch. For `len(input_to_use)`
-× `len(basis)` in the hundreds-to-thousands, this is the dominant cost on
-the Python side.
-
-**Fix:** Precompute once per epoch:
-- `degree = np.array([len(b) for b in basis])` (M,)
-- `contains[i,k] = (i in basis[k])` (p, M) -- bool sparse, O(p·M)
-
-Then:
 ```python
 bmask &= (degree[None, :] < max_degree) & (~contains | self_interact)
 ```
-Vectorized in numpy. `aux_filter` is user-supplied so it has to stay scalar,
-but the basic filter is the hot one.
 
-## V) MARS algorithmic improvements
+`aux_filter` is user-supplied and stays scalar, but call it only on the entries
+still true after the basic filter.
 
-The underlying motivation across all three is the same observation: stock MARS
-becomes numerically unreliable at interaction order $\geq 3$ on correlated
-features. The Gram matrix loses effective rank, GCV rankings become noisy, and
-the backward pass cannot be trusted to remove redundant terms. Each item below
-addresses some part of that failure chain.
+## 5. MARS algorithmic improvements
 
-### 1. Fix `endspan` logic
+Motivation: stock MARS becomes numerically unreliable at interaction order ≥ 3
+on correlated features — the Gram matrix loses effective rank, GCV rankings get
+noisy, and the backward pass cannot be trusted to remove redundant terms.
 
-Applied at the **boundaries** of the data: minimum gap between the
-smallest/largest data point and the first/last candidate knot for each
-variable.
+Two concrete data points from the 2026-10-22 review, to re-check the symptom
+against before investing here:
 
-Boundary knots are asymmetrically dangerous. A hinge with knot $t$ near $\min
-(x_v)$ has support $[t, \infty)$ that extends past every data point — it will
-dominate extrapolation at the boundary even though it's supported by very few
-in-sample observations. The cost of a bad boundary knot is therefore much
-higher than the cost of a bad interior knot, which justifies a separate
-(and larger) gap.
+- The hinge sweep *was* selecting numerically-in-span cuts (den/‖h+‖² ~ 1e-11,
+  spurious gain up to 1e-2, above legitimate cuts) whenever the cut passed
+  below a small-support parent. Order-≥3 parents have the smallest support, so
+  they were hit most. Now gated (CLAUDE.md, 2026-10-22). Re-run the failing
+  cases first; part of the symptom may be gone.
+- A plain hinge fit (n=2e5, p=40, 41 terms, then `prune`) kept four hinges of
+  the same input at adjacent tail knots (1.83, 1.92, 2.01, 2.07) on one parent
+  with coefficients −21, +165, −350, +211: knots placed `min_span` apart across
+  *epochs* on the same (input, parent), fitting a wiggle in a 2% tail. This is
+  the failure chain items 1–2 below target (nothing forbids a new knot next to
+  an existing one on the same input/parent; `end_span` is a fraction of n, not
+  Friedman's formula).
 
-Friedman's default formula:
+### 5.1 Fix `endspan`
 
-$$
-\text{endspan} = 3 - \log_2(\alpha / d)
-$$
+Applied at the boundaries of the data: the minimum gap between the
+smallest/largest data point and the first/last candidate knot per variable.
+Boundary knots are asymmetrically dangerous: a knot near min(x) has support
+reaching past every data point and dominates extrapolation while being backed
+by few observations. Friedman's default:
 
-where $d$ is the number of input variables and $\alpha$ is the same small
-probability as in `minspan` (default 0.05). Note this is a fixed constant plus
-a $\log d$ correction — it does not depend on $N$. Typical values are in the
-range 10–30.
+$$\text{endspan} = 3 - \log_2(\alpha / d)$$
 
-Things to audit when you get back to this:
+with $d$ the number of inputs and $\alpha$ the same small probability as in
+`minspan` (0.05): a constant plus a $\log d$ correction, independent of $N$,
+typically 10–30 samples. Today `tail_span` is a *fraction* of n (2% → 10k rows
+at n=5e5). Audit: scale with $d$ per the formula; apply `endspan` and `minspan`
+together (`sorted_x[endspan : N - endspan : minspan]`); consider a minimum gap
+to knots already in the model on the same (input, parent).
 
-- Check that `endspan` scales with $d$ (number of input variables) per the
-  formula, not just $N$ or constants.
-- Check that `endspan` and `minspan` are **both** applied — the slice should
-  be `sorted_x[endspan : N - endspan : minspan]`, not one or the other.
+### 5.2 Knot tuning: 1-D refinement after each forward pick
 
-### 2. Knot tuning — 1D refinement after each forward pick
+After the forward pass picks $t^*$ from the discrete grid, refine it by a line
+search (Brent / golden section) for the RSS-minimizing position in
+$(\tau_{i-1}, \tau_{i+1})$. Friedman rejected this in 1991 on cost; with cached
+partial residuals each evaluation is $O(M)$ incremental and Brent converges in
+5–10 steps, so it is sub-millisecond even at $N = 10^6$. Bakin/Hegland/Osborne
+(2000) report it improves forward-pass quality. Validate on a signal with a knot
+at a non-grid position (e.g. $f(x) = 1[x > 0.4137]$ with a quantile grid that
+misses it): same test MSE with fewer terms. Do after 5.1.
 
-After the forward pass picks a knot $t^* \in \{\tau_i\}$ from the discrete
-candidate grid, do a local 1D line search to refine $t^*$ to the RSS-minimizing
-position in the open interval $(\tau_{i-1}, \tau_{i+1})$. Brent's method or
-golden-section search both work; bracket is the two adjacent grid points.
+### 5.3 BMARS basis reformulation
 
-Friedman discussed and rejected knot tuning in 1991 on cost grounds — the line
-search is $\mathcal{O}(N)$ per step and he wanted forward selection cheap. On
-modern hardware (especially with cached partial residuals from the fast-MARS
-framework already being used), each line search is sub-millisecond even for $N
-= 10^6$. The cost calculus is inverted.
+A change of basis internal to the linear algebra: the user still sees hinge
+terms and the API/serialization are unchanged, but the matrices factored and
+updated are formed in a compactly-supported linear B-spline basis per variable
+(tent functions on a quantile knot grid, $K_v \in [64, 256]$), where the Gram
+is banded and well conditioned. Any grid-knot hinge is an exact combination of
+two adjacent B-splines plus a global linear term (de Boor §IX), so a
+precomputed banded change-of-basis $W^v$ maps hinges to B-spline coefficients;
+tensor-product interactions use the Kronecker factors applied as banded
+matvecs, never materialized. Items 5.1–5.2 reduce the *frequency* of
+conditioning failures; this removes the cause (unbounded hinge support).
 
-Bakin/Hegland/Osborne (2000) re-investigated this in the BMARS paper and
-reported it improves the forward-pass quality. They have a figure
-"Results of experiment with knot tuning procedure" in the published version.
+Stage it: (a) univariate linear B-splines, snap-to-grid knots, replace only the
+forward-pass inner products — must match hinge MARS to machine precision on
+well-conditioned data; (b) tensor-product interactions (the Kronecker matvec is
+the only new piece); (c) knot tuning in the B-spline basis; (d) optionally
+quadratic B-splines for $C^1$. Keep the hinge representation primary (store and
+serialize hinges, derive B-spline coefficients); add an explicit linear term so
+boundary half-tents extrapolate cleanly; unit-test $B_j(x) = \beta_j^\top
+\Phi(x)$ pointwise. Validate in three regimes: well-conditioned low order
+(match), ill-conditioned order 4 on shared-factor features (hinge GCV path
+plateaus and spikes, B-spline path smooth), and a real surface under bootstrap
+(more stable selected terms). A multi-month project; keep the hinge path as the
+oracle throughout.
 
-After the discrete pick, you have:
+## Dropped
 
-- The chosen variable $v$ and the chosen grid knot $\tau_i$.
-- The current basis $\{B_1, \ldots, B_M\}$ and the residual vector $r$ from
-  the previous step.
-- Cached $\langle B_j, B_{M+1}(t)\rangle$ for the candidate basis function
-  $B_{M+1}(t) = (\text{parent}) \cdot (x_v - t)_+$.
+- **`argsort` LRU cache (Fast-MARS).** `argsort` is now an O(n) stable radix
+  sort (~5 ms at n=5e5 vs 51 ms for the indirect `stable_sort`); caching
+  permutations no longer pays for its memory.
+- **Row-order sensitivity of the constructor reductions.** They are f64 sums
+  (~√n·eps_f64); the row-order dependence `tests/repro_shuffle.py` measures
+  comes from tie-breaking in the sort (by row index), not from these.
 
-Define $\rho(t) = \text{RSS}$ when $B_{M+1}(t)$ is added to the model with
-its optimal least-squares coefficient. This is a smooth function of $t$ on
-$(\tau_{i-1}, \tau_{i+1})$ (the breakpoint at $\tau_i$ is removed when you
-allow $t$ to move continuously). Run Brent on $\rho(t)$ in that interval.
+## Benchmarking note
 
-Cost analysis: each evaluation of $\rho(t)$ at a new $t$ requires recomputing
-the inner products $\langle B_j, B_{M+1}(t)\rangle$ for $j = 1, \ldots, M$
-and $\langle y, B_{M+1}(t)\rangle$. That's $\mathcal{O}(MN)$ if done naively,
-but only the data points in the support of $B_{M+1}(t)$ contribute and the
-support changes incrementally with $t$ — so with sorted indexing you can
-update incrementally in $\mathcal{O}(M)$ per Brent step. Brent typically
-converges in 5–10 steps. Total added cost per forward step:
-$\mathcal{O}(M)$ in the best case, $\mathcal{O}(MN/K)$ if you're lazy where
-$K$ is the candidate grid size.
-
-Do this **after** (1) is working — knot tuning amplifies the quality of
-the discrete pick, which itself depends on a clean candidate filter. Wire
-in the line search as a refinement step that runs after the discrete
-forward pass and before committing the basis function.
-
-Validation: Same setup as before. With knot tuning on, the test-set MSE should
-improve at fixed $M$ (model size). Equivalently, you should reach the same MSE
-with fewer basis functions. The improvement is largest when the underlying
-signal has knot-like discontinuities at non-grid positions(easy to construct
-synthetically: $f(x) = \mathbb{1}[x > 0.4137]$ and let the grid be aligned to
-quantiles that don't include 0.4137).
-
-### 3. BMARS basis reformulation
-
-A change of basis that's **purely internal to the linear algebra**. The user
-still sees a hinge-basis MARS model, the API and serialization are
-unchanged, but the matrices you actually factor and update are formed in a
-compactly-supported B-spline basis where the Gram is banded and well-
-conditioned.
-
-Items (1)–(2) reduce the *frequency* of conditioning failures. They don't
-fix the underlying problem, which is that truncated power basis functions
-$(x - t)_+$ have **unbounded support** — they grow without bound for
-$x > t$. Every pair of such basis functions has substantial overlap in
-their tails, and at high interaction order the joint support is enormous.
-
-B-splines have **compact support** — they are exactly zero outside a bounded
-interval. Two B-splines have non-zero inner product only if their supports
-physically overlap. The Gram matrix becomes banded (1D) or sparse with
-structured nonzero pattern (tensor product). Sparse Cholesky on the B-spline
-Gram is numerically much better-behaved than dense Cholesky on the hinge
-Gram, and the gap *widens* with interaction order rather than narrowing.
-
-For each variable $v$, set up an internal linear B-spline basis
-$\{\phi_1^v, \ldots, \phi_{K_v}^v\}$ on a knot grid
-$\tau_1^v < \tau_2^v < \cdots < \tau_{K_v}^v$. Choose the grid once at
-startup as evenly-spaced quantiles of $x_v$. $K_v \in [64, 256]$ is plenty
-for typical financial features.
-
-A linear B-spline $\phi_i^v$ centered at $\tau_i^v$ is the tent function
-
-$$
-\phi_i^v(x) = \begin{cases}
-(x - \tau_{i-1}^v) / (\tau_i^v - \tau_{i-1}^v) & \tau_{i-1}^v \leq x \leq \tau_i^v \\
-(\tau_{i+1}^v - x) / (\tau_{i+1}^v - \tau_i^v) & \tau_i^v \leq x \leq \tau_{i+1}^v \\
-0 & \text{otherwise}
-\end{cases}
-$$
-
-The key identity: any hinge $(x_v - \tau_i^v)_+$ with knot at a grid point
-can be written exactly as a linear combination of two adjacent B-splines
-plus a global linear term:
-
-$$
-(x_v - \tau_i^v)_+ \;=\; \alpha_i \cdot x_v + \beta_i + \sum_{j \geq i} w_j^{(i)} \, \phi_j^v(x_v)
-$$
-
-The weights $w_j^{(i)}, \alpha_i, \beta_i$ are determined by matching values
-at the grid points. Precompute these once at startup. Stack into a
-lower-triangular banded matrix $W^v \in \mathbb{R}^{K_v \times K_v}$.
-
-For tensor-product hinges (interactions), the joint expansion is the tensor
-product of the univariate expansions. The change-of-basis matrix is
-$W^{v_1} \otimes W^{v_2} \otimes \cdots \otimes W^{v_k}$, but you never
-materialize the Kronecker product — apply the factors as a sequence of
-banded matvecs.
-
-#### Algorithm
-
-1. **Startup (once)**:
-   - For each variable $v$: compute knot grid $\{\tau_i^v\}$ as quantiles.
-   - Build $\Phi^v \in \mathbb{R}^{N \times K_v}$, the B-spline design matrix.
-     Each row has at most 2 nonzeros; store sparse.
-   - Compute $\Phi^{v\top}\Phi^v \in \mathbb{R}^{K_v \times K_v}$ — banded.
-   - Compute the change-of-basis matrix $W^v$.
-
-2. **Forward pass**:
-   - Each existing hinge basis function $B_j$ is stored *additionally* as a
-     coefficient vector $\beta_j$ in the (tensor) B-spline basis.
-   - To evaluate a candidate hinge $B_{M+1}$: compute its $\beta_{M+1}$ via
-     the change-of-basis identity (cheap, sparse).
-   - Inner products: $\langle B_j, B_{M+1}\rangle = \beta_j^\top G \beta_{M+1}$
-     where $G$ is the (precomputed, banded) B-spline Gram. Banded matvec.
-   - Run the standard fast-MARS rank-1 update for the RSS reduction, but
-     using these Gram entries instead of dense ones.
-   - The internal Cholesky factor is on the B-spline Gram, not the hinge Gram.
-
-3. **Backward pass / GCV**:
-   - Unchanged in structure. The rank-1 downdates now operate on the
-     well-conditioned B-spline Gram, so GCV rankings are trustworthy.
-
-4. **Output**:
-   - Return the model in hinge form for interpretability and API
-     compatibility. The B-spline representation is purely internal.
-
-### Why "minimum viable cut" matters
-
-Don't try to do the full thing in one go. Stage it:
-
-**Stage 3a — univariate, linear B-splines, snap-to-grid knots.**
-~A few hundred lines. Replaces just the inner-product computation in the
-forward pass for univariate (non-interaction) terms. Validate on the
-Friedman benchmark — should match standard MARS to machine precision on
-well-conditioned cases and outperform it on ill-conditioned ones.
-
-**Stage 3b — extend to tensor-product interactions.**
-The Kronecker matvec is the only really new piece. Cost per inner product
-for an order-$k$ interaction is $\mathcal{O}(k \cdot K \cdot \text{nnz})$,
-which beats the hinge version's dense $\mathcal{O}(N)$ for any $K \ll N$.
-
-**Stage 3c — integrate with knot tuning (item 2).**
-Knot tuning in the B-spline basis is a 1D line search over the
-representation coefficients $\beta$, which is even cheaper than in the
-hinge basis because the support is bounded.
-
-**Stage 3d (optional) — quadratic B-splines for $C^1$ continuity.**
-This recovers Friedman's cubic-smoothing benefit (BMARS as published is
-purely $C^0$). A hinge isn't exactly representable in quadratic B-splines
-on a finite grid, but the error is a piecewise-quadratic correction that
-can be absorbed into the basis. Probably not worth doing until 3a–3c are
-solid and you have a concrete need for $C^1$.
-
-### Practical complications
-
-**Knot grid resolution vs. accuracy.** Snapping candidate knots to a grid
-of $K$ points gives up Friedman's continuous knot search. In practice this
-is fine — Friedman's own fast-MARS does subsampling that's morally
-equivalent — and item (2) above (knot tuning) gives you sub-grid resolution
-back where it matters.
-
-**Boundary handling.** Linear B-splines at the edges of the grid are
-half-tents. Add an explicit linear term to the basis to handle extrapolation
-cleanly, otherwise candidates near the boundary look weird.
-
-**The $W^v$ change-of-basis matrices.** Precompute once. Watch for
-off-by-one errors in the Kronecker composition for interactions — write
-unit tests that verify $B_j(x) = \beta_j^\top \Phi(x)$ pointwise on a
-random sample of $x$ values.
-
-**Hinge-basis interpretability.** Don't lose this. Always store the hinge
-representation as the primary; the B-spline coefficients are derived. When
-serializing fitted models, serialize the hinges. When loading, recompute
-the B-spline coefficients from the hinges.
-
-### Stack-specific notes
-
-- Blaze `CompressedMatrix` handles the banded B-spline Gram cleanly. The
-  existing `LLT` factorization works without modification.
-- The Kronecker matvecs for tensor-product interactions are inner-loop
-  AVX-512 candidates. Sort the B-spline support by knot index so memory
-  access is contiguous; this is essentially free cache-friendliness.
-- The f64 accumulation refactor done for the cross-machine (i7-7820X vs
-  EPYC 9845) divergence issue is more useful here than in the original code,
-  because the hinge-basis Gram was throwing away precision before the
-  accumulation step — so f64 accumulation was a partial fix. With B-spline
-  basis the conditioning win compounds with the accumulation precision win.
-- BLIS gives the dense ops for the final QR/Cholesky on the active model;
-  banded structure mostly bypasses BLAS in favor of hand-rolled banded
-  kernels. Worth profiling.
-
-### Validation
-
-Three regimes to test:
-
-1. **Well-conditioned, low-order**: fit standard Friedman benchmark with
-   $k=2$ interactions. B-spline backend should match hinge backend to
-   machine precision on test MSE.
-
-2. **Ill-conditioned, high-order**: construct a synthetic with $k=4$
-   interactions on highly correlated features (e.g., features generated as
-   $x_i = z + \epsilon_i$ for shared $z$). Hinge backend's GCV path should
-   show the characteristic noisy-plateau-then-spike pattern as conditioning
-   fails. B-spline backend's GCV path should be smooth and monotone in the
-   forward phase.
-
-3. **Real data**: pick one of the binance execution-cost surfaces. Compare
-   hinge backend vs B-spline backend on test-set MSE and on the stability
-   of the fitted model under bootstrap resampling. The B-spline backend
-   should produce models that are more stable across bootstrap samples
-   (fewer different basis functions selected), which is the practical
-   manifestation of better conditioning.
-
----
-
-## Implementation order
-
-1. **Item 1 (`endspan` audit/fix)** — easiest first improvement; catches
-   regressions in the candidate-generation code path. Do this first.
-2. **Item 2 (knot tuning)** — depends on (1) being correct. Independent
-   of item 3.
-3. **Item 3a (univariate BMARS)** — biggest win, but most invasive.
-   Validate against items 1–2 in well-conditioned regime first.
-4. **Item 3b (tensor-product BMARS)** — extension of 3a.
-5. **Item 3c (knot tuning in B-spline basis)** — composition step.
-6. **Item 3d (quadratic B-splines)** — only if needed.
-
-Items 1 and 2 can each ship as standalone improvements with their own
-benchmarks. Item 3 is a multi-month project; stage it carefully and keep the
-hinge-basis code path working as the validation oracle.
-
----
+On the shared EPYC server, timings differ by ±20% between cores and between
+concurrent runs — enough to invert small A/B results. Build each variant as its
+own binary, `taskset -c <one core>`, run variants back to back on that core,
+and diff `bench_sweep`'s dump files for bit-exactness. The bench's basis must
+stay well conditioned (random hinges on random parents make the summed
+delta-SSEs noise-dominated and useless for A/B).
 
 ## References
 
 - Friedman, J.H. (1991), "Multivariate Adaptive Regression Splines",
-  *Annals of Statistics* 19(1):1–141. The original paper. `minspan` and
-  `endspan` formulas are in §3. Knot tuning is discussed and rejected
-  in §3.5 on cost grounds.
-
-- Friedman, J.H. (1993), "Fast MARS", Stanford Tech Report LCS110.
-  Cached partial residuals; the rank-1 update framework you're already
-  using.
-
-- Bakin, S., Hegland, M., Osborne, M.R. (2000), "Parallel MARS Algorithm
-  Based on B-splines", *Computational Statistics* 15:463–484. The BMARS
-  paper. Has the knot-tuning experiment for B-spline basis.
-
-- For the change-of-basis identity between truncated powers and B-splines:
-  de Boor, "A Practical Guide to Splines" (revised ed., 2001), §IX.
-  Standard reference; the identity is classical.
+  *Annals of Statistics* 19(1):1–141. `minspan`/`endspan` in §3; knot tuning
+  discussed and rejected in §3.5 on cost grounds.
+- Friedman, J.H. (1993), "Fast MARS", Stanford Tech Report LCS110. Cached
+  partial residuals; the rank-1 update framework used here.
+- Bakin, S., Hegland, M., Osborne, M.R. (2000), "Parallel MARS Algorithm Based
+  on B-splines", *Computational Statistics* 15:463–484. The BMARS paper, with
+  the knot-tuning experiment.
+- de Boor, "A Practical Guide to Splines" (revised ed., 2001), §IX: the
+  truncated-power ↔ B-spline change of basis.

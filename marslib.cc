@@ -60,7 +60,7 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
 
     int n_procs = omp_get_num_procs();
     threads = threads <= 0? std::min(64, n_procs) : std::min(threads, n_procs);
-    threads = std::min<int>(threads, mask_rows);
+    threads = std::max<int>(1, std::min<int>(threads, mask_rows));
 
     /*
      *  The CUDA orthonormalize context is shared, single-stream and not

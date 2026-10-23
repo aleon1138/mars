@@ -1,3 +1,5 @@
+#pragma once
+
 #include <stdexcept>
 #include <cstddef>  // size_t
 
@@ -11,7 +13,11 @@ inline void verify(bool check, const char *msg)
 // Opaque GPU context (see cuda/mars_cuda.h). Forward-declared unconditionally so
 // this header stays identical whether or not MARS_USE_CUDA is defined; the
 // pointer is null and never dereferenced in a non-CUDA build.
-namespace mars { namespace cuda { struct Context; } }
+namespace mars {
+namespace cuda {
+struct Context;
+}
+}
 
 class MarsAlgo {
     struct MarsData *_data = nullptr;
