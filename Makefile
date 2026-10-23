@@ -2,7 +2,8 @@
 #
 #   make                 CPU-only build; drops marslib*.so at the source root
 #   make cuda            one-shot GPU build (configure with CUDA + build)
-#   make test            build, then run the C++ unit tests and pytest
+#   make test            build, then run the C++ unit tests (+ CUDA tests if
+#                        built), then pytest
 #   make configure-cuda  reconfigure with the GPU kernels only (no build)
 #   make format          astyle all .h/.cc
 #   make clean           remove build/ and the built .so
@@ -38,8 +39,15 @@ cuda: configure-cuda
 configure-cuda:
 	cmake -S . -B $(BUILD_DIR) -DBUILD_TESTING=ON -DUSE_CUDA=ON
 
+# test_cuda only exists in a USE_CUDA configure (`make cuda`); run it when it's
+# there. The binary itself GTEST_SKIPs every case if no GPU is visible.
 test: all
 	$(BUILD_DIR)/unittest
+	@if [ -x $(BUILD_DIR)/test_cuda ]; then \
+		$(BUILD_DIR)/test_cuda; \
+	else \
+		echo "[make test] $(BUILD_DIR)/test_cuda not built - skipping CUDA tests"; \
+	fi
 	python3 -m pytest tests/ -v
 
 format:

@@ -25,6 +25,7 @@ Typical wrappers
     # 5. per-callsite allocation tally
     heaptrack python tests/bench_eval.py
 """
+
 import argparse
 import os
 import resource
@@ -55,6 +56,7 @@ def rss_kb():
 
 
 def main():
+    # fmt: off
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=100_000)
     ap.add_argument("--p", type=int, default=200)
@@ -71,27 +73,44 @@ def main():
                          "(requires a CUDA build; set MARS_CUDA_BLOCK_GB / "
                          "MARS_CUDA_VERBOSE to tune/inspect)")
     args = ap.parse_args()
+    # fmt: on
 
     X, y = make_data(args.n, args.p, args.seed)
-    print(f"# n={args.n} p={args.p} max_terms={args.max_terms} threads={args.threads}"
-          f"  linear_only={args.linear_only}  cuda={args.cuda}"
-          f"  MALLOC_ARENA_MAX={os.environ.get('MALLOC_ARENA_MAX', 'default')}"
-          f"  LD_PRELOAD={os.environ.get('LD_PRELOAD', '')}")
+    print(
+        f"# n={args.n} p={args.p} max_terms={args.max_terms} threads={args.threads}"
+        f"  linear_only={args.linear_only}  cuda={args.cuda}"
+        f"  MALLOC_ARENA_MAX={os.environ.get('MALLOC_ARENA_MAX', 'default')}"
+        f"  LD_PRELOAD={os.environ.get('LD_PRELOAD', '')}"
+    )
 
     if args.warmup:
-        mars.fit(X[:1000], y[:1000], max_terms=5, threads=args.threads,
-                 linear_only=args.linear_only, cuda=args.cuda)
+        mars.fit(
+            X[:1000],
+            y[:1000],
+            max_terms=5,
+            threads=args.threads,
+            linear_only=args.linear_only,
+            cuda=args.cuda,
+        )
 
     rss_before = rss_kb()
     for i in range(args.repeat):
         t0 = time.perf_counter()
-        model = mars.fit(X, y, max_terms=args.max_terms, threads=args.threads,
-                         linear_only=args.linear_only, cuda=args.cuda)
+        model = mars.fit(
+            X,
+            y,
+            max_terms=args.max_terms,
+            threads=args.threads,
+            linear_only=args.linear_only,
+            cuda=args.cuda,
+        )
         dt = time.perf_counter() - t0
-        print(f"run {i+1}/{args.repeat}: {dt:.2f}s  M={len(model)}"
-              f"  ms/term={1000*dt/max(len(model),1):.0f}"
-              f"  peak_rss={rss_kb()/1024:.0f} MB"
-              f"  Δrss={(rss_kb()-rss_before)/1024:+.0f} MB")
+        print(
+            f"run {i + 1}/{args.repeat}: {dt:.2f}s  M={len(model)}"
+            f"  ms/term={1000 * dt / max(len(model), 1):.0f}"
+            f"  peak_rss={rss_kb() / 1024:.0f} MB"
+            f"  Δrss={(rss_kb() - rss_before) / 1024:+.0f} MB"
+        )
 
 
 if __name__ == "__main__":

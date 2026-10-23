@@ -34,3 +34,11 @@ minimum-version = "0.10"
 cmake.version   = ">=3.18"
 build.verbose   = true
 wheel.packages  = []   # no packages — mars.py and marslib are installed via CMake
+
+[tool.pytest.ini_options]
+# Put this checkout at the head of sys.path so the tests import the local
+# mars.py + marslib*.so, not a `pip install .` copy in site-packages. Relative
+# to this file, so it holds for bare `pytest`, `python3 -m pytest`, and any cwd.
+# tests/conftest.py fails the run if either module still resolves elsewhere.
+testpaths  = ["tests"]
+pythonpath = ["."]

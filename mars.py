@@ -247,9 +247,9 @@ def fit(X, y, w=None, **kwargs):
     # Fast-MARS parent cache holds the best delta-SSE each basis produced as a
     # parent the last time it was scored, and that epoch; a new basis enters at
     # +inf so it is scored at least once before competing on its own gain.
-    basis     = [[]]
-    degree    = np.zeros(max_terms, dtype=np.int64)
-    contains  = np.zeros((n_inputs, max_terms), dtype=bool)
+    basis = [[]]
+    degree = np.zeros(max_terms, dtype=np.int64)
+    contains = np.zeros((n_inputs, max_terms), dtype=bool)
     basis_sse = np.full(max_terms, np.inf)
     basis_age = np.zeros(max_terms, dtype=np.int64)
     epoch = 0

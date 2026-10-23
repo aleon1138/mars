@@ -9,7 +9,7 @@ The build is driven by `CMakeLists.txt`. The `Makefile` is a thin wrapper.
 
 ```bash
 make              # configure (build/) + build; drops marslib*.so at the source root
-make test         # build and run C++ unit tests, then pytest
+make test         # build and run C++ unit tests (+ test_cuda if built), then pytest
 make clean        # remove build/ and the built .so
 make format       # format all .h/.cc files with astyle
 
