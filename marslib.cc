@@ -155,7 +155,7 @@ PYBIND11_MODULE(marslib, m)
     options.disable_function_signatures();
 
     m.doc() = "Multivariate Adaptive Regression Splines";
-    m.attr("__version__") = "0.12";
+    m.attr("__version__") = "0.13";
 
     py::class_<MarsAlgo>(m, "MarsAlgo")
     .def(py::init(&new_algo)
