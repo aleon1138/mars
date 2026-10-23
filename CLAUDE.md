@@ -52,12 +52,15 @@ Three methods drive the algorithm:
 **pybind11 bindings (`marslib.cc`)** — exposes `MarsAlgo` as `marslib.MarsAlgo`.
 The `eval()` binding parallelizes over `X` columns using OpenMP, releasing the
 GIL. It accepts a boolean mask matrix `(p, m)` controlling which `(input, basis)`
-pairs to evaluate (Fast-MARS cache).
+pairs to evaluate (Fast-MARS cache). The module also carries the free function
+`marslib.expand()`, the row-blocked OpenMP kernel behind `mars.expand()` (see
+the 2026-10-23 note).
 
 **Python orchestration (`mars.py`)** — implements the full MARS forward pass loop
 on top of `marslib` (pure numpy/scipy, no numba). Key public API:
 - `fit(X, y, ...)` → structured numpy array `model` of basis nodes
-- `expand(X, model)` → basis matrix `B` for a new dataset
+- `expand(X, model, order="F", threads=-1)` → basis matrix `B` for a new
+  dataset, in C or Fortran order, computed in parallel by `marslib.expand()`
 - `prune(B, y, ...)` → backward pass / GCV pruning (returns a coefficient vector,
   typically stored back as `model["beta"] = prune(...)`)
 - `compact(model)` → drop pruned nodes (those with `model["beta"] == 0`), remap
@@ -221,6 +224,44 @@ emulation is the wrong tool for these shapes.
   outputs for bit-exact A/B. On the EPYC box, pin with `taskset` and run
   variants sequentially on the same core: concurrent runs on different cores
   disagree by ±20%.
+
+**Performance note (2026-10-23) — `expand()` is a row-blocked C++ kernel:**
+`mars.expand()` used to build `B` column by column in numpy on one core (three
+temporaries per hinge column, so ~4 passes of memory traffic per column). It
+now calls `marslib.expand()`, which splits the rows into blocks sized so all
+`m` columns of a block fit in ~256 KB of L2 and walks the nodes in index order
+inside each block. Because `basis[i] < i`, every parent block is still in
+cache when its children are formed, so the parent/child dependency costs no
+second pass and no synchronization: the OpenMP loop is over independent row
+blocks, and the DRAM traffic is one read of the X columns the model uses plus
+one write of `B`. `X` and `B` are taken with arbitrary strides, so `X` may be
+C- or F-ordered and `B` is returned in whichever `order` the caller asked for.
+A column-major `B` is filled in place with a contiguous, vectorized column
+loop. A row-major `B` is computed by the same loop into a per-thread
+column-major tile and scattered out in 16×16 sub-blocks (`transpose_tile`);
+computing straight into the strided rows was ~3× slower per thread whether
+walked by column (a cache-line fill per element) or by row (scalar, ~4
+cycles/element), and the scalar transpose costs ~1 cycle/element -- an AVX
+8×8 shuffle transpose is the obvious next step if single-thread C-order ever
+matters. Arithmetic is in X's dtype (f32 or f64) with the cut rounded to that
+dtype first, matching how `append()` forms the column `fit()` scored; the
+pytest suite checks bit-identity against a dtype-faithful numpy reference.
+Thread count follows `eval()` (all cores capped at 64, clamped to the block
+count), and the main thread polls for Ctrl-C every 256 blocks.
+`tests/bench_expand.py` times the old numpy loop against the kernel at several
+thread counts in both orders (fresh `B` per call, so page faults are included).
+On the EPYC box at n=4e6, m=100, p=16, f32 (`B` = 1.6 GB):
+
+| threads | numpy loop | order="F" | order="C" |
+|--------:|-----------:|----------:|----------:|
+|       1 |    0.78 s  |   0.157 s |   0.274 s |
+|       8 |            |   0.027 s |   0.036 s |
+|      16 |            |   0.022 s |   0.018 s |
+|      32 |            |   0.020 s |   0.014 s |
+
+Past ~16 threads both orders sit on the memory/page-fault wall (73–114 GB/s
+written); the F-order plateau is lower, presumably because each thread writes
+`m` separate 2.5 KB column segments per block rather than one contiguous run.
 
 **Data requirements:** `X` must be `float32`, **column-major** (Fortran order).
 `y` and `w` must be `float32` column-major 1D arrays. The bindings assert these

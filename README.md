@@ -31,6 +31,9 @@ is kept for the shape of the scaling curve.
 
 ![Performance timings of MARS](timings.png)
 
+`expand` is parallel as well: it fills the basis matrix in row blocks across
+cores and returns it in Fortran order by default or C order with `order="C"`.
+
 A CUDA build can additionally run the `linear_only` forward pass on the GPU;
 see the GPU build section below.
 

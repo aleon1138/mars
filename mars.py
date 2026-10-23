@@ -403,33 +403,55 @@ def fit(X, y, w=None, **kwargs):
 # -----------------------------------------------------------------------------
 
 
-def expand(X, model):
+def expand(X, model, order="F", threads=-1):
     """
     Expand a feature set X into the bases of a MARS model.
+
+    Column `i` of the result is the term of model node `i`: 1 for the
+    intercept, otherwise the parent column times the node's factor of X
+    (`X[:, input]`, `max(X[:, input] - hinge, 0)` or `max(hinge - X[:, input],
+    0)`). The work is done in `marslib`, in parallel over row blocks.
+
+    Parameters
+    ----------
+    X : array (n, p)
+        Feature matrix, float32 or float64 (any other dtype is converted to
+        float64). Any memory layout is accepted; column-major is fastest.
+
+    model : structured array
+        Model as returned by `fit()` (or `compact()`).
+
+    order : {"F", "C"} (default="F")
+        Memory layout of the returned basis matrix.
+
+    threads : int (default=-1)
+        Number of cores to use. A negative number implies usage of all cores.
+
+    Returns
+    -------
+    B : array (n, len(model))
+        Basis matrix, in the dtype of X.
     """
     X = np.asarray(X)
-    B = np.empty((len(X), len(model)), dtype=X.dtype, order="F")
-    decode = lambda s: s.decode("utf8") if isinstance(s, bytes) else s
+    if X.dtype not in (np.float32, np.float64):
+        X = X.astype(np.float64)
+    if X.ndim != 2:
+        raise ValueError("X must be 2D, got shape %s" % (X.shape,))
+    order = str(order).upper()
+    if order not in ("C", "F"):
+        raise ValueError("order must be 'C' or 'F', got %r" % (order,))
 
-    for i, node in enumerate(model):
-        t = decode(node["type"])
-        b = node["basis"]
-        x = node["input"]
-        h = node["hinge"]
-
-        if t == "i":
-            B[:, i] = 1.0
-        else:
-            assert 0 <= x < X.shape[1]
-            assert 0 <= b < i
-            if t == "l":
-                B[:, i] = B[:, b] * X[:, x]
-            elif t == "+":
-                B[:, i] = B[:, b] * np.maximum(X[:, x] - h, 0)
-            elif t == "-":
-                B[:, i] = B[:, b] * np.maximum(h - X[:, x], 0)
-            else:
-                assert False
+    model = np.asarray(model)
+    B = np.empty((len(X), len(model)), dtype=X.dtype, order=order)
+    marslib.expand(
+        X,
+        B,
+        np.ascontiguousarray(model["type"], dtype="S1").view(np.uint8),
+        np.ascontiguousarray(model["basis"], dtype=np.int32),
+        np.ascontiguousarray(model["input"], dtype=np.int32),
+        np.ascontiguousarray(model["hinge"], dtype=np.float64),
+        threads,
+    )
     return B
 
 
