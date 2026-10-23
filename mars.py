@@ -147,8 +147,10 @@ def fit(X, y, w=None, **kwargs):
     labels : list-like (default=None)
         A list of column labels. This is only used for console output.
 
-    xfilter : function (default=lambda x,b: True)
-        Allows custom filtering of inputs.
+    xfilter : callable or None (default=None)
+        Custom candidate filter `xfilter(i, b) -> bool`, where `i` is the input
+        column and `b` the list of inputs already in the parent basis. Called
+        only for candidates that pass the degree / self-interaction filter.
 
     threads : int (default=-1)
         Number of cores to use. A negative number implies usage of all cores.
@@ -202,7 +204,7 @@ def fit(X, y, w=None, **kwargs):
     r2_window     = kwargs.pop('r2_window', 32) # window over which to measure R2
     r2_thresh     = kwargs.pop('r2_thresh', 3e-5)
     labels        = kwargs.pop('labels', None)
-    aux_filter    = kwargs.pop('xfilter', lambda x,b: True)
+    xfilter       = kwargs.pop('xfilter', None)
     max_basis     = kwargs.pop('max_basis', None)         # Fast-MARS parent cap; None = all
     max_inputs    = kwargs.pop('max_inputs', None)        # Faster-MARS-v2 input cap; None = all
     aging_factor  = kwargs.pop('aging_factor', 1.0)
@@ -230,20 +232,20 @@ def fit(X, y, w=None, **kwargs):
     get_dof = lambda m: m + penalty * (m - 1)  # Eq. (31,32)
     gcv_adj = lambda mse, m: mse / (1.0 - get_dof(m) / n_true) ** 2  # Eq. (30)
 
-    # Set up a basic filter which caps the polynomial degree of basis and
-    # optionally prevents features from interacting with themselves. Here 'i'
-    # is the index of the feature to be added and 'b' is a list of features
-    # that exist in the parent basis.
-    basic_filter = lambda i, b: (
-        (len(b) < max_degree) and (self_interact or (i not in b))
-    )
-
     # Clamp the requested term budget so the DOF never exceed the sample count.
     i = np.arange(1, max_terms + 1)
     max_terms = i[get_dof(i) < n_true].max()
 
-    n = len(X)
-    basis = [[]]  # list of lists of used basis
+    n, n_inputs = X.shape
+    basis = [[]]  # inputs of each basis, in insertion order (for xfilter)
+
+    # The candidate filter as arrays, maintained alongside `basis` on every
+    # append: degree[k] = len(basis[k]) caps the polynomial degree, and
+    # contains[i, k] = (i in basis[k]) blocks self-interaction. Evaluating them
+    # as block operations replaces two Python list comprehensions per input per
+    # epoch, which dominated the per-epoch orchestration cost.
+    degree   = np.zeros(max_terms, dtype=np.int64)
+    contains = np.zeros((n_inputs, max_terms), dtype=bool)
     tail = max(int(n * tail_span), 1)
     algo = marslib.MarsAlgo(X, y, w, max_terms)
     var_y = algo.yvar()
@@ -253,8 +255,8 @@ def fit(X, y, w=None, **kwargs):
     # the 'max_inputs' dynamically to account for these values.
     epoch = 0
     basis_sse = np.array([0.0])
-    input_sse = np.full(X.shape[1], np.inf)
-    input_age = np.full(X.shape[1], epoch)
+    input_sse = np.full(n_inputs, np.inf)
+    input_age = np.full(n_inputs, epoch)
 
     # Define output data structure
     # fmt: off
@@ -315,12 +317,16 @@ def fit(X, y, w=None, **kwargs):
         input_to_use = input_to_use[::-1][:n_take]
         input_to_use = np.sort(input_to_use)
 
-        # Build up the mask block here
-        bmask = np.zeros((X.shape[1], len(basis)), dtype="bool")
+        # Build the (input, basis) candidate mask for this epoch.
+        M = len(basis)
+        bmask = np.zeros((n_inputs, M), dtype=bool)
         bmask[np.ix_(input_to_use, basis_to_use)] = True
-        for i in input_to_use:
-            bmask[i] &= np.array([basic_filter(i, b) for b in basis])
-            bmask[i] &= np.array([aux_filter(i, b) for b in basis])
+        bmask &= degree[None, :M] < max_degree
+        if not self_interact:
+            bmask &= ~contains[:, :M]
+        if xfilter is not None:
+            for i, k in zip(*np.nonzero(bmask)):
+                bmask[i, k] = bool(xfilter(i, basis[k]))
 
         # Find the delta-SSE for the entire block
         # 'sse1' is the improvement by adding a linear term
@@ -372,6 +378,9 @@ def fit(X, y, w=None, **kwargs):
             if mse >= 0:
                 # fmt:off
                 basis.append(basis[bcol] + [xcol])
+                degree[m]         = degree[bcol] + 1
+                contains[:, m]    = contains[:, bcol]
+                contains[xcol, m] = True
                 model[m] = (
                     htype,                              # type
                     bcol,                               # basis
@@ -380,7 +389,7 @@ def fit(X, y, w=None, **kwargs):
                     np.nan,                             # beta (NaN until prune fills it)
                     1.0 - mse / var_y,                  # r2
                     1.0 - gcv_adj(mse, m + 1) / var_y,  # r2_cv
-                    len(basis[-1]),                     # order
+                    degree[m],                          # order
                     dt,                                 # time
                 )
                 basis_sse = np.append(basis_sse, [0.0])

@@ -90,20 +90,15 @@ accumulates in f32 and `dgemm` needs f64 inputs.
 and, since the sweep fix, ~45% of a CPU hinge eval (1.1 of 2.4 s at m=100,
 5.8 of 12.5 s at m=250). Expected ~2× on Phase 1/2a, so ~1.3× on a hinge fit.
 
-## 4. Python orchestration: `bmask` list comprehensions
+## 4. Python orchestration: resolved
 
-`fit()` rebuilds the mask each epoch with two Python list comprehensions per
-input (`basic_filter`, `aux_filter`) over all bases; ~130 ms/epoch on the
-production fit, ~16% under the GPU path and growing as the GPU gets faster.
-Precompute per epoch `degree = [len(b) for b in basis]` and a `(p, M)` bool
-`contains[i, k] = (i in basis[k])`, then vectorize the basic filter:
-
-```python
-bmask &= (degree[None, :] < max_degree) & (~contains | self_interact)
-```
-
-`aux_filter` is user-supplied and stays scalar, but call it only on the entries
-still true after the basic filter.
+`fit()` now keeps `degree[k]` and a `(p, M)` boolean `contains[i, k]` alongside
+the `basis` list and applies the degree / self-interaction filter as array
+operations over the whole candidate block; a user `xfilter` is called only on
+the survivors (and never when not supplied). Models are bit-identical to the
+list-comprehension version; the Python side of an epoch went 3.3 → 1.0 ms at
+p=200, M=150. The ~130 ms/epoch this item used to quote was mostly the strided
+modified-GS `append()` (fixed in the 2026-10-22 pass), not this loop.
 
 ## 5. MARS algorithmic improvements
 
