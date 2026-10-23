@@ -89,32 +89,49 @@ sanitizer builds noted at the top of the `Makefile`). Both `pip install .` and
 via the [scikit-build-core](https://scikit-build-core.readthedocs.io) backend;
 there is no `setup.py`.
 
-### CPU build (default)
+### Default build: GPU kernels when a GPU is present
 
-A plain `pip install .` or `make` produces a CPU-only library.
+`pip install .` and `make` decide at configure time whether to build the GPU
+kernels into `marslib.so`: they are built in when a working CUDA compiler
+(`nvcc`) and an NVIDIA GPU (one listed by `nvidia-smi -L`) are both found, and
+the library is CPU-only otherwise. Set `NOCUDA=1` to skip the probe and force
+a CPU-only build:
 
 ```bash
 cd mars
-pip install .
+pip install .            # GPU kernels if nvcc + a GPU are found, else CPU-only
+NOCUDA=1 pip install .   # CPU-only
 ```
 
-For local development, the Makefile is a thin wrapper around CMake:
+pip hides the build output, so add `-v` (`pip install -v .`) to see the
+`CUDA:` configure line that reports which build was chosen and why.
+
+For local development, the Makefile is a thin wrapper around CMake and makes
+the same decision:
 
 ```bash
 cd mars
 make            # configures + builds; drops marslib*.so at the source root
+NOCUDA=1 make   # CPU-only
 make test       # runs the C++ unit tests (+ CUDA tests on a GPU build) and pytest
 make clean      # removes the build/ directory and built .so
 ```
+
+The decision is cached in `build/`, so run `make clean` before switching
+between a CPU-only and a GPU build.
 
 The tests always import the checkout's `mars.py` and `marslib*.so`, never a
 copy installed in site-packages; `tests/conftest.py` fails the run if either
 resolves elsewhere (for example when the local `.so` has not been built yet).
 
-### GPU build (opt-in, CUDA)
+### Forcing a GPU build (`USE_CUDA=ON`)
 
-The GPU orthonormalize kernels are gated behind the `USE_CUDA` option,
-which is disabled by default. Turn it on to build them into `marslib.so`:
+The GPU kernels are gated behind the CMake `USE_CUDA` option, which is `AUTO`
+by default. Set it to `ON` to require them: the configure then fails if
+`nvcc` is missing instead of falling back to CPU-only, and the GPU check is
+skipped, which is how to build a GPU wheel on a machine without a card.
+`OFF` is the same as `NOCUDA=1`; an explicit `ON`/`OFF` wins over the
+environment variable.
 
 ```bash
 # wheel: pass the CMake define through pip
@@ -125,8 +142,9 @@ pip install . -C cmake.define.USE_CUDA=ON
 make cuda
 ```
 
-A GPU build additionally needs the CUDA Toolkit (`nvcc`). It targets compute
-capabilities 7.5 and 12.0 by default; pin a single target with
+A GPU build needs the CUDA Toolkit (`nvcc`). It targets compute capabilities
+7.5 and 12.0 by default, dropping any the installed `nvcc` cannot emit (12.0
+needs CUDA ≥ 12.8); pin a single target with
 `-DCMAKE_CUDA_ARCHITECTURES=<arch>` (append
 `-C cmake.define.CMAKE_CUDA_ARCHITECTURES=<arch>` to the pip command).
 

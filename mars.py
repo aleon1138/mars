@@ -157,7 +157,8 @@ def fit(X, y, w=None, **kwargs):
 
     cuda : bool (default=False)
         Run the forward-pass orthonormalize step on the GPU (requires a CUDA
-        build, i.e. USE_CUDA=ON). Most effective in the `linear_only` regime,
+        build: the default when nvcc and a GPU are detected at build time, or
+        USE_CUDA=ON). Most effective in the `linear_only` regime,
         where the candidate columns are batched into large GEMMs; the GPU path
         is driven single-threaded (`threads` is ignored for it).
 

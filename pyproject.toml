@@ -19,16 +19,20 @@ Source = "https://github.com/aleon1138/mars"
 
 # This replaces the old setup.py: scikit-build-core drives CMake (CMakeLists.txt
 # is the source of truth for the build) and installs mars.py + marslib.so into
-# the wheel. `pip install .` produces a CPU-only build by default.
+# the wheel.
 #
-# CUDA is opt-in. To build the GPU kernels into the wheel, forward the CMake
-# option through pip's config settings:
+# CUDA is auto-detected (CMake's USE_CUDA=AUTO): `pip install .` builds the GPU
+# kernels into the wheel when a CUDA compiler (nvcc) and an NVIDIA GPU are both
+# found, and a CPU-only library otherwise. To override:
 #
-#   pip install . -C cmake.define.USE_CUDA=ON
+#   NOCUDA=1 pip install .                       # CPU-only, skip the probe
+#   pip install . -C cmake.define.USE_CUDA=ON    # GPU required (fails without nvcc)
 #
 # Pin a single GPU target by also passing
 #   -C cmake.define.CMAKE_CUDA_ARCHITECTURES=<arch>
-# (default: 7.5 and 12.0). See README.md and the Makefile for dev builds.
+# (default: 7.5 and 12.0, trimmed to what the installed nvcc can emit). Add -v
+# to pip to see the `CUDA:` configure line that reports the decision. See
+# README.md and the Makefile for dev builds.
 [tool.scikit-build]
 minimum-version = "0.10"
 cmake.version   = ">=3.18"

@@ -1,16 +1,20 @@
 # Thin wrapper around CMake (the real build driver is CMakeLists.txt).
 #
-#   make                 CPU-only build; drops marslib*.so at the source root
-#   make cuda            one-shot GPU build (configure with CUDA + build)
+#   make                 build; drops marslib*.so at the source root. The GPU
+#                        kernels are built in when nvcc and an NVIDIA GPU are
+#                        both detected (USE_CUDA=AUTO), CPU-only otherwise
+#   NOCUDA=1 make        CPU-only build, no probing
+#   make cuda            GPU build, required (configure error without nvcc)
 #   make test            build, then run the C++ unit tests (+ CUDA tests if
 #                        built), then pytest
-#   make configure-cuda  reconfigure with the GPU kernels only (no build)
+#   make configure-cuda  reconfigure with the GPU kernels required (no build)
 #   make format          astyle all .h/.cc
 #   make clean           remove build/ and the built .so
 #
-# CUDA is opt-in and OFF by default: `make` never touches nvcc. `make cuda` does
-# a one-shot GPU build. For a CUDA wheel instead of a dev build, use
-# `pip install . -C cmake.define.USE_CUDA=ON` (see README.md).
+# The CUDA decision is made at configure time and cached in build/, so run
+# `make clean` before switching between a CPU-only and a GPU build. A wheel
+# makes the same AUTO decision: `pip install .`, with `NOCUDA=1 pip install .`
+# and `pip install . -C cmake.define.USE_CUDA=ON` to force it (see README.md).
 #
 # For memchecks, configure by hand with:
 #   cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
@@ -32,15 +36,17 @@ $(BUILD_DIR)/CMakeCache.txt:
 cuda: configure-cuda
 	cmake --build $(BUILD_DIR) --parallel
 
-# Opt-in CUDA build (drops the GPU kernels into marslib.so + builds test_cuda).
-# Only *reconfigures* — `make cuda` (or a follow-up `make`) does the build.
-# Reuses the existing build dir, so run `make clean` first to switch a CPU build
-# over (and again to switch back to CPU-only).
+# Required CUDA build (drops the GPU kernels into marslib.so + builds
+# test_cuda; a configure error if nvcc is missing). Only *reconfigures* --
+# `make cuda` (or a follow-up `make`) does the build. Reuses the existing build
+# dir, so run `make clean` first to switch a CPU build over (and again to switch
+# back to CPU-only).
 configure-cuda:
 	cmake -S . -B $(BUILD_DIR) -DBUILD_TESTING=ON -DUSE_CUDA=ON
 
-# test_cuda only exists in a USE_CUDA configure (`make cuda`); run it when it's
-# there. The binary itself GTEST_SKIPs every case if no GPU is visible.
+# test_cuda only exists in a CUDA configure (auto-detected, or `make cuda`);
+# run it when it's there. The binary itself GTEST_SKIPs every case if no GPU
+# is visible.
 test: all
 	$(BUILD_DIR)/unittest
 	@if [ -x $(BUILD_DIR)/test_cuda ]; then \

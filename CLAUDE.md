@@ -8,13 +8,26 @@ code in this repository.
 The build is driven by `CMakeLists.txt`. The `Makefile` is a thin wrapper.
 
 ```bash
-make              # configure (build/) + build; drops marslib*.so at the source root
+make              # configure (build/) + build; drops marslib*.so at the source root.
+                  # GPU kernels are built in when nvcc + an NVIDIA GPU are detected
+NOCUDA=1 make     # CPU-only build (skip the probe)
+make cuda         # GPU kernels required (configure error without nvcc)
 make test         # build and run C++ unit tests (+ test_cuda if built), then pytest
-make clean        # remove build/ and the built .so
+make clean        # remove build/ and the built .so (also needed to flip CPU <-> GPU)
 make format       # format all .h/.cc files with astyle
 
-pip install .     # alternative: build a wheel via scikit-build-core
+pip install .     # alternative: build a wheel via scikit-build-core; same CUDA
+                  # auto-detection, NOCUDA=1 for CPU-only, -C cmake.define.USE_CUDA=ON to require
 ```
+
+**Build note (2026-10-23):** CMake's `USE_CUDA` is a tri-state cache string,
+`AUTO` (default) / `ON` / `OFF`. `AUTO` runs `check_language(CUDA)` and
+`nvidia-smi -L` and builds the GPU kernels only if both succeed; `NOCUDA=1` in
+the environment short-circuits it to CPU-only. The resolved boolean is the
+plain CMake variable `MARS_CUDA`; test that, never `if(USE_CUDA)` (`"AUTO"` is
+truthy). The default `CMAKE_CUDA_ARCHITECTURES` (`75;120`) is trimmed to what
+`nvcc --list-gpu-code` reports so an older toolkit still builds; an explicit
+`-DCMAKE_CUDA_ARCHITECTURES` is never trimmed.
 
 For memory/sanitizer debugging, reconfigure with sanitizer flags:
 ```bash
