@@ -3,41 +3,36 @@
 Ideas and notes for future performance/quality work, not planned for a specific
 release. Completed work lives in git history; rejected approaches and why they
 were rejected live in CLAUDE.md's performance notes. Items are ordered by
-expected value per unit of risk as of the 2026-10-22 review. Timings below are
+expected value per unit of risk as of the 2026-10-23 review. Timings below are
 single-threaded on the EPYC 9845 server (`tests/bench_sweep`, n=5e5, pinned to
 one core); see the benchmarking note at the end before trusting any A/B.
 
-## 1. Hinge sweep: close the in-situ gap (CPU hinge fits)
+## 1. Hinge sweep (CPU hinge fits): resolved, with a lesson
 
-The sweep (`covariates_impl` over sorted rows) is ~75% of `eval(hinge)` at
-m=100–250 and is the dominant cost of a CPU hinge fit. The 2026-10-22 pass made
-it 1.3× faster (4 basis columns per gathered `Bo` row, full-row and gather
-prefetch, 64-byte-aligned `f`/`g`, forced inline) and bit-exact, but left a
-measured, unexplained gap:
+The sweep (`covariates_impl` over sorted rows) was ~75% of `eval(hinge)` and ran
+~3× slower than the identical loop in a standalone microbench. Bisection
+(2026-10-23) stripped the on-grid work, support bookkeeping, scalar
+accumulators and gathers one at a time: together they cost <5%. Replacing the
+gathered `Bo` row by an L1-resident one cut the sweep from 2.8 s to 0.93 s,
+yet no prefetch variant changed anything -- because **the binary contained no
+prefetch instructions**. GCC 13 deletes a loop of `__builtin_prefetch` calls
+inside a lambda at every -O level (plain loops, single calls and inline asm
+survive; clang keeps all forms). The pre-review code had a single call that
+survived but covered only the first line of each row.
 
-| per (sorted row, basis column), m=100            | ns  |
-|--------------------------------------------------|-----|
-| in situ (`eval(hinge)` minus `eval(linear)`)     | 68  |
-| in situ with the gathered values replaced by constants | 31 |
-| standalone microbench, identical loop, same DRAM-resident random `Bo` rows and `b`/`bx`/`y` gathers, prefetched | 23 |
-| same, gathers pre-sorted into sweep order        | 28  |
-| pure compute floor (L1-resident)                 | 20  |
+With `prefetch_line()` (inline asm) prefetching the full `Bo` row and the
+`b`/`bx`/`y` gathers 4 rows ahead, the sweep at n=5e5 is 1.3 s vs 4.6 s before
+the review at m=100 and 6.7 s vs 21.9 s at m=250, bit-identical; tuning
+confirmed distance 4, 4 columns per row and the forced inline. The
+orthonormalize GEMMs (item 3) are now ~45% of a CPU hinge eval. Remaining headroom is small: the compute floor of the
+loop (2 loads, 1 widening load, 2 FMAs, 2 stores per 4 lanes) is ~0.9 s at
+this size. What is left is the store traffic of `f`/`g` (one load + one
+store each per FMA); amortizing it across 2 sorted rows per step is possible
+algebraically (`f += (d1+d2)·g + d2·b1·x1`) but changes the f64 summation
+order and needs the on-grid positions handled exactly -- low priority.
 
-What was ruled out in situ: memory (the pre-sort gather pass costs 0.09 s of a
-3.1 s sweep; prefetch distance 4/8/16 and first-line vs full-row make no
-difference; `MADV_HUGEPAGE` on `B`/`Bo`/`Bx` did not help; dTLB miss rate is
-*lower* in situ than in the microbench), inlining (+5%), pre-sorting (+10%),
-f/g alignment (20% in the microbench). `perf annotate` spreads the cycles evenly
-over the eight inner-loop instructions (IPC ~1 vs ~3 in the microbench). So the
-in-situ loop body is slow for a reason that is not the memory system.
-
-**Next step:** bisect between `tests/bench_sweep.cc` and a standalone copy of
-the loop, one difference at a time: the `thread_local Scratch*` indirection; the
-per-column pointer/accumulator arrays (`k0..vb[JB]` cannot stay in registers
-while `jj` is a runtime loop — unroll `jj` by `JB` with a compile-time count);
-the `on_grid` branch and `<true>` instantiation; the `nz`/`done` bookkeeping;
-`_tol`/`hinge_sse` double stores forcing reloads. Expected gain if the
-microbench number is reached: ~2.5× on the sweep, ~2× on a CPU hinge fit.
+**Lesson:** after any change to prefetch code, check
+`objdump -d marslib*.so | grep -c prefetcht0`.
 
 ## 2. CUDA: the hinge sweep
 
@@ -92,7 +87,8 @@ accumulate in f64 (the precision contract behind the f32 buffers); `sgemm`
 accumulates in f32 and `dgemm` needs f64 inputs.
 
 **Value:** the whole cost of CPU `linear_only` (production uses the GPU there)
-and ~25% of a hinge eval. Expected ~2× on Phase 1/2a.
+and, since the sweep fix, ~45% of a CPU hinge eval (1.1 of 2.4 s at m=100,
+5.8 of 12.5 s at m=250). Expected ~2× on Phase 1/2a, so ~1.3× on a hinge fit.
 
 ## 4. Python orchestration: `bmask` list comprehensions
 

@@ -191,12 +191,22 @@ emulation is the wrong tool for these shapes.
   had become the dominant per-epoch cost on the GPU path (where eval is ~0.1 s).
   Same DGKS gate; with `Bo` orthonormal to f32 precision the two agree to that
   floor (the test cross-checks both references).
-- **Sweep 1.3× faster, bit-exact:** JB=4 columns per gathered `Bo` row,
+- **Sweep 3.3–3.6× faster, bit-exact** (4.6→1.3 s at n=5e5, m=100; 21.9→6.7 s
+  at m=250; a 16-thread hinge fit of n=2e5, p=40, 41 terms went 19→9 s):
+  JB=4 columns per gathered `Bo` row,
   full-row + gather prefetch, 64-byte-aligned `f`/`g`, forced inline of
-  `covariates_impl`. A standalone microbench of the identical loop (same
-  DRAM-resident random rows and gathers) runs **3× faster** than the in-situ
-  loop; the gap is not memory (the gather pass is cheap, prefetch depth and
-  huge pages change nothing) and is TODO item 1.
+  `covariates_impl`. Most of the gain came from discovering that **the sweep
+  had no software prefetch at all**: GCC 13 deletes a loop of
+  `__builtin_prefetch` calls inside a lambda (a single call or a plain loop
+  survives; clang keeps every form), and the pre-review code only ever
+  prefetched the first line of each row. `prefetch_line()` is inline asm on
+  x86 so it cannot be dropped; the sweep now runs at the compute floor measured
+  by a standalone microbench of the same loop. Bisection also showed the
+  per-row gathers of `b`/`bx`/`y` are the dominant stall once the row is
+  prefetched (without their prefetch the sweep is 2.5× slower), while the
+  on-grid work, support bookkeeping and scalar accumulators cost <5% together.
+  **Check `objdump -d marslib*.so | grep -c prefetcht0` after touching the
+  sweep.**
 - Smaller: `argsort` is a stable LSD radix sort (51→~5 ms at n=5e5; the
   planned LRU cache is moot); per-thread `Bx` is sized by the active columns
   `p` rather than `m` (Fast-MARS memory); `fit()` caches `max(sse1, sse2)`
