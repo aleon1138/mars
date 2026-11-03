@@ -39,61 +39,65 @@ order and needs the on-grid positions handled exactly -- low priority.
 **Landed and tuned on-device (2026-11-03, `cuda/hinge_sweep.cu`; see the
 CLAUDE.md note of that date).** `fit(cuda=True)` runs the hinge sweep on the
 GPU as a two-pass chunked f64 recurrence: 76 ms per X column at n=5e5, m=100
-(CPU one core 2.1 s) and 386 ms at m=250 (12.4 s). Pass 1 (carries) is at
-~1.9× the f64 FMA floor (27 / 165 ms vs 14 / 88 ms) and the grid scoring adds
-~12 / 31 ms. The f64-only levers are spent; what is left:
+(CPU one core 2.1 s, 28×) and 386 ms at m=250 (12.4 s, 32×). Pass 1 (carries)
+is at ~1.9× the f64 FMA floor (27 / 165 ms vs 14 / 88 ms) and the grid scoring
+adds ~12 / 31 ms. The f64-only levers are spent. Future work, in order:
 
-- **Blocked f32 for pass 1 (the real lever, a numerics decision).** With the
-  carry defined at the end of step b-1, pass 1 is plain sums over the chunk
-  (`g_loc = Σ_t b_t·v_t`, `f_loc = Σ_t b_t·v_t·D(t,b-1)` with per-chunk suffix
-  sums of `d` as weights), i.e. a batched GEMM over pre-permuted rows that
-  could run as f32 (64× the f64 rate here) with f64 cross-chunk accumulation
-  like the T GEMM: ~sqrt(L)·eps_f32 within-chunk error on O(sqrt(L/n))
-  partials is ~1e-7..1e-9 relative on the O(1) carries, against the 1e-6
-  relative HINGE_DEN_REL gate -- it would move near-gate scores at the
-  1e-3..1e-1 level, the same order as the GPU orthonormalize's f32 projection
-  already does (CLAUDE.md 2026-11-03: ~5e-4 relative). Needs the same
-  fit-quality study as the T GEMM before it is trusted; pass 1 would drop
-  from ~27 ms to a few ms at m=100. Pass 2's chunk-local part could follow
-  (its local contribution is O(L/n) of the carried state, so f32 there is
-  ~1e-10 relative), which would make the whole sweep tensor-core shaped.
-- Cache the sort permutation (and its inverse) per X column across epochs; it
-  never changes within a fit (sort+prep is 1.5 ms per eval, so low priority).
-- `m + 1 + 2·JB > 1024` lanes throws; lift by instantiating more lanes per thread.
-- Re-profile a full hinge fit (`tests/bench_eval.py --cuda`, `MARS_CUDA_PROFILE=1`):
-  `append()` and `sync_basis` (a strided row-major scatter per appended
-  column, 308 ms over the 100-column bench) now matter relative to a 0.08 s eval.
-
-With `append()` now 15× faster on the CPU
-(it had become the dominant per-epoch cost under the GPU path), re-profile a
-production fit with `MARS_CUDA_PROFILE=1` (now also prints the sweep phases)
-before deciding on the next step; the
-GPU phases were flat (T GEMM 28%, round/norm 24%, fill 23%, DGKS 19%,
-projection 6%) and Python orchestration ~16% as of 2026-06-17.
+1. **Blocked f32 for pass 1 -- the remaining factor of several, and a numerics
+   decision (not yet taken).** With the carry defined at the end of step b-1,
+   pass 1 is plain sums over the chunk (`g_loc = Σ_t b_t·v_t`, `f_loc = Σ_t
+   b_t·v_t·D(t,b-1)` with per-chunk suffix sums of `d` as weights), i.e. a
+   batched GEMM over pre-permuted rows that could run as f32 (64× the f64
+   rate on the sm_120 box) with f64 cross-chunk accumulation, like the T
+   GEMM. Within-chunk f32 error of ~sqrt(L)·eps_f32 on O(sqrt(L/n)) partials
+   is ~1e-7..1e-9 relative on the O(1) carries, against the 1e-6 relative
+   `HINGE_DEN_REL` gate: near-gate scores would move at the 1e-3..1e-1 level,
+   the same order the GPU orthonormalize's f32 projection already introduces
+   (~5e-4 relative). Build it opt-in (`MARS_CUDA_SWEEP_F32=1`), measure speed
+   (pass 1 from ~27 ms to a few ms at m=100), and run the same fit-quality
+   study the T GEMM got (R², basis selection on well-conditioned, correlated
+   and collinear stresses) before considering a default. Pass 2's chunk-local
+   part could follow (its local contribution is O(L/n) of the carried state,
+   so f32 there is ~1e-10 relative), which would make the whole sweep
+   tensor-core shaped.
+2. **Profile a whole hinge fit** (`MARS_CUDA_PROFILE=1 python3
+   tests/bench_eval.py --cuda --n 500000 --p 20 --max-terms 101 --repeat 1`)
+   and attack what dominates there. Candidates now that an eval is <0.1 s:
+   `append()` (28 ms at m=100, CPU classical GS), `context_sync_basis` (a host
+   gather plus a strided row-major scatter per appended column, 308 ms over
+   the 100-column bench), and the per-column serialization -- the cuda path
+   evaluates X columns one `eval()` at a time on one stream, so for small m
+   the GPU is underfilled; sweeping several X columns per launch (grid.z) or
+   overlapping the CPU-side work of column i+1 with the GPU's column i would
+   help there.
+3. **Deterministic orthonormalize reductions** (`round_reduce_kernel` f64
+   atomics): GPU results vary at the ULP between runs, which forces every
+   downstream test to use tolerances instead of equality. A per-tile partials
+   buffer plus a fixed-order second pass; cheap.
+4. Cache the sort permutation (and its inverse) per X column across epochs;
+   it never changes within a fit (sort+prep is 1.5 ms per eval -- low priority).
+5. `m + 1 + 2·JB > 1024` lanes throws; lift by instantiating more lanes per
+   thread. The 8-columns-per-block variant at four lanes per thread spills
+   (only reachable with `MARS_CUDA_SWEEP_JB=8` above m≈500).
+6. Smaller orthonormalize items from the 2026-06-17 profile (GPU phases were
+   flat: T GEMM 28%, round/norm 24%, fill 23%, DGKS 19%, projection 6%):
+   - **`fill` f64-write drop (~7%).** `fill` writes both an f32 and an f64
+     `Bx`; on the blocked-f32 path the f64 copy is read only by `round_reduce`
+     as the minuend of the fused subtract. Reading the f32 `Bx` instead needs
+     the f32 projection in its own buffer (it currently overwrites `dBx_f32`).
+     Bit-identical result, delicate aliasing change, low ROI.
+   - **`context_sync_basis` host gather.** The new `Bo` column is gathered on
+     the host from the row-major `Bo` (one cache line per row); `append()` has
+     the same column contiguous as f64 `v` just before scattering it. Staging a
+     contiguous f32 copy on `MarsData` and uploading that avoids the gather.
+   - **DGKS 19%** is genuine f64 re-orthogonalization of real near-collinear
+     columns; cutting it further needs an algorithmic change (re-orthogonalize
+     against only the relevant `Bo` columns). High risk for the remaining slice.
 
 Lesson kept from that profile (commit `3d27433`): the random-`Bo` benches never
 fire the DGKS retry, so a perf benchmark must exercise it or it measures a path
 production never takes. `CudaKernelsTest.BatchDgksRetryMatchesPerColumn` covers
 the batched retry.
-
-Small CUDA items, all untested on-device until the GPU is free:
-
-- **Deterministic reductions.** `round_reduce_kernel` sums `ds`/`ybx_raw` with
-  f64 `atomicAdd` across up to 64 row tiles, so GPU results vary at f64 ULP from
-  run to run (not just vs the CPU). A per-tile partials buffer (64×P doubles)
-  plus a fixed-order second pass makes them reproducible; cheap.
-- **`fill` f64-write drop (~7% of GPU time).** `fill` writes both an f32 and an
-  f64 `Bx`; on the blocked-f32 path the f64 copy is read only by `round_reduce`
-  as the minuend of the fused subtract. Reading the f32 `Bx` instead needs the
-  f32 projection to land in its own buffer (it currently overwrites `dBx_f32`).
-  Bit-identical result, delicate aliasing change, low ROI.
-- **`context_sync_basis` host gather.** The new `Bo` column is gathered on the
-  host from the row-major `Bo` (one cache line per row); `append()` has the same
-  column contiguous as f64 `v` just before scattering it. Staging a contiguous
-  f32 copy on `MarsData` and uploading that avoids the gather. A few ms/epoch.
-- **DGKS 19%** is genuine f64 re-orthogonalization of real near-collinear
-  columns; cutting it further needs an algorithmic change (re-orthogonalize
-  against only the relevant `Bo` columns). High risk for the remaining slice.
 
 ## 3. Orthonormalize Phase 1/2a GEMMs are store-port-bound (CPU)
 
