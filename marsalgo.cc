@@ -10,6 +10,7 @@
 #include <vector>
 #include <algorithm>        // for std::fill_n, std::max, std::min
 #include <cstdio>           // for snprintf
+#include <cstdlib>          // for std::getenv, std::atoi
 #include <cstddef>          // for size_t
 #ifdef __SSE__
 #   include <immintrin.h>   // for _mm_getcsr
@@ -303,21 +304,9 @@ struct MarsData {
  */
 constexpr size_t JB = 4;
 
-/*
- *  Relative floor on the hinge-sweep denominator den = ||h+||^2 - ||proj h+||^2,
- *  the energy of the candidate hinge outside span(Bo, Bx). For a hinge inside
- *  the span, den is the difference of two O(||h+||^2) sums and comes out as
- *  noise of either sign at ~eps_f32/sqrt(n) of ||h+||^2 (the orthonormality
- *  defect of the f32 Bo); the numerator uw is noise of the same origin, so
- *  uw^2/den can score anywhere up to ||y_perp||^2 -- observed: in-span cuts at
- *  den/||h+||^2 ~ 1e-11 scoring 1e-2, above every legitimate cut. The absolute
- *  _tol (which grows with n while this floor shrinks) cannot catch it, so
- *  require that at least this fraction of the hinge's energy be new. 8*eps_f32
- *  ~ 1e-6 sits ~4 decades above the floor and well below any cut min_span
- *  admits; below it the term would be a near-duplicate with an O(1/sqrt(den))
- *  coefficient whose gain f32 cannot resolve anyway.
- */
-constexpr double HINGE_DEN_REL = 8.0 * FLT_EPSILON;
+// HINGE_DEN_REL (the relative den floor of the hinge sweep) lives in kernels.h,
+// shared with the CUDA sweep.
+using mars::HINGE_DEN_REL;
 
 inline double *align64(double *p)
 {
@@ -363,6 +352,7 @@ struct Scratch {
     std::vector<double>  ybx;      // (cap) Bx^T * y, leading p entries used
     std::vector<int>     hinge_idx;// (cap) best hinge sort position per j (leading p)
     std::vector<double>  hinge_sse;// (cap) best hinge delta-SSE per j (leading p)
+    std::vector<double>  hinge_cut;// (cap) best hinge cut value per j (cuda sweep output)
     std::vector<double>  BoTBx;    // (cap, pcap) column-major (col stride cap) -- Bo^T*Bx workspace
 
     /*
@@ -394,6 +384,7 @@ struct Scratch {
             ybx.resize(cap);
             hinge_idx.resize(cap);
             hinge_sse.resize(cap);
+            hinge_cut.resize(cap);
             BoTBx.resize(cap * pcap);
         }
     }
@@ -613,8 +604,18 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
      *  orthonormalize(); it is overwritten immediately below with Bxᵀ * y.
      */
     double *ybx = S.ybx.data();
+    /*
+     *  Under cuda the hinge sweep runs on the GPU too (cuda/hinge_sweep.cu),
+     *  reading the normalized Bx in place on the device; MARS_CUDA_SWEEP=0
+     *  keeps the GPU orthonormalize but downloads Bx and sweeps on the CPU
+     *  (the A/B reference for the GPU sweep).
+     */
+    bool gpu_sweep = false;
     if (cuda) {
 #ifdef MARS_USE_CUDA
+        const char *sweep_env = std::getenv("MARS_CUDA_SWEEP");   // read per call: tests toggle it
+        const bool  sweep_off = sweep_env && std::atoi(sweep_env) == 0;
+        gpu_sweep = !linear_only && !sweep_off;
         /*
          *  GPU orthonormalize. The resident context is created lazily (so
          *  CPU-only fits never touch the GPU) and synced by column count -- B/Bo
@@ -634,8 +635,9 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
          *  itself is downloaded only when the hinge sweep needs it (i.e. not
          *  linear_only) -- in linear_only the n×p matrix never leaves the device.
          */
-        float *Bx_out = linear_only ? nullptr : Bx;
-        mars::cuda::orthonormalize(_cuda, _m, p, x, bcols, Bx_out, n, ybx);
+        float *Bx_out = (linear_only || gpu_sweep) ? nullptr : Bx;
+        mars::cuda::orthonormalize(_cuda, _m, p, x, bcols, Bx_out, n, ybx,
+                                   nullptr, /*normalize_resident=*/gpu_sweep);
 #else
         verify(false, "marslib was built without CUDA support (configure with -DUSE_CUDA=ON)");
 #endif
@@ -666,7 +668,26 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     }
 
     /* Evaluate the delta SSE on all hinge locations */
-    if (linear_only == false) {
+    if (gpu_sweep) {
+#ifdef MARS_USE_CUDA
+        /*
+         *  GPU sweep: same grid, gate and support rule as the CPU loop below,
+         *  evaluated as a chunked f64 recurrence over the sorted rows. Returns
+         *  the best gain / sorted position / raw cut per active column.
+         */
+        mars::cuda::hinge_sweep(_cuda, _m, p, xc, _data->ybo.data(),
+                                min_span, end_span,
+                                S.hinge_sse.data(), S.hinge_idx.data(),
+                                S.hinge_cut.data());
+        for (size_t j = 0; j < p; ++j) {
+            if (S.hinge_idx[j] >= 0) {
+                hinge_dsse[bcols[j]] = linear_dsse[bcols[j]] + S.hinge_sse[j];
+                hinge_cuts[bcols[j]] = S.hinge_cut[j];
+            }
+        }
+#endif
+    }
+    else if (linear_only == false) {
         const double *ybo = _data->ybo.data();
         int    *hinge_idx = S.hinge_idx.data();
         double *hinge_sse = S.hinge_sse.data();

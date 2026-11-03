@@ -238,6 +238,67 @@ emulation is the wrong tool for these shapes.
   variants sequentially on the same core: concurrent runs on different cores
   disagree by ±20%.
 
+**CUDA note (2026-11-03) — the GPU hinge sweep (`cuda/hinge_sweep.cu`),
+first pass, validated on the sm_120 box:** with `cuda=True` and
+`linear_only=False`, `eval()` keeps the normalized `Bx` on the device
+(`orthonormalize(..., normalize_resident=true)`) and calls
+`mars::cuda::hinge_sweep()`, which sorts the raw X column (CUB radix sort,
+`-0.0` folded, stable descending like `argsort`) and runs the CPU sweep's f/g
+recurrence as a **two-pass chunked scan** over the sorted rows: pass 1
+computes each chunk's local end state from zero, a propagate kernel turns
+those into carry-ins (`g_b = g_a + g_loc`, `f_b = f_a + D(a,b)·g_a + f_loc`,
+`h2_b = h2_a + D(a,b)(2bd_a + D(a,b)b2_a) + h2_loc`, with `D(a,b)` = the f32
+deltas summed over `[a, b)` -- `d_a` in, `d_b` out, exactly the steps the
+chunk applies, so every row's weight matches the CPU's), and pass 2 reruns
+each chunk from its carry-in scoring the min_span grid with the same
+`HINGE_DEN_REL` gate (now in `kernels.h`) and support clipping (`i_last[j]`,
+the last sorted position with a nonzero parent, clamped to `tail-1`). One
+block per (chunk, 4 columns); thread lanes are the m Bo columns, the Bx
+column, a parent-b lane (b2/bd/‖h+‖²) and a y lane (vb/w); Bo is kept
+row-major on the device (`dBo_rm`) so the gathered row is contiguous, staged
+16 rows at a time in shared memory with the block-uniform per-row values
+(d, y, b, Bx) staged as f64. Everything accumulates in f64 (the rejected f32
+f/g mode applies here too).
+- **Measured** (`bench_sweep 500000 {100,250} 20 7 2 - 1`): eval(hinge) 112 ms
+  at m=100 (CPU one core: 2.8 s) and 532 ms at m=250 (12.5 s), i.e. ~25×;
+  identical cuts at m=100, 1/250 near-tie at m=250; vs the CPU sweep on the
+  *same* device `Bx` the scores agree to ≤ 7e-10 relative with identical cuts
+  (`CudaSweepTest.*`). Per eval at m=100: sort+prep 1.5 ms, pass 1 38 ms, pass 2
+  65 ms, argmax ~0. The f64 FMA floor is ~14 ms per pass.
+- **Where the time goes (next levers, see TODO.md):** (1) f32→f64 conversion
+  runs at the f64 rate on this card -- staging the uniform values as f64 took
+  pass 1 from 67 to 38 ms; the per-thread Bo conversion (1 per 8 FMAs) remains.
+  (2) The on-grid `ff`/`fy` reduction is 5 shuffle+f64-add rounds per warp per
+  value: ~70% extra f64 work at min_span=7 (pass 2 − pass 1 = 27 ms); a
+  per-tile batched reduction through shared memory does the same sums in ~4×
+  fewer warp instructions. (3) The single parent-b lane does its k0/k1 FMAs
+  alone in its warp, so that warp issues 2× the FMA instructions (~15–25% of
+  the block); spreading the b/y lanes one column per thread fixes it. (4)
+  Tile size (`MARS_CUDA_SWEEP_TILE`) 8/16/32 measured identical, 64 15% slower:
+  residency is not the limit. No register spills (pass 2: 116 regs, pass 1: 74
+  at one lane per thread).
+- **Validation lesson:** a CPU emulation of the chunked scan matched the
+  sequential sweep to 1e-13 on a heavily quantized column while the GPU tests
+  failed by up to 3% on continuous ones -- the carry had been defined as the
+  state *after* step `a` (an extra f-step with `d_b`, deltas over `(a, b]`),
+  so pass 2 applied `d_a·g_a` twice, invisible wherever `d_a` is a tie (0).
+  Validate sweep numerics on continuous data, and A/B the GPU sweep against
+  the CPU sweep on the same device `Bx` (`MARS_CUDA_SWEEP=0`): the f32
+  projection in the GPU orthonormalize alone moves near-gate scores by up to
+  ~5e-4 relative, which would mask a sweep bug. `MARS_CUDA_SWEEP_CHUNK=65536`
+  (one chunk) isolates the carry logic. The orthonormalize's f64 atomics make
+  the linear term vary at the ULP between runs (TODO.md), so no bit-equality
+  on anything downstream of it.
+- Knobs: `MARS_CUDA_SWEEP=0` (GPU orthonormalize + CPU sweep),
+  `MARS_CUDA_SWEEP_CHUNK` (rows per chunk; default sized for ~6k blocks),
+  `MARS_CUDA_SWEEP_TILE` (rows per shared tile), `MARS_CUDA_SWEEP_BLOCK` (block
+  size; the tests use 32 to force 2 and 4 lanes per thread),
+  `MARS_CUDA_PROFILE=1` (per-phase times at context destroy),
+  `MARS_CUDA_VERBOSE=1` (the chosen shape). `m + 3 > 1024` lanes throws.
+  Tests: `CudaSweepTest.*` in `tests/test_cuda.cc` (three-way: CPU, hybrid,
+  GPU), `tests/test_cuda.py` (whole fits: identical basis for the hinge fit),
+  `bench_sweep ... 1` (timing + deviation vs the CPU eval).
+
 **Performance note (2026-10-23) — `expand()` is a row-blocked C++ kernel:**
 `mars.expand()` used to build `B` column by column in numpy on one core (three
 temporaries per hinge column, so ~4 passes of memory traffic per column). It

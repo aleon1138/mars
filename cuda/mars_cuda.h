@@ -131,7 +131,42 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
                     const float *x, const int *mask,
                     float *Bx, size_t ldBx,
                     double *ybx = nullptr,
-                    std::atomic<long> *dgks_counter = nullptr);
+                    std::atomic<long> *dgks_counter = nullptr,
+                    bool normalize_resident = false);
+
+/*
+ *  GPU hinge sweep for one X column -- the linear_only=false half of
+ *  MarsAlgo::eval(). Must directly follow an orthonormalize() call for the
+ *  same (m, p, x, mask) made with normalize_resident=true: it reads the
+ *  normalized candidate columns Bx and their target dots ybx from the device
+ *  scratch that call left behind, plus the resident B / Bo / y.
+ *
+ *  For each candidate j in [0, p) with parent basis b = B[:, mask[j]], it
+ *  evaluates the positive hinge h+ = b .* max(x - h, 0) at every cut h on the
+ *  min_span grid of the descending sort of `xraw` (sorted positions head+1,
+ *  head+1+min_span, ... below n-end_span, with head = end_span), scoring
+ *      sse = uw^2 / (den + tol),  den = ||h+||^2 - ||proj_{Bo,Bx[:,j]} h+||^2,
+ *      uw  = <proj h+, proj y> - <h+, y>,
+ *  gated by den > max(tol, HINGE_DEN_REL*||h+||^2), and keeps the best cut
+ *  (first one on ties), stopping a column once every nonzero row of its
+ *  parent lies above the cut -- the same recurrence, gate and support rule as
+ *  the CPU sweep in marsalgo.cc. The recurrence runs in f64 as a two-pass
+ *  chunked scan over the sorted rows (see hinge_sweep.cu); results agree with
+ *  the CPU to f64 reassociation error, not bit-exactly.
+ *
+ *      xraw      : (n) f32 host pointer -- the RAW X column (sort keys and the
+ *                  reported cut values; the scaled candidate is already resident).
+ *      ybo       : (m) f64 host pointer -- Boᵀ·y.
+ *      hinge_sse : (p) f64 [output] best hinge gain beyond the linear term, 0 if none.
+ *      hinge_idx : (p) int [output] sorted position of the best cut, -1 if none.
+ *      hinge_cut : (p) f64 [output] xraw at the best cut, NaN if none.
+ *
+ *  Synchronous. Throws std::runtime_error on any CUDA failure.
+ */
+void hinge_sweep(Context *ctx, size_t m, size_t p,
+                 const float *xraw, const double *ybo,
+                 int min_span, int end_span,
+                 double *hinge_sse, int *hinge_idx, double *hinge_cut);
 
 /*
  *  Batched linear_only orthonormalize: process P candidate columns (which all

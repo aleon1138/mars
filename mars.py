@@ -156,11 +156,13 @@ def fit(X, y, w=None, **kwargs):
         Number of cores to use. A negative number implies usage of all cores.
 
     cuda : bool (default=False)
-        Run the forward-pass orthonormalize step on the GPU (requires a CUDA
-        build: the default when nvcc and a GPU are detected at build time, or
-        USE_CUDA=ON). Most effective in the `linear_only` regime,
-        where the candidate columns are batched into large GEMMs; the GPU path
-        is driven single-threaded (`threads` is ignored for it).
+        Run the forward-pass orthonormalize step and the hinge sweep on the
+        GPU (requires a CUDA build: the default when nvcc and a GPU are
+        detected at build time, or USE_CUDA=ON). In the `linear_only` regime
+        the candidate columns are batched into large GEMMs; with hinges each
+        X column's sweep runs as a chunked f64 recurrence on the device. The
+        GPU path is driven single-threaded (`threads` is ignored for it) and
+        is not bit-identical to the CPU fit (near-tied terms may reorder).
 
     Returns
     -------

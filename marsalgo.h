@@ -80,10 +80,13 @@ public:
      *      This will ignore the output values of `hinge_dsse` and `hinge_cuts`.
      *
      *  cuda : bool
-     *      run the orthonormalize step on the GPU (requires a CUDA build, i.e.
-     *      USE_CUDA=ON; throws otherwise). The rest of eval() stays on the CPU.
-     *      The GPU context is not thread-safe -- callers must drive the cuda
-     *      path from a single thread.
+     *      run the orthonormalize step and the hinge sweep on the GPU
+     *      (requires a CUDA build, i.e. USE_CUDA=ON; throws otherwise). The
+     *      linear delta-SSE and the output mapping stay on the CPU. The GPU
+     *      sweep matches the CPU one to f64 reassociation error (not
+     *      bit-exactly); MARS_CUDA_SWEEP=0 falls back to the CPU sweep after
+     *      the GPU orthonormalize. The GPU context is not thread-safe --
+     *      callers must drive the cuda path from a single thread.
      */
     void eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
               int xcol, const bool *bmask, int min_span, int end_span,

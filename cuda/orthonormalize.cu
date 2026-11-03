@@ -19,10 +19,7 @@
  */
 
 #include "../kernels.h"   // mars::DGKS_GATE_RATIO_SQ
-#include "mars_cuda.h"
-
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
+#include "context.cuh"    // Context, CUDA_CHECK, reductions (shared with hinge_sweep.cu)
 
 #include <algorithm>
 #include <chrono>    // host-side phase timing (MARS_CUDA_PROFILE)
@@ -37,80 +34,6 @@ namespace mars {
 namespace cuda {
 
 namespace {
-
-#define CUDA_CHECK(call)                                                       \
-    do {                                                                       \
-        cudaError_t err_ = (call);                                             \
-        if (err_ != cudaSuccess) {                                             \
-            throw std::runtime_error(std::string("CUDA error: ") +             \
-                                     cudaGetErrorString(err_) + " at " +       \
-                                     __FILE__ ":" + std::to_string(__LINE__)); \
-        }                                                                      \
-    } while (0)
-
-#define CUBLAS_CHECK(call)                                                     \
-    do {                                                                       \
-        cublasStatus_t st_ = (call);                                           \
-        if (st_ != CUBLAS_STATUS_SUCCESS) {                                    \
-            throw std::runtime_error(std::string("cuBLAS error ") +            \
-                                     std::to_string((int)st_) + " at " +       \
-                                     __FILE__ ":" + std::to_string(__LINE__)); \
-        }                                                                      \
-    } while (0)
-
-constexpr int BLOCK = 256;
-
-// --- reductions -------------------------------------------------------------
-
-__inline__ __device__ double warpReduceSum(double v)
-{
-    for (int off = warpSize / 2; off > 0; off >>= 1) {
-        v += __shfl_down_sync(0xffffffffu, v, off);
-    }
-    return v;
-}
-
-__inline__ __device__ double blockReduceSum(double v)
-{
-    __shared__ double shared[32];  // one slot per warp (max 1024 threads = 32 warps)
-    const int lane = threadIdx.x % warpSize;
-    const int wid  = threadIdx.x / warpSize;
-    v = warpReduceSum(v);
-    if (lane == 0) {
-        shared[wid] = v;
-    }
-    __syncthreads();
-    const int nwarps = (blockDim.x + warpSize - 1) / warpSize;
-    v = (threadIdx.x < nwarps) ? shared[lane] : 0.0;
-    if (wid == 0) {
-        v = warpReduceSum(v);
-    }
-    return v;
-}
-
-// Reduce two independent accumulators with a single barrier (thread 0 gets both
-// block sums). Used by the fused round/norm/dot kernel.
-__inline__ __device__ void blockReduceSum2(double &a, double &b)
-{
-    __shared__ double sa[32];
-    __shared__ double sb[32];
-    const int lane = threadIdx.x % warpSize;
-    const int wid  = threadIdx.x / warpSize;
-    a = warpReduceSum(a);
-    b = warpReduceSum(b);
-    if (lane == 0) {
-        sa[wid] = a;
-        sb[wid] = b;
-    }
-    __syncthreads();
-    const int nwarps = (blockDim.x + warpSize - 1) / warpSize;
-    a = (threadIdx.x < nwarps) ? sa[lane] : 0.0;
-    b = (threadIdx.x < nwarps) ? sb[lane] : 0.0;
-    if (wid == 0) {
-        a = warpReduceSum(a);
-        b = warpReduceSum(b);
-    }
-}
 
 // --- kernels ----------------------------------------------------------------
 
@@ -272,6 +195,16 @@ __global__ void colsumsq_f64_kernel(const double *M, size_t ld, size_t rows,
     }
 }
 
+// dst[i*ld] = src[i]: scatter a contiguous column into a strided (row-major)
+// matrix column.
+__global__ void scatter_col_kernel(const float *src, float *dst, size_t ld, size_t n)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i * ld] = src[i];
+    }
+}
+
 __global__ void widen_kernel(const float *in, double *out, size_t total)
 {
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -342,78 +275,7 @@ __global__ void normalize_kernel(float *bx32, const float *scale, size_t n)
     bx32[j * n + i] *= scale[j];
 }
 
-inline void check_launch()
-{
-    CUDA_CHECK(cudaGetLastError());
-}
-
 }  // namespace
-
-// --- Context ----------------------------------------------------------------
-
-struct Context {
-    cublasHandle_t handle = nullptr;
-    cudaStream_t   stream = nullptr;
-
-    size_t n         = 0;
-    size_t max_terms = 0;
-    size_t ldT       = 0;   // == max_terms
-    size_t p_cap     = 0;   // candidate-column capacity of the scratch (>= max_terms)
-    double tol       = 0.0;
-    size_t m_synced  = 0;   // columns of B/Bo currently resident on device
-
-    // resident basis + target
-    float  *dB      = nullptr;  // (n, max_terms) col-major, ld n
-    float  *dBo_f32 = nullptr;  // (n, max_terms) col-major, ld n -- f32 Bo (blocked GEMM + widen src)
-    double *dBo_f64 = nullptr;  // (n, max_terms) col-major, ld n -- widened from dBo_f32
-    float  *dy      = nullptr;  // (n) normalized target
-    const float *target_ptr = nullptr;  // host y pointer last uploaded to dy
-
-    // blocked-f32 T = Boᵀ·Bx: split K=n into chunks, cublasSgemm each in f32,
-    // accumulate the chunk results into the f64 dT. Default 2048 (on);
-    // MARS_CUDA_KCHUNK=0 selects the native-f64 T GEMM.
-    size_t  kchunk   = 2048;
-    float  *dTc_f32  = nullptr;  // (max_terms, p_cap) per-chunk f32 T, then the f32 cast of dT
-
-    // per-call scratch (sized for the worst case p == p_cap; the per-eval path
-    // uses the leading <= max_terms columns, the batched path up to p_cap)
-    float  *dBx_f32 = nullptr;  // (n, p_cap) col-major, ld n
-    double *dBx_f64 = nullptr;  // (n, p_cap) col-major, ld n
-    double *dT      = nullptr;  // (max_terms, p_cap) col-major, ld max_terms
-    float  *dx      = nullptr;  // (n) single candidate (per-eval path)
-    int    *dmask   = nullptr;  // (p_cap)
-    double *ds       = nullptr;  // (p_cap)
-    double *dtnorm2  = nullptr;  // (p_cap)
-    double *dybx_raw = nullptr;  // (p_cap) Σ Bx·y on the un-normalized column
-    double *dybx     = nullptr;  // (p_cap) scale·ybx_raw -- the ΔSSE input
-    float  *dscale   = nullptr;  // (p_cap)
-    int    *didx    = nullptr;  // (p_cap) compact global indices of DGKS-flagged cols
-
-    // batched path: resident scaled candidates (x_c = X[:,c]·s[c]) and the
-    // per-output-column source maps. dXscaled is allocated (n, p_x) on the first
-    // context_sync_xcols call; columns are uploaded+scaled lazily, once each.
-    float  *dXscaled  = nullptr;  // (n, p_x) col-major -- resident scaled candidates
-    size_t  p_x       = 0;        // X-column count (dXscaled width)
-    std::vector<char> x_resident; // (p_x) which columns are uploaded+scaled
-    int    *dsrc_xcol = nullptr;  // (p_cap) output col -> global X column
-    int    *dsrc_basis = nullptr; // (p_cap) output col -> B/Bo column
-
-    // host staging
-    std::vector<float>  h_stage;    // (n) gather one Bo column
-    std::vector<double> h_ds;       // (p_cap)
-    std::vector<double> h_tnorm2;   // (p_cap)
-    std::vector<int>    h_idx;      // (p_cap) compact flagged-column indices
-
-    // --- profiling (MARS_CUDA_PROFILE): per-phase GPU time, accumulated over
-    // the whole fit and dumped at context_destroy. Zero overhead when off.
-    int         profile = 0;
-    cudaEvent_t ev[8] = {};         // per-call phase markers (created when on)
-    double ms_fill = 0, ms_gemmT = 0, ms_proj = 0, ms_round = 0,
-           ms_dgks = 0, ms_scale = 0;       // GPU phases (cudaEvent deltas)
-    double ms_sync_basis = 0, ms_sync_xcols = 0;  // host-side (std::chrono)
-    long   n_calls = 0, n_dgks_fired = 0;
-    size_t prof_cols = 0;           // total candidate columns processed
-};
 
 // --- profiling helpers ------------------------------------------------------
 // Record a stream marker; read the GPU ms between two markers (valid only after
@@ -489,6 +351,32 @@ Context *context_create(size_t n, size_t max_terms, double tol)
                 ctx->kchunk = (size_t)v;  // 0 disables (native f64)
             }
         }
+        // Hinge sweep: MARS_CUDA_SWEEP_CHUNK pins the sorted-row chunk length
+        // of the two-pass recurrence (0 / unset = sized from n and p, see
+        // hinge_sweep.cu).
+        if (const char *sc = std::getenv("MARS_CUDA_SWEEP_CHUNK")) {
+            const long v = std::atol(sc);
+            if (v > 0) {
+                ctx->sweep_chunk = (size_t)v;
+            }
+        }
+        // MARS_CUDA_SWEEP_BLOCK pins the sweep's block size (a multiple of 32,
+        // <= 256); the tests use it to force several lanes per thread.
+        if (const char *sb = std::getenv("MARS_CUDA_SWEEP_BLOCK")) {
+            const long v = std::atol(sb);
+            if (v >= 32 && v <= 256 && v % 32 == 0) {
+                ctx->sweep_block = (int)v;
+            }
+        }
+        // MARS_CUDA_SWEEP_TILE pins the rows staged per shared-memory tile
+        // (a multiple of 4 in [4, 128]); the tile bounds the per-block shared
+        // memory and hence the blocks resident per SM.
+        if (const char *st = std::getenv("MARS_CUDA_SWEEP_TILE")) {
+            const long v = std::atol(st);
+            if (v >= 4 && v <= 128 && v % 4 == 0) {
+                ctx->sweep_tile = (int)v;
+            }
+        }
         if (std::getenv("MARS_CUDA_PROFILE")) {
             ctx->profile = 1;
             for (int i = 0; i < 8; ++i) {
@@ -507,6 +395,7 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         CUDA_CHECK(cudaMalloc(&ctx->dB,        nmt * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dBo_f32,   nmt * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dBo_f64,   nmt * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&ctx->dBo_rm,    nmt * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dy,        n * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dBx_f32,   npc * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->dBx_f64,   npc * sizeof(double)));
@@ -559,6 +448,16 @@ void context_destroy(Context *ctx)
                      ctx->ms_fill, ctx->ms_gemmT, ctx->ms_proj, ctx->ms_round,
                      ctx->ms_dgks, ctx->n_dgks_fired, ctx->ms_scale, gpu,
                      ctx->ms_sync_basis, ctx->ms_sync_xcols);
+        if (ctx->n_sweeps) {
+            std::fprintf(stderr,
+                         "[mars-cuda] PROFILE hinge sweep: %ld calls (host wall time)\n"
+                         "  sort + prep        %10.1f ms\n"
+                         "  pass 1 (carries)   %10.1f ms\n"
+                         "  pass 2 (scores)    %10.1f ms\n"
+                         "  argmax + copies    %10.1f ms\n",
+                         ctx->n_sweeps, ctx->ms_sweep_sort, ctx->ms_sweep_pass1,
+                         ctx->ms_sweep_pass2, ctx->ms_sweep_misc);
+        }
         for (int i = 0; i < 8; ++i) {
             if (ctx->ev[i]) {
                 cudaEventDestroy(ctx->ev[i]);
@@ -568,7 +467,9 @@ void context_destroy(Context *ctx)
     cudaFree(ctx->dB);
     cudaFree(ctx->dBo_f32);
     cudaFree(ctx->dBo_f64);
+    cudaFree(ctx->dBo_rm);
     cudaFree(ctx->dy);
+    sweep_free(ctx);
     cudaFree(ctx->dBx_f32);
     cudaFree(ctx->dBx_f64);
     cudaFree(ctx->dT);
@@ -627,6 +528,11 @@ void context_sync_basis(Context *ctx, size_t m,
                                    cudaMemcpyHostToDevice, ctx->stream));
         widen_kernel<<<grid_col, BLOCK, 0, ctx->stream>>>(
             ctx->dBo_f32 + c * n, ctx->dBo_f64 + c * n, n);
+        check_launch();
+        // Row-major copy for the hinge sweep's per-row gather (stride
+        // max_terms). A strided 4-byte scatter, once per appended column.
+        scatter_col_kernel<<<grid_col, BLOCK, 0, ctx->stream>>>(
+            ctx->dBo_f32 + c * n, ctx->dBo_rm + c, ctx->max_terms, n);
         check_launch();
         CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
     }
@@ -831,7 +737,8 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
                     const float *x, const int *mask,
                     float *Bx, size_t ldBx,
                     double *ybx,
-                    std::atomic<long> *dgks_counter)
+                    std::atomic<long> *dgks_counter,
+                    bool normalize_resident)
 {
     if (p == 0) {
         return;
@@ -859,11 +766,15 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
         CUDA_CHECK(cudaMemcpyAsync(ybx, ctx->dybx, p * sizeof(double),
                                    cudaMemcpyDeviceToHost, s));
     }
-    // Only when the caller needs the matrix itself (hinge sweep) do we physically
-    // normalize and copy Bx back. In linear_only Bx is nullptr and stays resident.
-    if (Bx) {
+    // Only when the caller needs the matrix itself (the CPU hinge sweep, or the
+    // GPU sweep reading it in place) do we physically normalize it, and only
+    // the CPU sweep copies it back. In linear_only Bx is nullptr and stays
+    // resident un-normalized (ybx carries the scale).
+    if (Bx || normalize_resident) {
         normalize_kernel<<<grid_np, block, 0, s>>>(ctx->dBx_f32, ctx->dscale, n);
         check_launch();
+    }
+    if (Bx) {
         CUDA_CHECK(cudaMemcpy2DAsync(
                        Bx, ldBx * sizeof(float),
                        ctx->dBx_f32, n * sizeof(float),

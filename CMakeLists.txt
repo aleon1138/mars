@@ -121,7 +121,7 @@ if(MARS_CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-    add_library(mars_cuda STATIC cuda/orthonormalize.cu)
+    add_library(mars_cuda STATIC cuda/orthonormalize.cu cuda/hinge_sweep.cu)
     set_target_properties(mars_cuda PROPERTIES
         POSITION_INDEPENDENT_CODE ON)   # linked into a shared object (marslib.so)
     target_include_directories(mars_cuda PRIVATE "${CMAKE_SOURCE_DIR}")  # kernels.h
@@ -241,6 +241,11 @@ if(BUILD_TESTING)
     # basis (no Eigen/GTest); see the usage comment in the source.
     add_executable(bench_sweep tests/bench_sweep.cc marsalgo.cc kernels.cc)
     target_link_libraries(bench_sweep PRIVATE mars_common)
+    if(MARS_CUDA)
+        # `bench_sweep ... cuda` times the GPU eval() against the CPU one.
+        target_link_libraries(bench_sweep PRIVATE mars_cuda CUDA::cudart)
+        target_compile_definitions(bench_sweep PRIVATE MARS_USE_CUDA)
+    endif()
     target_compile_definitions(unittest PRIVATE EIGEN_DONT_PARALLELIZE)
     target_link_libraries(unittest PRIVATE
         mars_common GTest::gtest GTest::gtest_main Threads::Threads)
@@ -250,12 +255,14 @@ if(BUILD_TESTING)
         target_link_libraries(unittest PRIVATE PkgConfig::EIGEN3)
     endif()
 
-    # CUDA orthonormalize tests: validate the GPU path against the same Eigen
-    # oracle and against the CPU kernel. Host-compiled (calls only the
-    # mars::cuda::* host API), linked against the CUDA static lib.
+    # CUDA tests: validate the GPU orthonormalize against the same Eigen
+    # oracle and the CPU kernel, and the GPU hinge sweep against the CPU
+    # MarsAlgo::eval(). Host-compiled (calls only the mars::cuda::* host API
+    # and MarsAlgo), linked against the CUDA static lib.
     if(MARS_CUDA)
-        add_executable(test_cuda tests/test_cuda.cc kernels.cc)
+        add_executable(test_cuda tests/test_cuda.cc marsalgo.cc kernels.cc)
         target_include_directories(test_cuda PRIVATE "${CMAKE_SOURCE_DIR}")
+        target_compile_definitions(test_cuda PRIVATE MARS_USE_CUDA)
         target_link_libraries(test_cuda PRIVATE
             mars_common mars_cuda CUDA::cudart
             GTest::gtest GTest::gtest_main Threads::Threads)

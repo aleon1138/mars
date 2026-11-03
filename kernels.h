@@ -17,6 +17,23 @@ namespace mars {
 constexpr double DGKS_GATE_RATIO_SQ = 9.0;
 
 /*
+ *  Relative floor on the hinge-sweep denominator den = ||h+||^2 - ||proj h+||^2,
+ *  the energy of the candidate hinge outside span(Bo, Bx). For a hinge inside
+ *  the span, den is the difference of two O(||h+||^2) sums and comes out as
+ *  noise of either sign at ~eps_f32/sqrt(n) of ||h+||^2 (the orthonormality
+ *  defect of the f32 Bo); the numerator uw is noise of the same origin, so
+ *  uw^2/den can score anywhere up to ||y_perp||^2 -- observed: in-span cuts at
+ *  den/||h+||^2 ~ 1e-11 scoring 1e-2, above every legitimate cut. The absolute
+ *  _tol (which grows with n while this floor shrinks) cannot catch it, so
+ *  require that at least this fraction of the hinge's energy be new. 8*eps_f32
+ *  ~ 1e-6 sits ~4 decades above the floor and well below any cut min_span
+ *  admits; below it the term would be a near-duplicate with an O(1/sqrt(den))
+ *  coefficient whose gain f32 cannot resolve anyway. Shared by the CPU sweep
+ *  (marsalgo.cc) and the CUDA sweep (cuda/hinge_sweep.cu).
+ */
+constexpr double HINGE_DEN_REL = 8.0 * 1.1920928955078125e-07;  // 8 * FLT_EPSILON
+
+/*
  *  Interact a candidate regressor `x` with the basis columns selected by
  *  `mask`, orthonormalize against `Bo`, and normalize each column. For each
  *  j in [0, p):

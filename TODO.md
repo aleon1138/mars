@@ -36,11 +36,45 @@ order and needs the on-grid positions handled exactly -- low priority.
 
 ## 2. CUDA: the hinge sweep
 
-Only `linear_only` runs on the GPU (`fit(cuda=True)`); the hinge sweep stays on
-the CPU. Porting it is a much bigger pass (sort / segmented scan / per-cut
-argmax) and the next CUDA frontier. With `append()` now 15× faster on the CPU
+**First pass landed and validated on-device (2026-11-03,
+`cuda/hinge_sweep.cu`; see the CLAUDE.md note of that date).** `fit(cuda=True)`
+runs the hinge sweep on the GPU as a two-pass chunked f64 recurrence: 112 ms
+per X column at n=5e5, m=100 (CPU one core 2.8 s), 532 ms at m=250 (12.5 s).
+Pass 1 (carries) is ~38 ms and pass 2 (scores) ~65 ms at m=100 against an f64
+FMA floor of ~14 ms per pass. Next levers, in order of expected gain:
+
+- **Batched on-grid reduction.** The per-grid-point `ff`/`fy` warp-shuffle
+  reductions are ~27 ms of pass 2's 65 ms at min_span=7 (5 f64 add rounds per
+  warp per value). Buffer each thread's per-slot partials in shared memory and
+  reduce once per tile with each thread summing a contiguous run (padded rows,
+  no shuffles): ~4× fewer f64 warp instructions for the same sums. Needs a
+  slot cap (min_span=1 gives 16 slots per 16-row tile = 128 KB of partials at
+  128 threads), e.g. a smaller tile when min_span is small.
+- **Spread the b/y lanes one column per thread** (lanes m+1..m+4 and m+5..m+8,
+  carries still stored at the canonical m+1 / m+2 slots). Today the single
+  parent-b lane issues 8 extra k0/k1 FMAs alone in its warp, so that warp
+  costs 2× and the block ~1.25×.
+- **JB=8 columns per block**: halves the Bo conversion and the gathered row
+  traffic per FMA (~+32 registers; pass 2 is at 116 with 4 blocks/SM).
+- **Pass 1 as plain sums.** With the carry defined at the end of step b-1,
+  `f_loc = Σ_t b_t·v_t·D(t,b-1)` and `g_loc = Σ_t b_t·v_t` are plain
+  reductions over the chunk (per-chunk suffix sums of `d` give the weights), so
+  pass 1 needs no sequential dependency: more ILP per thread, or a batched f64
+  GEMM over pre-permuted rows. Blocked f32 with f64 cross-chunk accumulation
+  (like the T GEMM) would be the real lever but needs the cancellation study
+  first: ~sqrt(L)·eps_f32 within-chunk error on O(sqrt(L/n)) partials is
+  ~1e-9 relative on the O(1) carries, against a 1e-6 relative gate.
+- Cache the sort permutation (and its inverse) per X column across epochs; it
+  never changes within a fit (sort+prep is 1.5 ms per eval, so low priority).
+- `m + 3 > 1024` lanes throws; lift by instantiating more lanes per thread.
+- Re-profile a full hinge fit (`tests/bench_eval.py --cuda`, `MARS_CUDA_PROFILE=1`):
+  `append()` and `sync_basis` (a strided row-major scatter per appended
+  column, 308 ms over the 100-column bench) now matter relative to a 0.1 s eval.
+
+With `append()` now 15× faster on the CPU
 (it had become the dominant per-epoch cost under the GPU path), re-profile a
-production `linear_only` fit with `MARS_CUDA_PROFILE=1` before deciding; the
+production fit with `MARS_CUDA_PROFILE=1` (now also prints the sweep phases)
+before deciding on the next step; the
 GPU phases were flat (T GEMM 28%, round/norm 24%, fill 23%, DGKS 19%,
 projection 6%) and Python orchestration ~16% as of 2026-06-17.
 

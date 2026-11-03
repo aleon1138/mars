@@ -5,14 +5,16 @@
  *  once linear_only (orthonormalize + linear ΔSSE) and once with the hinge sweep.
  *  Single-threaded; the difference between the two eval() timings is the sweep.
  *
- *  Usage:  bench_sweep [n] [m] [px] [min_span] [repeat] [dump]
+ *  Usage:  bench_sweep [n] [m] [px] [min_span] [repeat] [dump] [cuda]
  *    n        rows                       (default 500000)
  *    m        basis columns to grow to   (default 100)
  *    px       X columns                  (default 20)
  *    min_span hinge-cut grid spacing     (default 7, ~Friedman's at n=5e5)
  *    repeat   timed eval() repeats       (default 2)
  *    dump     optional path; writes the final linear/hinge/cut arrays as raw
- *             f64 for a bit-exact A/B comparison between builds
+ *             f64 for a bit-exact A/B comparison between builds ("-" = none)
+ *    cuda     1 to time eval(cuda=true) (GPU orthonormalize + GPU hinge sweep;
+ *             CUDA build only) and print its max deviation from the CPU eval
  *
  *  The basis is grown the way fit() grows it -- degree <= 3, no input repeated
  *  within a term, alternating linear terms and hinge pairs -- so it is as well
@@ -112,17 +114,47 @@ int main(int argc, char **argv)
     std::vector<char> mask(m, 1);
     std::vector<double> lin(m), hin(m), cutp(m);
     const int end_span = (int)(0.02 * n);
+    const bool cuda = arg(argc, argv, 7, 0) != 0;
+#ifndef MARS_USE_CUDA
+    if (cuda) {
+        std::fprintf(stderr, "bench_sweep: not a CUDA build (cuda arg ignored)\n");
+    }
+    const bool use_cuda = false;
+#else
+    const bool use_cuda = cuda;
+#endif
     for (int linear = 1; linear >= 0; --linear) {
         algo.eval(lin.data(), hin.data(), cutp.data(), 0, (const bool *)mask.data(),
-                  min_span, end_span, linear != 0);  // warm
+                  min_span, end_span, linear != 0, use_cuda);  // warm
         const double t0 = now_s();
         for (int r = 0; r < repeat; ++r) {
             algo.eval(lin.data(), hin.data(), cutp.data(), 0, (const bool *)mask.data(),
-                      min_span, end_span, linear != 0);
+                      min_span, end_span, linear != 0, use_cuda);
         }
         const double dt = (now_s() - t0) / repeat;
-        std::printf("eval(%s): %.3f s  (%.2f ms per basis)\n", linear ? "linear" : "hinge ",
-                    dt, 1e3 * dt / m);
+        std::printf("eval(%s%s): %.3f s  (%.2f ms per basis)\n", linear ? "linear" : "hinge ",
+                    use_cuda ? ", cuda" : "", dt, 1e3 * dt / m);
+    }
+    if (use_cuda) {
+        // One CPU hinge eval for reference: time it and report the deviation.
+        std::vector<double> lin_c(m), hin_c(m), cut_c(m);
+        const double t0 = now_s();
+        algo.eval(lin_c.data(), hin_c.data(), cut_c.data(), 0, (const bool *)mask.data(),
+                  min_span, end_span, false, false);
+        const double dt = now_s() - t0;
+        double max_lin = 0.0, max_hin = 0.0;
+        size_t n_cut_diff = 0;
+        for (size_t j = 0; j < m; ++j) {
+            max_lin = std::max(max_lin, std::fabs(lin[j] - lin_c[j]));
+            max_hin = std::max(max_hin, std::fabs(hin[j] - hin_c[j]));
+            const bool nan_g = std::isnan(cutp[j]), nan_c = std::isnan(cut_c[j]);
+            if (nan_g != nan_c || (!nan_g && cutp[j] != cut_c[j])) {
+                ++n_cut_diff;
+            }
+        }
+        std::printf("eval(hinge , cpu ): %.3f s  (%.2f ms per basis)\n", dt, 1e3 * dt / m);
+        std::printf("gpu vs cpu: max |dlinear| %.3e, max |dhinge| %.3e, %zu/%zu cuts differ\n",
+                    max_lin, max_hin, n_cut_diff, m);
     }
     // Keep the outputs observable; optionally dump them for an A/B diff.
     double chk = 0.0;
@@ -130,7 +162,7 @@ int main(int argc, char **argv)
         chk += lin[j] + hin[j];
     }
     std::printf("# checksum %.9e\n", chk);
-    if (argc > 6) {
+    if (argc > 6 && std::string(argv[6]) != "-") {
         FILE *f = std::fopen(argv[6], "wb");
         if (!f) {
             return 1;

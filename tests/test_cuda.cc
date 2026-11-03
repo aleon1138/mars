@@ -485,3 +485,220 @@ TEST(CudaKernelsTest, BatchDgksRetryMatchesPerColumn)
     ASSERT_GT(batch_counter.load(), 0);
     ASSERT_EQ(batch_counter.load(), percol_counter.load());
 }
+
+// ---------------------------------------------------------------------------
+// GPU hinge sweep vs the CPU MarsAlgo::eval() (the oracle). The basis is grown
+// the way fit() grows it (see tests/bench_sweep.cc) so it is as well
+// conditioned as a real fit's; MARS_CUDA_KCHUNK=0 selects the native-f64
+// orthonormalize so the comparison isolates the sweep.
+// ---------------------------------------------------------------------------
+#include "marsalgo.h"
+#include <cstdlib>
+#include <string>
+
+namespace {
+
+struct SweepProblem {
+    size_t n, px;
+    std::vector<float> X, y, w;
+};
+
+// Random inputs with planted hinge structure. Column 0 is quantized (ties in
+// the sort); column 1 is exactly zero on a block of rows (a zero-support tail).
+SweepProblem make_sweep_problem(size_t n, size_t px, unsigned seed)
+{
+    SweepProblem P;
+    P.n  = n;
+    P.px = px;
+    P.X.resize(n * px);
+    P.y.resize(n);
+    P.w.assign(n, 1.0f);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    for (auto &v : P.X) {
+        v = gauss(rng);
+    }
+    for (size_t i = 0; i < n; ++i) {
+        P.X[i] = std::round(P.X[i] * 4.0f) / 4.0f;      // ties
+        if (i % 7 == 3) {
+            P.X[n + i] = 0.0f;                          // exact zeros
+        }
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const float x0 = P.X[i], x1 = P.X[n + i], x2 = P.X[2 * n + i],
+                    x3 = P.X[3 * n + i], x4 = P.X[4 * n + i];
+        P.y[i] = std::max(x0 - 0.3f, 0.0f) - 0.8f * std::max(0.5f - x1, 0.0f)
+                 + 0.6f * x2 * std::max(x3, 0.0f) + 0.4f * x4 + 0.3f * gauss(rng);
+    }
+    return P;
+}
+
+// Grow the basis to m columns like fit(): degree <= 3, no input repeated in a
+// term, alternating linear terms and mirrored hinge pairs; a rejected
+// (collinear) append is skipped.
+void grow_basis(MarsAlgo &algo, size_t px, size_t m, std::mt19937 &rng)
+{
+    std::vector<std::vector<int>> inputs(1);
+    std::vector<char> used(px * (m + 2), 0);
+    std::uniform_real_distribution<float> cut(-1.0f, 1.0f);
+    int step = 0;
+    while ((size_t)algo.nbasis() < m) {
+        int xcol, bcol;
+        do {
+            xcol = (int)(rng() % px);
+            bcol = (int)(rng() % algo.nbasis());
+        } while (inputs[bcol].size() >= 3 || used[xcol * (m + 2) + bcol] ||
+                 std::find(inputs[bcol].begin(), inputs[bcol].end(), xcol) != inputs[bcol].end());
+        used[xcol * (m + 2) + bcol] = 1;
+        const bool  hinge = (step++ % 2) == 1;
+        const float h     = cut(rng);
+        for (char type : (hinge ? std::string("+-") : std::string("l"))) {
+            if ((size_t)algo.nbasis() >= m) {
+                break;
+            }
+            if (algo.append(type, xcol, bcol, h) < 0) {
+                break;
+            }
+            inputs.push_back(inputs[bcol]);
+            inputs.back().push_back(xcol);
+        }
+    }
+}
+
+// Three-way comparison over several X columns, grid spacings and masks:
+//   ref : CPU orthonormalize + CPU sweep            (eval(cuda=false))
+//   hyb : GPU orthonormalize + CPU sweep            (cuda=true, MARS_CUDA_SWEEP=0)
+//   gpu : GPU orthonormalize + GPU sweep            (cuda=true)
+// hyb and gpu sweep the SAME device Bx, so they must agree to f64
+// reassociation error (tight). gpu vs ref additionally carries the GPU
+// orthonormalize's f32 projection (Bx differs by ~1 f32 ulp), which the score
+// amplifies by h2/den near the HINGE_DEN_REL gate -- so that comparison is
+// loose and reported, not the correctness gate for the sweep.
+void check_sweep(size_t n, size_t px, size_t m, unsigned seed, const char *block)
+{
+    setenv("MARS_CUDA_KCHUNK", "0", 1);
+    if (block) {
+        setenv("MARS_CUDA_SWEEP_BLOCK", block, 1);
+    }
+    else {
+        unsetenv("MARS_CUDA_SWEEP_BLOCK");
+    }
+
+    SweepProblem P = make_sweep_problem(n, px, seed);
+    MarsAlgo algo(P.X.data(), P.y.data(), P.w.data(), n, px, m + 2, n);
+    std::mt19937 rng(seed + 1);
+    grow_basis(algo, px, m, rng);
+    ASSERT_EQ((size_t)algo.nbasis(), m);
+
+    const int end_span = (int)(0.02 * n);
+    std::vector<double> lin_r(m), hin_r(m), cut_r(m);
+    std::vector<double> lin_h(m), hin_h(m), cut_h(m);
+    std::vector<double> lin_g(m), hin_g(m), cut_g(m);
+    int    n_found = 0, n_cut_hg = 0, n_cut_gr = 0, n_rel_gr_1e3 = 0;
+    double max_rel_hg = 0.0, max_rel_gr = 0.0, max_abs_gr = 0.0;
+    for (int xcol : {0, 1, 3, (int)px - 1}) {
+        for (int min_span : {1, 7}) {
+            for (int masked : {0, 1}) {
+                std::vector<char> mask(m, 1);
+                if (masked) {
+                    for (size_t j = 0; j < m; j += 3) {
+                        mask[j] = 0;
+                    }
+                }
+                const bool *bm = (const bool *)mask.data();
+                algo.eval(lin_r.data(), hin_r.data(), cut_r.data(), xcol, bm,
+                          min_span, end_span, false, false);
+                setenv("MARS_CUDA_SWEEP", "0", 1);
+                algo.eval(lin_h.data(), hin_h.data(), cut_h.data(), xcol, bm,
+                          min_span, end_span, false, true);
+                setenv("MARS_CUDA_SWEEP", "1", 1);
+                algo.eval(lin_g.data(), hin_g.data(), cut_g.data(), xcol, bm,
+                          min_span, end_span, false, true);
+                for (size_t j = 0; j < m; ++j) {
+                    SCOPED_TRACE("xcol=" + std::to_string(xcol) + " min_span=" +
+                                 std::to_string(min_span) + " masked=" + std::to_string(masked) +
+                                 " basis=" + std::to_string(j));
+                    if (!mask[j]) {
+                        EXPECT_EQ(hin_g[j], 0.0);
+                        EXPECT_TRUE(std::isnan(cut_g[j]));
+                        continue;
+                    }
+                    // Same device Bx up to the f64-ULP run-to-run noise of the
+                    // orthonormalize's atomic reductions (TODO.md): the linear
+                    // term agrees to ULPs, not bit-exactly.
+                    EXPECT_NEAR(lin_g[j], lin_h[j], 1e-15 + 1e-12 * std::abs(lin_h[j]));
+                    // The sweep itself: f64 reassociation, amplified by h2/den
+                    // near the gate (observed <= 1e-9; a logic bug shows as >= 1e-4).
+                    const double rel_hg = std::abs(hin_g[j] - hin_h[j]) /
+                                          std::max(1e-300, std::abs(hin_h[j]));
+                    max_rel_hg = std::max(max_rel_hg, rel_hg);
+                    EXPECT_NEAR(hin_g[j], hin_h[j], 1e-12 + 1e-8 * std::abs(hin_h[j]));
+                    EXPECT_EQ(std::isnan(cut_g[j]), std::isnan(cut_h[j]));
+                    if (!std::isnan(cut_h[j]) && !std::isnan(cut_g[j])) {
+                        ++n_found;
+                        if (cut_g[j] != cut_h[j]) {
+                            ++n_cut_hg;
+                            // A different cut is only acceptable as a tie: the
+                            // two scores must then agree to the same tolerance.
+                            EXPECT_NEAR(hin_g[j], hin_h[j], 1e-12 + 1e-8 * std::abs(hin_h[j]))
+                                    << "cut mismatch vs the CPU sweep on the same Bx: gpu "
+                                    << cut_g[j] << " hyb " << cut_h[j];
+                        }
+                    }
+                    // Against the all-CPU eval: loose (f32 projection in the GPU
+                    // orthonormalize), with a gross-error bound.
+                    EXPECT_NEAR(lin_g[j], lin_r[j], 1e-8 + 1e-6 * std::abs(lin_r[j]));
+                    const double rel_gr = std::abs(hin_g[j] - hin_r[j]) /
+                                          std::max(1e-300, std::abs(hin_r[j]));
+                    max_rel_gr = std::max(max_rel_gr, rel_gr);
+                    max_abs_gr = std::max(max_abs_gr, std::abs(hin_g[j] - hin_r[j]));
+                    n_rel_gr_1e3 += (rel_gr > 1e-3);
+                    EXPECT_NEAR(hin_g[j], hin_r[j], 1e-6 + 0.1 * std::abs(hin_r[j]));
+                    if (!std::isnan(cut_r[j]) && !std::isnan(cut_g[j]) && cut_g[j] != cut_r[j]) {
+                        ++n_cut_gr;
+                    }
+                }
+            }
+        }
+    }
+    EXPECT_GT(n_found, 0);
+    std::printf("[ sweep A/B ] n=%zu m=%zu: gpu vs hyb (same Bx): max rel %.2e, %d/%d cuts differ;"
+                " gpu vs cpu: max rel %.2e (abs %.2e), %d pairs > 1e-3, %d cuts differ\n",
+                n, m, max_rel_hg, n_cut_hg, n_found, max_rel_gr, max_abs_gr,
+                n_rel_gr_1e3, n_cut_gr);
+}
+
+}  // namespace
+
+TEST(CudaSweepTest, MatchesCpuEval)
+{
+    if (!cuda_available()) {
+        GTEST_SKIP() << "no CUDA device available";
+    }
+    check_sweep(30011, 12, 40, 0x5EED, nullptr);   // one lane per thread (CPT=1)
+}
+
+TEST(CudaSweepTest, MatchesCpuEvalTwoLanesPerThread)
+{
+    if (!cuda_available()) {
+        GTEST_SKIP() << "no CUDA device available";
+    }
+    check_sweep(30011, 12, 40, 0x5EEE, "32");      // m+3 = 43 lanes on 32 threads (CPT=2)
+}
+
+TEST(CudaSweepTest, MatchesCpuEvalFourLanesPerThread)
+{
+    if (!cuda_available()) {
+        GTEST_SKIP() << "no CUDA device available";
+    }
+    check_sweep(12007, 20, 100, 0x5EEF, "32");     // 103 lanes on 32 threads (CPT=4)
+}
+
+TEST(CudaSweepTest, MatchesCpuEvalSmallN)
+{
+    if (!cuda_available()) {
+        GTEST_SKIP() << "no CUDA device available";
+    }
+    // Fewer rows than one chunk (tests the single-chunk / short-tile paths).
+    check_sweep(601, 8, 12, 0x5EF0, nullptr);
+}
