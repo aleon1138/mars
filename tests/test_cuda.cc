@@ -628,11 +628,12 @@ void check_sweep(size_t n, size_t px, size_t m, unsigned seed, const char *block
                     // term agrees to ULPs, not bit-exactly.
                     EXPECT_NEAR(lin_g[j], lin_h[j], 1e-15 + 1e-12 * std::abs(lin_h[j]));
                     // The sweep itself: f64 reassociation, amplified by h2/den
-                    // near the gate (observed <= 1e-9; a logic bug shows as >= 1e-4).
+                    // near the gate (observed <= 7e-9 at m=260; a logic bug shows
+                    // as >= 1e-4).
                     const double rel_hg = std::abs(hin_g[j] - hin_h[j]) /
                                           std::max(1e-300, std::abs(hin_h[j]));
                     max_rel_hg = std::max(max_rel_hg, rel_hg);
-                    EXPECT_NEAR(hin_g[j], hin_h[j], 1e-12 + 1e-8 * std::abs(hin_h[j]));
+                    EXPECT_NEAR(hin_g[j], hin_h[j], 1e-12 + 1e-7 * std::abs(hin_h[j]));
                     EXPECT_EQ(std::isnan(cut_g[j]), std::isnan(cut_h[j]));
                     if (!std::isnan(cut_h[j]) && !std::isnan(cut_g[j])) {
                         ++n_found;
@@ -640,7 +641,7 @@ void check_sweep(size_t n, size_t px, size_t m, unsigned seed, const char *block
                             ++n_cut_hg;
                             // A different cut is only acceptable as a tie: the
                             // two scores must then agree to the same tolerance.
-                            EXPECT_NEAR(hin_g[j], hin_h[j], 1e-12 + 1e-8 * std::abs(hin_h[j]))
+                            EXPECT_NEAR(hin_g[j], hin_h[j], 1e-12 + 1e-7 * std::abs(hin_h[j]))
                                     << "cut mismatch vs the CPU sweep on the same Bx: gpu "
                                     << cut_g[j] << " hyb " << cut_h[j];
                         }
@@ -692,6 +693,16 @@ TEST(CudaSweepTest, MatchesCpuEvalFourLanesPerThread)
         GTEST_SKIP() << "no CUDA device available";
     }
     check_sweep(12007, 20, 100, 0x5EEF, "32");     // 103 lanes on 32 threads (CPT=4)
+}
+
+TEST(CudaSweepTest, MatchesCpuEvalLargeBasis)
+{
+    if (!cuda_available()) {
+        GTEST_SKIP() << "no CUDA device available";
+    }
+    // 260 columns: m + 1 + 2*JB lanes exceed one 256-thread block, so the host
+    // picks two lanes per thread on a block sized to the lane count.
+    check_sweep(8009, 24, 260, 0x5EF1, nullptr);
 }
 
 TEST(CudaSweepTest, MatchesCpuEvalSmallN)

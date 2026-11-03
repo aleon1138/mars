@@ -253,30 +253,41 @@ chunk applies, so every row's weight matches the CPU's), and pass 2 reruns
 each chunk from its carry-in scoring the min_span grid with the same
 `HINGE_DEN_REL` gate (now in `kernels.h`) and support clipping (`i_last[j]`,
 the last sorted position with a nonzero parent, clamped to `tail-1`). One
-block per (chunk, 4 columns); thread lanes are the m Bo columns, the Bx
-column, a parent-b lane (b2/bd/‖h+‖²) and a y lane (vb/w); Bo is kept
-row-major on the device (`dBo_rm`) so the gathered row is contiguous, staged
-16 rows at a time in shared memory with the block-uniform per-row values
-(d, y, b, Bx) staged as f64. Everything accumulates in f64 (the rejected f32
-f/g mode applies here too).
-- **Measured** (`bench_sweep 500000 {100,250} 20 7 2 - 1`): eval(hinge) 112 ms
-  at m=100 (CPU one core: 2.8 s) and 532 ms at m=250 (12.5 s), i.e. ~25×;
+block per (chunk, JB=4 columns); thread lanes are the m Bo columns, the Bx
+column, one parent-b lane per column (b2/bd/‖h+‖², in consecutive threads so
+their k0/k1 FMAs share two warp instructions) and one y lane per column
+(vb/w); Bo is kept row-major on the device (`dBo_rm`) so the gathered row is
+contiguous, staged 16 rows at a time in shared memory with the block-uniform
+per-row values (d, y, b, Bx) staged as f64. Grid scoring writes per-thread
+`ff`/`fy` partials to shared memory and reduces them cooperatively per grid
+slot (each thread sums a strided run, then a short shuffle). Everything
+accumulates in f64 (the rejected f32 f/g mode applies here too).
+- **Measured** (`bench_sweep 500000 {100,250} 20 7 2 - 1`): eval(hinge) 76 ms
+  at m=100 (CPU one core: 2.1 s, 28×) and 386 ms at m=250 (12.4 s, 32×);
   identical cuts at m=100, 1/250 near-tie at m=250; vs the CPU sweep on the
-  *same* device `Bx` the scores agree to ≤ 7e-10 relative with identical cuts
-  (`CudaSweepTest.*`). Per eval at m=100: sort+prep 1.5 ms, pass 1 38 ms, pass 2
-  65 ms, argmax ~0. The f64 FMA floor is ~14 ms per pass.
-- **Where the time goes (next levers, see TODO.md):** (1) f32→f64 conversion
-  runs at the f64 rate on this card -- staging the uniform values as f64 took
-  pass 1 from 67 to 38 ms; the per-thread Bo conversion (1 per 8 FMAs) remains.
-  (2) The on-grid `ff`/`fy` reduction is 5 shuffle+f64-add rounds per warp per
-  value: ~70% extra f64 work at min_span=7 (pass 2 − pass 1 = 27 ms); a
-  per-tile batched reduction through shared memory does the same sums in ~4×
-  fewer warp instructions. (3) The single parent-b lane does its k0/k1 FMAs
-  alone in its warp, so that warp issues 2× the FMA instructions (~15–25% of
-  the block); spreading the b/y lanes one column per thread fixes it. (4)
-  Tile size (`MARS_CUDA_SWEEP_TILE`) 8/16/32 measured identical, 64 15% slower:
-  residency is not the limit. No register spills (pass 2: 116 regs, pass 1: 74
-  at one lane per thread).
+  *same* device `Bx` the scores agree to ≤ 7e-9 relative with identical cuts
+  (`CudaSweepTest.*`, up to m=260). Per eval: sort+prep 1.5 ms, pass 1 27 / 165
+  ms, pass 2 41 / 196 ms (m=100 / 250). Pass 1 sits at ~1.9× the f64 FMA floor
+  (14 / 88 ms); the grid scoring is the pass 2 − pass 1 difference.
+- **What the tuning found (2026-11-03, all measured on the box):** (1) f32→f64
+  conversion runs at the f64 rate on this card -- staging the uniform values as
+  f64 took pass 1 from 67 to 38 ms. (2) The per-grid-point warp-shuffle
+  reduction (5 f64-add rounds per warp per value) was ~70% extra f64 work at
+  min_span=7; the shared-memory batched reduction cut the grid cost from 27 to
+  ~12 ms at m=100. (3) The single parent-b lane issuing 8 k0/k1 FMAs alone in
+  its warp cost ~25% of pass 1; spreading the b/y lanes one column per thread
+  took pass 1 from 38 to 27 ms. (4) Residency matters for pass 2 once the f64
+  reduction work is gone: a block past ~34 KB of shared memory (one resident
+  block) costs ~2×, so the partials buffer is one grid slot wide and only as
+  wide as the lanes that contribute, and the pass 2 tile shrinks to fit;
+  larger batches (`MARS_CUDA_SWEEP_BATCH`) measured no better. (5) Idle padding
+  lanes cost real FMAs: with 259 lanes a 256-thread block at two lanes per
+  thread wasted half the work (pass 1 +34% at m=250); the block is sized to
+  the lane count (160 threads for 259 lanes). (6) 8 columns per block
+  (`MARS_CUDA_SWEEP_JB=8`) ties at m=100 and loses at m=250 (registers/tile),
+  so 4 is the default. No register spills in the default variants (pass 2:
+  117 regs, pass 1: 62 at one lane per thread; the JB=8 four-lanes-per-thread
+  variant spills).
 - **Validation lesson:** a CPU emulation of the chunked scan matched the
   sequential sweep to 1e-13 on a heavily quantized column while the GPU tests
   failed by up to 3% on continuous ones -- the carry had been defined as the
@@ -291,10 +302,12 @@ f/g mode applies here too).
   on anything downstream of it.
 - Knobs: `MARS_CUDA_SWEEP=0` (GPU orthonormalize + CPU sweep),
   `MARS_CUDA_SWEEP_CHUNK` (rows per chunk; default sized for ~6k blocks),
-  `MARS_CUDA_SWEEP_TILE` (rows per shared tile), `MARS_CUDA_SWEEP_BLOCK` (block
-  size; the tests use 32 to force 2 and 4 lanes per thread),
+  `MARS_CUDA_SWEEP_TILE` (rows per shared tile, both passes),
+  `MARS_CUDA_SWEEP_BLOCK` (block size; the tests use 32 to force 2 and 4 lanes
+  per thread), `MARS_CUDA_SWEEP_JB` (4 or 8 columns per block),
+  `MARS_CUDA_SWEEP_BATCH` (grid slots per reduction batch),
   `MARS_CUDA_PROFILE=1` (per-phase times at context destroy),
-  `MARS_CUDA_VERBOSE=1` (the chosen shape). `m + 3 > 1024` lanes throws.
+  `MARS_CUDA_VERBOSE=1` (the chosen shape). `m + 1 + 2·JB > 1024` lanes throws.
   Tests: `CudaSweepTest.*` in `tests/test_cuda.cc` (three-way: CPU, hybrid,
   GPU), `tests/test_cuda.py` (whole fits: identical basis for the hinge fit),
   `bench_sweep ... 1` (timing + deviation vs the CPU eval).

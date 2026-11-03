@@ -180,6 +180,8 @@ struct Context {
     size_t  sweep_chunk = 0;       // MARS_CUDA_SWEEP_CHUNK: fixed chunk length (0 = auto)
     int     sweep_block = 0;       // MARS_CUDA_SWEEP_BLOCK: fixed block size (0 = auto; tests)
     int     sweep_tile  = 0;       // MARS_CUDA_SWEEP_TILE: rows staged per tile (0 = auto)
+    int     sweep_jb    = 4;       // MARS_CUDA_SWEEP_JB: columns per block, 4 or 8
+    int     sweep_batch = 0;       // MARS_CUDA_SWEEP_BATCH: grid slots per reduction batch (0 = 1)
 
     // host staging
     std::vector<float>  h_stage;    // (n) gather one Bo column

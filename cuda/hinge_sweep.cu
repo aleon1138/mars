@@ -68,8 +68,7 @@ namespace cuda {
 
 namespace {
 
-constexpr int JB        = 4;     // candidate columns per block (share the gathered Bo row)
-constexpr int MAX_LANES = 1024;  // m + 3 <= MAX_LANES (CPT <= 4 at blockDim 256)
+constexpr int MAX_LANES = 1024;  // m + 1 + 2*JB <= MAX_LANES (CPT <= 4 at blockDim 256)
 constexpr int PROP_BLOCK = 256;
 
 // --- prep kernels -----------------------------------------------------------
@@ -184,25 +183,61 @@ __device__ __forceinline__ int first_grid_at(int i0, int head, int min_span)
     return g0 + ((i0 - g0 + min_span - 1) / min_span) * min_span;
 }
 
+// Select arr[idx] from a register array with an unrolled chain, so a
+// per-thread runtime index never forces the array into local memory.
+template <int N, typename T>
+__device__ __forceinline__ T sel(const T (&arr)[N], int idx)
+{
+    T v = arr[0];
+    #pragma unroll
+    for (int e = 1; e < N; ++e) {
+        v = (idx == e) ? arr[e] : v;
+    }
+    return v;
+}
+
 /*
- *  One block per (chunk ck, column group jg). PASS1: start from zero, no
- *  scoring, write the local end state (after the chunk's last step) as the
- *  chunk's carry record. PASS2: start from the carry-in, score on-grid cuts,
- *  write the chunk's best per column.
+ *  One block per (chunk ck, column group jg of JB columns). PASS1: start from
+ *  zero, no scoring, write the local end state (after the chunk's last step)
+ *  as the chunk's carry record. PASS2: start from the carry-in, score on-grid
+ *  cuts, write the chunk's best per column.
  *
- *  Dynamic shared memory layout (TS = rows per tile, Lpad = CPT*blockDim).
- *  The block-uniform per-row values are staged as f64: converted once per
- *  tile rather than by every thread at every step (f32->f64 conversion runs
- *  at the f64 rate, so nine of them per step would cost as much as the eight
- *  FMAs). Only the per-thread Bo value is converted in the step loop.
- *      double s_acc[TS][JB][4]    (PASS2) per-slot ff, fy, h2, w
- *      double s_d  [TS], s_y[TS]  delta and gathered y
- *      double s_b  [JB][TS]       gathered parent b per column
- *      double s_bx [JB][TS]       gathered Bx per column
- *      float  s_bo [TS][Lpad]     gathered Bo rows (lanes c < m)
- *      int    s_k  [TS]           row index of each sorted position
+ *  Thread lanes (c = tid + q*blockDim, q < CPT), LANES = m + 1 + 2*JB:
+ *      c < m           Bo column c, all JB columns in slots f[q][jj], g[q][jj]
+ *      c == m          Bx lane, all JB columns
+ *      c == m+1+jj     parent-b lane of column jj, in slot 0 only (b2, bd and
+ *                      the k0/k1 halves of ||h+||^2); the four lanes sit in
+ *                      consecutive threads so their k0/k1 FMAs share two warp
+ *                      instructions instead of one thread issuing eight
+ *      c == m+1+JB+jj  y lane of column jj, slot 0 only (vb, w)
+ *  The carry record per column keeps the canonical LCAR = m+3 layout
+ *  (Bo columns, Bx, b, y), independent of JB.
+ *
+ *  Slot 0 is gated by "any column active" (block-uniform) so the b/y lanes'
+ *  own column is always advanced; the other slots by that column's own gate.
+ *  Updates past a column's i_last are never read, so the over-gating is
+ *  harmless.
+ *
+ *  Dynamic shared memory (TS = rows per tile, Lpad = CPT*blockDim, PW = the
+ *  threads holding Bo/Bx lanes (all of them when CPT > 1, m+1 otherwise),
+ *  PST = PW rounded up plus a 4-double pad against bank conflicts, SMAX =
+ *  grid slots per reduction batch):
+ *      double s_acc [SMAX][JB][4]        (PASS2) per-slot ff, fy, h2, w
+ *      double s_part[SMAX][JB][2][PST]   (PASS2) per-thread ff/fy partials
+ *      double s_d[TS], s_y[TS]           delta and gathered y
+ *      double s_b[JB][TS], s_bx[JB][TS]  gathered parent b and Bx per column
+ *      float  s_bo[TS][Lpad]             gathered Bo rows (lanes c < m)
+ *      int    s_k[TS]                    row index of each sorted position
+ *  The block-uniform per-row values are staged as f64 (f32->f64 conversion
+ *  runs at the f64 rate; only the per-thread Bo value is converted per step).
+ *
+ *  On-grid scoring (PASS2): at each grid point every thread writes its two
+ *  partials per column to s_part; after SMAX grid points (or at the chunk
+ *  end) the block reduces them cooperatively -- GRP threads per (slot, column,
+ *  value) each summing a strided run, then a GRP-wide shuffle -- which costs
+ *  ~4x fewer f64 instructions than a per-point warp-shuffle reduction.
  */
-template <int CPT, bool PASS1>
+template <int CPT, int JB, bool PASS1>
 __global__ void __launch_bounds__(256)
 sweep_kernel(const float *__restrict__ Bo_rm, int ldBo,
              const float *__restrict__ B, const float *__restrict__ Bx,
@@ -210,28 +245,29 @@ sweep_kernel(const float *__restrict__ Bo_rm, int ldBo,
              const float *__restrict__ d, const int *__restrict__ mask,
              const double *__restrict__ ybo, const double *__restrict__ ybx,
              const int *__restrict__ i_last,
-             size_t n, int m, int p, int L, int tail, int head, int min_span, int TS,
-             double tol,
+             size_t n, int m, int p, int L, int tail, int head, int min_span,
+             int TS, int SMAX, int GRP, int PW, int PST, double tol,
              double *__restrict__ carry_f, double *__restrict__ carry_g,
              double *__restrict__ carry_h2,
              double *__restrict__ best_sse, int *__restrict__ best_idx)
 {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     const int BD   = blockDim.x;
-    const int Lc   = m + 3;
+    const int LCAR = m + 3;
     const int Lpad = CPT * BD;
-    double *s_acc = reinterpret_cast<double *>(smem_raw);          // [TS][JB][4] (PASS2 only)
-    double *s_d   = s_acc + (PASS1 ? 0 : (size_t)TS * JB * 4);     // [TS]
-    double *s_y   = s_d + TS;                                      // [TS]
-    double *s_b   = s_y + TS;                                      // [JB][TS]
-    double *s_bx  = s_b + JB * TS;                                 // [JB][TS]
-    float  *s_bo  = reinterpret_cast<float *>(s_bx + JB * TS);     // [TS][Lpad]
-    int    *s_k   = reinterpret_cast<int *>(s_bo + (size_t)TS * Lpad);
+    double *s_acc  = reinterpret_cast<double *>(smem_raw);                 // [SMAX][JB][4]
+    double *s_part = s_acc + (PASS1 ? 0 : (size_t)SMAX * JB * 4);          // [SMAX][JB][2][PST]
+    double *s_d    = s_part + (PASS1 ? 0 : (size_t)SMAX * JB * 2 * PST);   // [TS]
+    double *s_y    = s_d + TS;                                             // [TS]
+    double *s_b    = s_y + TS;                                             // [JB][TS]
+    double *s_bx   = s_b + JB * TS;                                        // [JB][TS]
+    float  *s_bo   = reinterpret_cast<float *>(s_bx + JB * TS);            // [TS][Lpad]
+    int    *s_k    = reinterpret_cast<int *>(s_bo + (size_t)TS * Lpad);    // [TS]
 
-    const int ck = blockIdx.x;
-    const int jg = blockIdx.y;
-    const int a  = ck * L;
-    const int b  = min(a + L, tail);
+    const int ck  = blockIdx.x;
+    const int jg  = blockIdx.y;
+    const int a   = ck * L;
+    const int b   = min(a + L, tail);
     const int tid = threadIdx.x;
 
     // Columns of this block. PASS1 needs a chunk only if its carry-out feeds a
@@ -256,13 +292,16 @@ sweep_kernel(const float *__restrict__ Bo_rm, int ldBo,
         return;
     }
 
-    // Lane kinds: 0 Bo column c, 1 Bx column, 2 parent-b lane, 3 y lane, 4 idle.
-    int    kind[CPT];
+    // Lane kinds: 0 Bo column c, 1 Bx, 2 parent-b of column my, 3 y of column
+    // my, 4 idle. wgt is the ybo weight of a Bo lane.
+    int    kind[CPT], my[CPT];
     double wgt[CPT];
     #pragma unroll
     for (int q = 0; q < CPT; ++q) {
         const int c = tid + q * BD;
-        kind[q] = (c < m) ? 0 : (c == m) ? 1 : (c == m + 1) ? 2 : (c == m + 2) ? 3 : 4;
+        kind[q] = (c < m) ? 0 : (c == m) ? 1 : (c < m + 1 + JB) ? 2
+                  : (c < m + 1 + 2 * JB) ? 3 : 4;
+        my[q]   = (kind[q] == 2) ? c - (m + 1) : (kind[q] == 3) ? c - (m + 1 + JB) : 0;
         wgt[q]  = (c < m) ? ybo[c] : 0.0;
     }
     double ybxj[JB];
@@ -271,28 +310,39 @@ sweep_kernel(const float *__restrict__ Bo_rm, int ldBo,
         ybxj[jj] = act[jj] ? ybx[jcol[jj]] : 0.0;
     }
 
-    // State. k0/k1 (||h+||^2 halves) live only in the parent-b lane.
-    double f[CPT][JB], g[CPT][JB], k0[JB], k1[JB];
+    // State. k0/k1 (||h+||^2 halves) live in the parent-b lanes' slot 0.
+    double f[CPT][JB], g[CPT][JB], k0 = 0.0, k1 = 0.0;
     #pragma unroll
-    for (int jj = 0; jj < JB; ++jj) {
-        k0[jj] = 0.0;
-        k1[jj] = 0.0;
+    for (int q = 0; q < CPT; ++q) {
         #pragma unroll
-        for (int q = 0; q < CPT; ++q) {
+        for (int jj = 0; jj < JB; ++jj) {
             f[q][jj] = 0.0;
             g[q][jj] = 0.0;
         }
-        if (!PASS1 && act[jj]) {
-            const size_t base = ((size_t)ck * p + jcol[jj]) * Lc;
-            #pragma unroll
-            for (int q = 0; q < CPT; ++q) {
-                const int c = tid + q * BD;
-                if (c < Lc) {
-                    f[q][jj] = carry_f[base + c];
-                    g[q][jj] = carry_g[base + c];
+        if (!PASS1) {
+            const int c = tid + q * BD;
+            if (kind[q] <= 1) {
+                #pragma unroll
+                for (int jj = 0; jj < JB; ++jj) {
+                    if (act[jj]) {
+                        const size_t base = ((size_t)ck * p + jcol[jj]) * LCAR + c;
+                        f[q][jj] = carry_f[base];
+                        g[q][jj] = carry_g[base];
+                    }
                 }
             }
-            k0[jj] = carry_h2[(size_t)ck * p + jcol[jj]];
+            else if (kind[q] <= 3) {
+                const int  jc  = jg * JB + my[q];
+                const bool am  = sel(act, my[q]);
+                if (am) {
+                    const size_t base = ((size_t)ck * p + jc) * LCAR + (kind[q] == 2 ? m + 1 : m + 2);
+                    f[q][0] = carry_f[base];
+                    g[q][0] = carry_g[base];
+                    if (kind[q] == 2) {
+                        k0 = carry_h2[(size_t)ck * p + jc];
+                    }
+                }
+            }
         }
     }
 
@@ -303,49 +353,69 @@ sweep_kernel(const float *__restrict__ Bo_rm, int ldBo,
         bsse[jj] = 0.0;
         bidx[jj] = -1;
     }
-    if (!PASS1) {
-        for (int e = tid; e < TS * JB * 4; e += BD) {
-            s_acc[e] = 0.0;
+
+    // Reduce + score the current batch of grid slots (PASS2; block-uniform).
+    // Three barriers: partials complete; sums complete; scoring complete
+    // before s_acc/s_part are reused.
+    int slot = 0, batch_first = 0;
+    auto flush = [&]() {
+        __syncthreads();
+        const int T      = slot * JB * 2;          // (slot, column, value) triples
+        const int per    = BD / GRP;               // triples per round
+        const int rounds = (T + per - 1) / per;
+        const int part   = tid % GRP;
+        for (int r = 0; r < rounds; ++r) {
+            const int  tr  = r * per + tid / GRP;
+            const bool on  = tr < T;
+            double acc = 0.0;
+            if (on) {
+                const double *row = s_part + (size_t)tr * PST;
+                for (int e = part; e < PW; e += GRP) {
+                    acc += row[e];
+                }
+            }
+            for (int off = GRP / 2; off > 0; off >>= 1) {
+                acc += __shfl_down_sync(0xffffffffu, acc, off, GRP);
+            }
+            if (on && part == 0) {
+                s_acc[(size_t)(tr >> 1) * 4 + (tr & 1)] = acc;
+            }
         }
-    }
-
-    const int lane_w = tid & 31;
-    int prev_first = 0, prev_nslots = 0;   // the previous tile's grid, for the scorer
-
-    for (int i0 = a; i0 < b; i0 += TS) {
-        const int i1 = min(i0 + TS, b);
-        const int nt = i1 - i0;
-
-        // --- phase A1: sorted-row indices + deltas; score the previous tile ---
-        for (int t = tid; t < nt; t += BD) {
-            s_k[t] = k[i0 + t];
-            s_d[t] = (double)d[i0 + t];
-        }
-        if (!PASS1) {
-            // Thread jj scores column jj. Unrolled with a thread match (not
-            // bsse[tid]) so the per-column arrays stay in registers.
-            #pragma unroll
-            for (int jj = 0; jj < JB; ++jj) {
-                if (tid == jj && act[jj]) {
-                    for (int s = 0; s < prev_nslots; ++s) {
-                        const int i = prev_first + s * min_span;
-                        if (i > ilast[jj]) {
-                            break;
-                        }
-                        double *e = s_acc + ((size_t)s * JB + jj) * 4;
-                        const double ff = e[0], fy = e[1], h2 = e[2], w = e[3];
-                        const double uw  = fy - w;
-                        const double den = h2 - ff;
-                        const double sse = den > fmax(tol, mars::HINGE_DEN_REL * h2)
-                                           ? (uw * uw) / (den + tol) : 0.0;
-                        if (sse > bsse[jj]) {
-                            bsse[jj] = sse;
-                            bidx[jj] = i;
-                        }
-                        e[0] = e[1] = e[2] = e[3] = 0.0;
+        __syncthreads();
+        #pragma unroll
+        for (int jj = 0; jj < JB; ++jj) {
+            if (tid == jj && act[jj]) {
+                for (int s = 0; s < slot; ++s) {
+                    const int i = batch_first + s * min_span;
+                    if (i > ilast[jj]) {
+                        break;
+                    }
+                    const double *e = s_acc + ((size_t)s * JB + jj) * 4;
+                    const double ff = e[0], fy = e[1], h2 = e[2], w = e[3];
+                    const double uw  = fy - w;
+                    const double den = h2 - ff;
+                    const double sse = den > fmax(tol, mars::HINGE_DEN_REL * h2)
+                                       ? (uw * uw) / (den + tol) : 0.0;
+                    if (sse > bsse[jj]) {
+                        bsse[jj] = sse;
+                        bidx[jj] = i;
                     }
                 }
             }
+        }
+        slot = 0;
+        __syncthreads();
+    };
+
+    bool all_done = false;
+    for (int i0 = a; i0 < b && !all_done; i0 += TS) {
+        const int i1 = min(i0 + TS, b);
+        const int nt = i1 - i0;
+
+        // --- phase A1: sorted-row indices + deltas ---
+        for (int t = tid; t < nt; t += BD) {
+            s_k[t] = k[i0 + t];
+            s_d[t] = (double)d[i0 + t];
         }
         __syncthreads();
 
@@ -378,48 +448,61 @@ sweep_kernel(const float *__restrict__ Bo_rm, int ldBo,
         __syncthreads();
 
         // --- phase B: the sequential recurrence over the tile ---
-        const int first = first_grid_at(i0, head, min_span);
-        int next_grid = first;
-        int slot = 0;
+        int next_grid = first_grid_at(i0, head, min_span);
         for (int t = 0; t < nt; ++t) {
             const int    i  = i0 + t;
             const double dv = s_d[t];
             const double yv = s_y[t];
             double bv[JB], bxv[JB];
             bool   go[JB];
+            bool   go_any = false;
             #pragma unroll
             for (int jj = 0; jj < JB; ++jj) {
                 bv[jj]  = s_b [jj * TS + t];
                 bxv[jj] = s_bx[jj * TS + t];
                 go[jj]  = act[jj] && (i <= ilast[jj]);   // block-uniform
+                go_any |= go[jj];
             }
-            double bo[CPT];
+            if (!go_any) {
+                all_done = true;
+                break;
+            }
+            // Per-lane slot-0 operands and the Bo value.
+            double bo[CPT], mult0[CPT], v0[CPT];
             #pragma unroll
             for (int q = 0; q < CPT; ++q) {
                 bo[q] = (kind[q] == 0) ? (double)s_bo[(size_t)t * Lpad + tid + q * BD] : 0.0;
+                const double bmy = sel(bv, my[q]);
+                mult0[q] = (kind[q] <= 1) ? bv[0] : (kind[q] <= 3) ? bmy : 0.0;
+                v0[q]    = (kind[q] == 0) ? bo[q] : (kind[q] == 1) ? bxv[0]
+                           : (kind[q] == 2) ? bmy : (kind[q] == 3) ? yv : 0.0;
             }
 
-            // f-part: f += d*g (k0/k1 first: they use bd before and b2 after
-            // the previous step, i.e. the current f and g, as the CPU does).
+            // f-part: f += d*g. k0/k1 first: they use bd before and b2 after
+            // the previous step, i.e. the current f and g, as the CPU does.
             #pragma unroll
             for (int q = 0; q < CPT; ++q) {
+                if (kind[q] == 2) {
+                    k0 = fma(dv * dv, g[q][0], k0);
+                    k1 = fma(dv * 2.0, f[q][0], k1);
+                }
+                f[q][0] = fma(dv, g[q][0], f[q][0]);
                 #pragma unroll
-                for (int jj = 0; jj < JB; ++jj) {
+                for (int jj = 1; jj < JB; ++jj) {
                     if (go[jj]) {
-                        if (kind[q] == 2) {
-                            k0[jj] = fma(dv * dv, g[q][jj], k0[jj]);
-                            k1[jj] = fma(dv * 2.0, f[q][jj], k1[jj]);
-                        }
                         f[q][jj] = fma(dv, g[q][jj], f[q][jj]);
                     }
                 }
             }
 
             if (!PASS1 && i == next_grid) {
+                if (slot == 0) {
+                    batch_first = i;
+                }
                 #pragma unroll
                 for (int jj = 0; jj < JB; ++jj) {
+                    double pf = 0.0, py = 0.0;
                     if (go[jj]) {
-                        double pf = 0.0, py = 0.0;
                         #pragma unroll
                         for (int q = 0; q < CPT; ++q) {
                             if (kind[q] <= 1) {
@@ -427,91 +510,79 @@ sweep_kernel(const float *__restrict__ Bo_rm, int ldBo,
                                 pf = fma(f[q][jj], f[q][jj], pf);
                                 py = fma(f[q][jj], w, py);
                             }
-                        }
-                        pf = warpReduceSum(pf);
-                        py = warpReduceSum(py);
-                        double *e = s_acc + ((size_t)slot * JB + jj) * 4;
-                        if (lane_w == 0) {
-                            atomicAdd(e + 0, pf);
-                            atomicAdd(e + 1, py);
-                        }
-                        #pragma unroll
-                        for (int q = 0; q < CPT; ++q) {
-                            if (kind[q] == 2) {
-                                e[2] = k0[jj] + k1[jj];
+                            else if (kind[q] == 2 && my[q] == jj) {
+                                s_acc[((size_t)slot * JB + jj) * 4 + 2] = k0 + k1;
                             }
-                            else if (kind[q] == 3) {
-                                e[3] = f[q][jj];
+                            else if (kind[q] == 3 && my[q] == jj) {
+                                s_acc[((size_t)slot * JB + jj) * 4 + 3] = f[q][0];
                             }
                         }
+                    }
+                    if (tid < PW) {
+                        double *pr = s_part + ((size_t)slot * JB + jj) * 2 * PST + tid;
+                        pr[0]   = pf;
+                        pr[PST] = py;
                     }
                 }
                 ++slot;
                 next_grid += min_span;
+                if (slot == SMAX) {
+                    flush();
+                }
             }
 
-            // g-part: g += b * value
+            // g-part: g += b * value.
             #pragma unroll
             for (int q = 0; q < CPT; ++q) {
+                g[q][0] = fma(mult0[q], v0[q], g[q][0]);
                 #pragma unroll
-                for (int jj = 0; jj < JB; ++jj) {
+                for (int jj = 1; jj < JB; ++jj) {
                     if (go[jj]) {
-                        const double v = (kind[q] == 0) ? bo[q]
-                                         : (kind[q] == 1) ? bxv[jj]
-                                         : (kind[q] == 2) ? bv[jj]
-                                         : (kind[q] == 3) ? yv : 0.0;
+                        const double v = (kind[q] == 0) ? bo[q] : (kind[q] == 1) ? bxv[jj] : 0.0;
                         g[q][jj] = fma(bv[jj], v, g[q][jj]);
                     }
                 }
             }
         }
-        prev_first  = first;
-        prev_nslots = slot;
         __syncthreads();
     }
 
     if (PASS1) {
         // The local end state (after step b-1) is the chunk's carry record.
         #pragma unroll
-        for (int jj = 0; jj < JB; ++jj) {
-            if (!act[jj]) {
-                continue;
-            }
-            const size_t base = ((size_t)ck * p + jcol[jj]) * Lc;
-            #pragma unroll
-            for (int q = 0; q < CPT; ++q) {
-                const int c = tid + q * BD;
-                if (c < Lc) {
-                    carry_f[base + c] = f[q][jj];
-                    carry_g[base + c] = g[q][jj];
+        for (int q = 0; q < CPT; ++q) {
+            const int c = tid + q * BD;
+            if (kind[q] <= 1) {
+                #pragma unroll
+                for (int jj = 0; jj < JB; ++jj) {
+                    if (act[jj]) {
+                        const size_t base = ((size_t)ck * p + jcol[jj]) * LCAR + c;
+                        carry_f[base] = f[q][jj];
+                        carry_g[base] = g[q][jj];
+                    }
                 }
-                if (kind[q] == 2) {
-                    carry_h2[(size_t)ck * p + jcol[jj]] = k0[jj] + k1[jj];
+            }
+            else if (kind[q] <= 3) {
+                const int  jc = jg * JB + my[q];
+                const bool am = sel(act, my[q]);
+                if (am) {
+                    const size_t base = ((size_t)ck * p + jc) * LCAR + (kind[q] == 2 ? m + 1 : m + 2);
+                    carry_f[base] = f[q][0];
+                    carry_g[base] = g[q][0];
+                    if (kind[q] == 2) {
+                        carry_h2[(size_t)ck * p + jc] = k0 + k1;
+                    }
                 }
             }
         }
     }
     else {
-        // Score the last tile, then publish the chunk's best per column.
+        if (slot > 0) {
+            flush();
+        }
         #pragma unroll
         for (int jj = 0; jj < JB; ++jj) {
             if (tid == jj && act[jj]) {
-                for (int s = 0; s < prev_nslots; ++s) {
-                    const int i = prev_first + s * min_span;
-                    if (i > ilast[jj]) {
-                        break;
-                    }
-                    const double *e = s_acc + ((size_t)s * JB + jj) * 4;
-                    const double ff = e[0], fy = e[1], h2 = e[2], w = e[3];
-                    const double uw  = fy - w;
-                    const double den = h2 - ff;
-                    const double sse = den > fmax(tol, mars::HINGE_DEN_REL * h2)
-                                       ? (uw * uw) / (den + tol) : 0.0;
-                    if (sse > bsse[jj]) {
-                        bsse[jj] = sse;
-                        bidx[jj] = i;
-                    }
-                }
                 best_sse[(size_t)ck * p + jcol[jj]] = bsse[jj];
                 best_idx[(size_t)ck * p + jcol[jj]] = bidx[jj];
             }
@@ -663,18 +734,46 @@ inline double wall_ms(const std::chrono::steady_clock::time_point &t0)
                std::chrono::steady_clock::now() - t0).count();
 }
 
-template <int CPT>
-void launch_passes(Context *ctx, size_t m, size_t p, int BD, int TS, int L, int C,
-                   int n_jg, int tail, int head, int min_span,
-                   size_t smem1, size_t smem2, double *t_pass1, double *t_pass2)
+// Dynamic shared memory above the 48 KB default needs a per-kernel opt-in
+// (up to the device's limit: 64 KB on sm_75, 227 KB on sm_120).
+template <typename K>
+void allow_smem(K kernel, size_t bytes)
 {
+    if (bytes > 48 * 1024) {
+        int dev = 0, cap = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+        if ((size_t)cap < bytes) {
+            throw std::runtime_error("cuda hinge_sweep: block needs more shared memory than "
+                                     "the device allows (reduce MARS_CUDA_SWEEP_TILE/JB)");
+        }
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        (int)bytes));
+    }
+}
+
+struct SweepShape {
+    int BD, CPT, TS1, TS2, SMAX, GRP, PW, PST;
+    size_t smem1, smem2;
+};
+
+template <int CPT, int JB>
+void launch_passes(Context *ctx, size_t m, size_t p, const SweepShape &sh,
+                   int L, int C, int n_jg, int tail, int head, int min_span,
+                   double *t_pass1, double *t_pass2)
+{
+    const int BD = sh.BD;
+    const size_t smem1 = sh.smem1, smem2 = sh.smem2;
     cudaStream_t s = ctx->stream;
     const dim3 grid((unsigned)C, (unsigned)n_jg);
+    allow_smem(sweep_kernel<CPT, JB, true>,  smem1);
+    allow_smem(sweep_kernel<CPT, JB, false>, smem2);
     auto t0 = std::chrono::steady_clock::now();
-    sweep_kernel<CPT, true><<<grid, BD, smem1, s>>>(
+    sweep_kernel<CPT, JB, true><<<grid, BD, smem1, s>>>(
         ctx->dBo_rm, (int)ctx->max_terms, ctx->dB, ctx->dBx_f32, ctx->dy,
         ctx->dk, ctx->dd, ctx->dmask, ctx->dybo, ctx->dybx, ctx->di_last,
-        ctx->n, (int)m, (int)p, L, tail, head, min_span, TS, ctx->tol,
+        ctx->n, (int)m, (int)p, L, tail, head, min_span, sh.TS1, sh.SMAX, sh.GRP,
+        sh.PW, sh.PST, ctx->tol,
         ctx->dcarry_f, ctx->dcarry_g, ctx->dcarry_h2, ctx->dbest_sse, ctx->dbest_idx);
     check_launch();
     const size_t prop_n = p * (m + 3);
@@ -687,15 +786,34 @@ void launch_passes(Context *ctx, size_t m, size_t p, int BD, int TS, int L, int 
         *t_pass1 += wall_ms(t0);
         t0 = std::chrono::steady_clock::now();
     }
-    sweep_kernel<CPT, false><<<grid, BD, smem2, s>>>(
+    sweep_kernel<CPT, JB, false><<<grid, BD, smem2, s>>>(
         ctx->dBo_rm, (int)ctx->max_terms, ctx->dB, ctx->dBx_f32, ctx->dy,
         ctx->dk, ctx->dd, ctx->dmask, ctx->dybo, ctx->dybx, ctx->di_last,
-        ctx->n, (int)m, (int)p, L, tail, head, min_span, TS, ctx->tol,
+        ctx->n, (int)m, (int)p, L, tail, head, min_span, sh.TS2, sh.SMAX, sh.GRP,
+        sh.PW, sh.PST, ctx->tol,
         ctx->dcarry_f, ctx->dcarry_g, ctx->dcarry_h2, ctx->dbest_sse, ctx->dbest_idx);
     check_launch();
     if (ctx->profile) {
         CUDA_CHECK(cudaStreamSynchronize(s));
         *t_pass2 += wall_ms(t0);
+    }
+}
+
+template <int JB>
+void launch_cpt(Context *ctx, size_t m, size_t p, const SweepShape &sh,
+                int L, int C, int n_jg, int tail, int head, int min_span,
+                double *t_pass1, double *t_pass2)
+{
+    switch (sh.CPT) {
+        case 1:
+            launch_passes<1, JB>(ctx, m, p, sh, L, C, n_jg, tail, head, min_span, t_pass1, t_pass2);
+            break;
+        case 2:
+            launch_passes<2, JB>(ctx, m, p, sh, L, C, n_jg, tail, head, min_span, t_pass1, t_pass2);
+            break;
+        default:
+            launch_passes<4, JB>(ctx, m, p, sh, L, C, n_jg, tail, head, min_span, t_pass1, t_pass2);
+            break;
     }
 }
 
@@ -741,9 +859,11 @@ void hinge_sweep(Context *ctx, size_t m, size_t p,
     }
     const size_t n  = ctx->n;
     cudaStream_t s  = ctx->stream;
-    const int    Lc = (int)m + 3;
-    if (Lc > MAX_LANES) {
-        throw std::runtime_error("cuda hinge_sweep: basis too large (m + 3 > 1024 lanes)");
+    const int    JB = (ctx->sweep_jb == 8) ? 8 : 4;       // columns per block
+    const int    Lc = (int)m + 3;                          // carry record length
+    const int    lanes = (int)m + 1 + 2 * JB;              // thread lanes
+    if (lanes > MAX_LANES) {
+        throw std::runtime_error("cuda hinge_sweep: basis too large (m + 1 + 2*JB > 1024 lanes)");
     }
     if (p > ctx->p_cap) {
         throw std::runtime_error("cuda hinge_sweep: p exceeds the context's column capacity");
@@ -763,41 +883,62 @@ void hinge_sweep(Context *ctx, size_t m, size_t p,
         return;
     }
 
-    // Block shape: one lane per (m+3) accumulator pair, CPT lanes per thread.
-    int BD, CPT;
+    // Block shape: one lane per accumulator pair, CPT lanes per thread.
+    SweepShape sh;
     if (ctx->sweep_block) {
-        BD  = ctx->sweep_block;
-        CPT = (Lc + BD - 1) / BD;
-        if (CPT > 4) {
+        sh.BD  = ctx->sweep_block;
+        sh.CPT = (lanes + sh.BD - 1) / sh.BD;
+        if (sh.CPT > 4) {
             throw std::runtime_error("cuda hinge_sweep: MARS_CUDA_SWEEP_BLOCK too small for m");
         }
-        CPT = (CPT == 3) ? 4 : CPT;   // instantiated for 1, 2, 4 lanes per thread
-    }
-    else if (Lc <= 256) {
-        BD = ((Lc + 31) / 32) * 32;
-        CPT = 1;
-    }
-    else if (Lc <= 512) {
-        BD = 256;
-        CPT = 2;
+        sh.CPT = (sh.CPT == 3) ? 4 : sh.CPT;   // instantiated for 1, 2, 4 lanes per thread
     }
     else {
-        BD = 256;
-        CPT = 4;
+        // The fewest lanes per thread that fit a <= 256-thread block, and the
+        // smallest block for that: idle padding lanes still execute the FMAs.
+        sh.CPT = 1;
+        sh.BD  = ((lanes + 31) / 32) * 32;
+        if (sh.BD > 256) {
+            sh.CPT = 2;
+            sh.BD  = (((lanes + 1) / 2 + 31) / 32) * 32;
+        }
+        if (sh.BD > 256) {
+            sh.CPT = 4;
+            sh.BD  = (((lanes + 3) / 4 + 31) / 32) * 32;
+        }
     }
-    const int Lpad = BD * CPT;
-    // Rows per tile. The tile bounds shared memory (and so residency), but the
-    // sweep is bound by per-step f64 work, not occupancy: 8/16/32 rows measured
-    // identical at n=5e5, m=100 and 64 was 15% slower, so 16 by default.
-    int TS = std::min(16, std::max(4, (8192 / Lpad) & ~3));
-    if (ctx->sweep_tile) {
-        TS = ctx->sweep_tile;
+    const int BD   = sh.BD;
+    const int Lpad = BD * sh.CPT;
+    /*
+     *  Shared memory is sized per pass against a residency budget (~34 KB per
+     *  block, i.e. 3 blocks per SM on a 100 KB carve-out): measured, pass 2
+     *  loses ~2x when its block grows past that (one resident block), and
+     *  pass 1 loses ~30% when the row tile shrinks below 16 rows. So pass 1
+     *  takes a 16-row tile (32 KB at 512 lanes), and pass 2 takes a one-slot
+     *  reduction batch, a partials buffer only as wide as the threads holding
+     *  Bo/Bx lanes, and whatever tile then fits the budget.
+     */
+    const size_t budget = 34 * 1024;
+    const size_t per_row = (size_t)Lpad * sizeof(float) + sizeof(int) +
+                           (size_t)(2 + 2 * JB) * sizeof(double);
+    auto tile_for = [&](size_t bytes) {
+        int t = (int)(bytes / per_row);
+        t = std::min(16, std::max(4, t & ~3));
+        return ctx->sweep_tile ? ctx->sweep_tile : t;
+    };
+    sh.TS1 = tile_for(budget);
+    sh.PW  = (sh.CPT == 1) ? std::min(BD, (int)m + 1) : BD;
+    sh.PST = ((sh.PW + 3) & ~3) + 4;
+    const size_t per_slot = (size_t)JB * (4 + 2 * sh.PST) * sizeof(double);
+    sh.SMAX = ctx->sweep_batch ? ctx->sweep_batch : 1;
+    sh.GRP  = 1;
+    while (sh.GRP * 2 <= std::min(32, BD / (sh.SMAX * JB * 2))) {
+        sh.GRP *= 2;
     }
-    const size_t smem_rows = (size_t)TS * Lpad * sizeof(float);
-    const size_t smem_side = (size_t)TS * sizeof(int) +
-                             (size_t)TS * (2 + 2 * JB) * sizeof(double);
-    const size_t smem1 = smem_rows + smem_side;
-    const size_t smem2 = smem1 + (size_t)TS * JB * 4 * sizeof(double);
+    const size_t partials = (size_t)sh.SMAX * per_slot;
+    sh.TS2   = tile_for(partials < budget ? budget - partials : 0);
+    sh.smem1 = (size_t)sh.TS1 * per_row;
+    sh.smem2 = (size_t)sh.TS2 * per_row + partials;
 
     // Chunking: enough blocks to fill the GPU several times over, chunks long
     // enough that the per-chunk carry work (propagate, C x p x Lc) stays small.
@@ -844,19 +985,11 @@ void hinge_sweep(Context *ctx, size_t m, size_t p,
         t_sort = wall_ms(t_start);
     }
 
-    switch (CPT) {
-        case 1:
-            launch_passes<1>(ctx, m, p, BD, TS, L, C, n_jg, tail, head, min_span,
-                             smem1, smem2, &t_pass1, &t_pass2);
-            break;
-        case 2:
-            launch_passes<2>(ctx, m, p, BD, TS, L, C, n_jg, tail, head, min_span,
-                             smem1, smem2, &t_pass1, &t_pass2);
-            break;
-        default:
-            launch_passes<4>(ctx, m, p, BD, TS, L, C, n_jg, tail, head, min_span,
-                             smem1, smem2, &t_pass1, &t_pass2);
-            break;
+    if (JB == 8) {
+        launch_cpt<8>(ctx, m, p, sh, L, C, n_jg, tail, head, min_span, &t_pass1, &t_pass2);
+    }
+    else {
+        launch_cpt<4>(ctx, m, p, sh, L, C, n_jg, tail, head, min_span, &t_pass1, &t_pass2);
     }
 
     const auto t_fin = std::chrono::steady_clock::now();
@@ -881,9 +1014,10 @@ void hinge_sweep(Context *ctx, size_t m, size_t p,
     }
     if (std::getenv("MARS_CUDA_VERBOSE") && ctx->n_sweeps <= 1) {
         std::fprintf(stderr,
-                     "[mars-cuda] hinge sweep: n=%zu m=%zu p=%zu lanes=%d block=%d cpt=%d "
-                     "tile=%d chunk=%d chunks=%d smem=%zu B\n",
-                     n, m, p, Lc, BD, CPT, TS, L, C, smem2);
+                     "[mars-cuda] hinge sweep: n=%zu m=%zu p=%zu jb=%d lanes=%d block=%d cpt=%d "
+                     "tiles=%d/%d batch=%d grp=%d pw=%d chunk=%d chunks=%d smem=%zu/%zu B\n",
+                     n, m, p, JB, lanes, BD, sh.CPT, sh.TS1, sh.TS2, sh.SMAX, sh.GRP, sh.PW,
+                     L, C, sh.smem1, sh.smem2);
     }
 }
 

@@ -377,6 +377,20 @@ Context *context_create(size_t n, size_t max_terms, double tol)
                 ctx->sweep_tile = (int)v;
             }
         }
+        // MARS_CUDA_SWEEP_JB: candidate columns per sweep block (4 or 8).
+        if (const char *sj = std::getenv("MARS_CUDA_SWEEP_JB")) {
+            const long v = std::atol(sj);
+            if (v == 4 || v == 8) {
+                ctx->sweep_jb = (int)v;
+            }
+        }
+        // MARS_CUDA_SWEEP_BATCH: grid slots per on-grid reduction batch (1..8).
+        if (const char *sb2 = std::getenv("MARS_CUDA_SWEEP_BATCH")) {
+            const long v = std::atol(sb2);
+            if (v >= 1 && v <= 8) {
+                ctx->sweep_batch = (int)v;
+            }
+        }
         if (std::getenv("MARS_CUDA_PROFILE")) {
             ctx->profile = 1;
             for (int i = 0; i < 8; ++i) {
