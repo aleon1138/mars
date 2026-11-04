@@ -52,6 +52,8 @@ explicit BLAS-style strides (see the 2026-06-09 note). Key internal state (in
 - `X` — read-only column-major (Fortran-order) pointer + stride `ldX` into the caller's data
 - `B` / `Bo` — the current basis and its ortho-normalized counterpart (kept in sync via Gram-Schmidt). `B` is column-major (stride `n`); `Bo` is row-major with a row stride (`bo_stride`) that holds the live basis count and grows geometrically (see the 2026-06-09 note)
 - `y`, `ybo` — normalized target and its projection onto the ortho-basis
+- `yres` — the residual target `y − Bo·ybo` (f64 master + f32 copy, extended per
+  `append()`): the linear ΔSSE dot target (see the 2026-11-04 note)
 
 Three methods drive the algorithm:
 - `eval()` — for each candidate `X` column, computes the delta-SSE improvement
@@ -221,7 +223,11 @@ emulation is the wrong tool for these shapes.
   per-row gathers of `b`/`bx`/`y` are the dominant stall once the row is
   prefetched (without their prefetch the sweep is 2.5× slower), while the
   on-grid work, support bookkeeping and scalar accumulators cost <5% together.
-  **Check `objdump -d marslib*.so | grep -c prefetcht0` after touching the
+  Replacing the gathered `Bo` row by an L1-resident one cut the sweep from
+  2.8 to 0.93 s, yet no prefetch variant moved it until the binary was
+  checked: it contained no prefetch instructions. Tuning then confirmed
+  prefetch distance 4, JB=4 columns per row and the forced inline; the loop's
+  compute floor is ~0.9 s at n=5e5, m=100 (1.3 s measured). **Check `objdump -d marslib*.so | grep -c prefetcht0` after touching the
   sweep.**
 - Smaller: `argsort` is a stable LSD radix sort (51→~5 ms at n=5e5; the
   planned LRU cache is moot); per-thread `Bx` is sized by the active columns
@@ -231,7 +237,17 @@ emulation is the wrong tool for these shapes.
   formed as `b·(x·s)` like the candidate, so it is bit-identical to what was
   scored; `threads` is clamped to ≥1; the MXCSR FTZ/DAZ state is restored by
   RAII; CUDA f64 GEMMs call `cublasDgemm` directly (the emulation compute-type
-  plumbing is gone).
+  plumbing is gone). Dropped with it: the row-order sensitivity of the
+  constructor reductions is not a fit-variation source (f64 sums, ~√n·eps_f64;
+  `tests/repro_shuffle.py`'s row-order dependence is the sort's tie-breaking
+  by row index -- see the comment in the `MarsAlgo` constructor).
+- **`fit()` candidate filter vectorized (2026-10-23):** `fit()` keeps
+  `degree[k]` and a `(p, M)` boolean `contains[i, k]` alongside the `basis`
+  list and applies the degree / self-interaction filter as array operations
+  over the whole candidate block; a user `xfilter` is called only on the
+  survivors (never when not supplied). Bit-identical models; the Python side
+  of an epoch went 3.3 → 1.0 ms at p=200, M=150. The ~130 ms/epoch once
+  blamed on this loop was mostly the strided modified-GS `append()`.
 - `tests/bench_sweep.cc` (`bench_sweep` target under `BUILD_TESTING`) times
   `append()`, `eval(linear)` and `eval(hinge)` at a fit-like basis and dumps the
   outputs for bit-exact A/B. On the EPYC box, pin with `taskset` and run
@@ -312,6 +328,47 @@ accumulates in f64 (the rejected f32 f/g mode applies here too).
   GPU), `tests/test_cuda.py` (whole fits: identical basis for the hinge fit),
   `bench_sweep ... 1` (timing + deviation vs the CPU eval).
 
+**Numerics note (2026-11-04) — linear ΔSSE scored against the residual
+target:** `eval()` now computes `ybx = <q, y_res>` with `y_res = y − Bo·ybo`
+(`MarsData::yres`; on the GPU via `context_set_residual()`) instead of
+`<q, y>`. The two agree in exact arithmetic, but `Bo` is f32, so
+`BoᵀBo = I + E`, and one projection pass leaves the unit candidate `q` with an
+in-span error of O(E·T). Against `y`, whose in-span part `Bo·ybo` is O(1), that
+enters `ybx` at first order; `y_res`'s in-span part is O(E·ybo), so it becomes
+second order. `E` is dominated by the intercept: a constant column rounds
+coherently, so `‖bo₀‖² − 1` is ~eps_f32 (6.6e-8 at n=2e4), not damped by √n;
+the error therefore scales with the intercept's share of `y`, i.e. with the
+target's mean. `MarsTest.LinearDsseMatchesOracleOnUncenteredInputs` (n=2e4,
+m=120, inputs with mean/std 3 and 0) scores every candidate against an exact
+f64 QR projection onto span(`Bo`): ΔSSE relative error went from median
+1.7–3.9e-7, max 5.2–5.9e-5 to median 6.6–7.5e-8, max 1.1e-5; a numpy model put
+the old tail at 1.5e-3 on columns the DGKS retry skips. The oracle must use
+span(`Bo`) (read through `MarsAlgo::ortho_basis()`), not span(`B`): the two
+differ by `Bo`'s f32 rounding, ~eps_f32·κ on the residual, which swamps the
+effect. The hinge sweep uses `ybx` as `q`'s coefficient, so its scores move at
+the same level (the CPU sweep tests pass unchanged; `CudaSweepTest.*` uses
+the same target on both sides). Same review: the CPU DGKS retry
+now re-runs the flagged columns through the batched Phase 1/2a (`bo_t_bx` /
+`project_out` over an index list) instead of two `Bo` sweeps per column --
+**no measurable speedup** (7.6 → 7.3 s, n=2e5, m=80, p=16, uncentered, one
+core): the per-column passes already ran at the batched rate, and on
+uncentered inputs the retry fires on nearly every candidate, so its cost is a
+full second pass of arithmetic. Only avoiding the retry helps (TODO.md 1.B).
+**GPU half (same date):** the batched/per-eval DGKS retry used to restart
+from the residual left by the f32 projection sgemm, which carries out-of-span
+noise ~eps_f32·√m·‖T‖ -- eps_f32·√m·κ relative on a cancelling column -- that
+no further projection removes. It now recomputes each flagged column's f64
+`B·x` (`refill_widen_kernel`, the same f32 product as the fill) and runs both
+passes in f64 against the gathered first-pass `T` (three Dgemms at width
+`fired`, was two). `CudaKernelsTest.LinearDsseMatchesOracleCollinearLargeBasis`
+(n=6000, m=400, uncentered, default blocked-f32 `T`) on the sm_120 box: GPU
+eval / eval_batch median 2.6e-7, max 7.5e-6 relative vs the span(`Bo`) oracle
+(CPU: 2.8e-7 / 1.1e-5); the old retry gave median 6.7e-4 / 1.1e-3, max
+0.12 / 0.24. The hinge sweep's loose GPU-vs-CPU A/B is unchanged by both
+halves (`CudaSweepTest.MatchesCpuEvalLargeBasis`, m=260: max rel 6.1e-2 before
+and after; pairs > 1e-3 34 → 32, differing cuts 9 → 6) -- that spread is the
+f32 projection on non-retried columns near `HINGE_DEN_REL`, not this change.
+
 **Performance note (2026-10-23) — `expand()` is a row-blocked C++ kernel:**
 `mars.expand()` used to build `B` column by column in numpy on one core (three
 temporaries per hinge column, so ~4 passes of memory traffic per column). It
@@ -349,6 +406,20 @@ On the EPYC box at n=4e6, m=100, p=16, f32 (`B` = 1.6 GB):
 Past ~16 threads both orders sit on the memory/page-fault wall (73–114 GB/s
 written); the F-order plateau is lower, presumably because each thread writes
 `m` separate 2.5 KB column segments per block rather than one contiguous run.
+
+**Benchmarking note:** on the shared EPYC server, timings differ by ±20%
+between cores and between concurrent runs -- enough to invert small A/B
+results. Build each variant as its own binary, `taskset -c <one core>`, run
+variants back to back on that core, and diff `bench_sweep`'s dump files for
+bit-exactness. The bench's basis must stay well conditioned (random hinges on
+random parents make the summed delta-SSEs noise-dominated and useless for
+A/B). A perf benchmark must also exercise the DGKS retry or it measures a path
+production never takes: the random-`Bo` benches never fire it, while a
+fit-like basis on uncentered features (mean/std = 3) fired it on 66–89% of
+candidates in a 2026-11-04 numpy emulation, and the same offset doubled CPU
+`eval(linear)` (3.8 → 7.6 s, n=2e5, m=80, p=16, one core). The 2026-06-17 GPU
+profile had DGKS at 19%; `CudaKernelsTest.BatchDgksRetryMatchesPerColumn` covers the
+batched retry).
 
 **Data requirements:** `X` must be `float32`, **column-major** (Fortran order).
 `y` and `w` must be `float32` column-major 1D arrays. The bindings assert these

@@ -46,6 +46,15 @@ public:
     double yvar() const;
 
     /*
+     *  Read-only views of the stored basis, for tests and diagnostics. B is
+     *  column-major (nrows(), nbasis()) with column stride nrows(); Bo is
+     *  row-major (nrows(), nbasis()) with row stride *ld_bo. Both pointers and
+     *  the stride are invalidated by append().
+     */
+    const float *basis() const;
+    const float *ortho_basis(size_t *ld_bo) const;
+
+    /*
      *  Returns the delta SSE (sum of squared errors) given the existing basis
      *  set and a candidate column of `X` to evaluate. Working memory is a
      *  function-local thread_local sized on demand, so eval() is safe to call

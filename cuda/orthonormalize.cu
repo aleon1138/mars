@@ -11,8 +11,12 @@
  *  within-chunk f32 error (~sqrt(kchunk)·eps_f32) remains. MARS_CUDA_KCHUNK=0
  *  selects the native-f64 cublasDgemm reference, bit-reproducible against the
  *  CPU kernel. The projection Bx -= Bo·T runs as an f32 sgemm whose result is
- *  subtracted from the f64 B·x inside the fused round/reduce pass; the DGKS
- *  retry (rare, cancelling columns) stays entirely in f64. The per-element f32
+ *  subtracted from the f64 B·x inside the fused round/reduce pass. The DGKS
+ *  retry (cancelling columns) runs entirely in f64 and restarts each flagged
+ *  column from its f64 B·x: on such a column the f32 projection leaves
+ *  out-of-span noise ~eps_f32·√m·‖T‖, i.e. eps_f32·√m·κ relative to the
+ *  residual, which a second projection cannot remove (ΔSSE was off by up to
+ *  tens of percent at m=400, κ>30, in a numpy model of this path). The per-element f32
  *  rounding points match the CPU kernel: the B·x product is rounded to f32
  *  before the GEMM, the residual is rounded to f32 before its squared norm
  *  accumulates, and the normalize scale is 1/sqrt(s+tol) in f64.
@@ -131,11 +135,14 @@ __global__ void round_reduce_kernel(const double *in, float *out,
     }
 }
 
-// DGKS retry, gather half: pack the `fired` flagged columns into a COMPACT f64
-// buffer for the retry GEMMs -- dst[:,c] = (double) src[:, idx[c]]. The retry
-// then runs at width `fired` instead of the full block P, so its cost scales
-// with the (rare) cancelling columns, not the batch. blockIdx.y = compact col c.
-__global__ void gather_widen_kernel(const float *src, size_t n,
+// DGKS retry, refill half: recompute the f64 B·x of each flagged column into a
+// COMPACT buffer -- dst[:,c] = (double)(B[:, basis[j]] * x_j), j = idx[c], with
+// x_j = X + xcol[j]*n (batched path) or X itself (per-eval path, xcol null).
+// The same f32 multiply as fill_kernel / fill_batch_kernel, so bit-identical to
+// the minuend the main pass used. The retry then runs at width `fired`, so its
+// cost scales with the cancelling columns, not the batch. blockIdx.y = compact c.
+__global__ void refill_widen_kernel(const float *B, size_t n, const float *X,
+                                    const int *xcol, const int *basis,
                                     const int *idx, double *dst)
 {
     const size_t c = blockIdx.y;
@@ -144,7 +151,22 @@ __global__ void gather_widen_kernel(const float *src, size_t n,
     if (i >= n) {
         return;
     }
-    dst[c * n + i] = (double)src[(size_t)j * n + i];
+    const float *x = xcol ? X + (size_t)xcol[j] * n : X;
+    const float  v = B[(size_t)basis[j] * n + i] * x[i];
+    dst[c * n + i] = (double)v;
+}
+
+// dst[:,c] = src[:, idx[c]] over `rows` f64 entries (src col stride ld_src, dst
+// ld_dst): the flagged columns' first-pass T, compacted for the retry.
+__global__ void gather_cols_f64_kernel(const double *src, size_t ld_src, size_t rows,
+                                       const int *idx, double *dst, size_t ld_dst)
+{
+    const size_t c = blockIdx.y;
+    const size_t k = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= rows) {
+        return;
+    }
+    dst[c * ld_dst + k] = src[(size_t)idx[c] * ld_src + k];
 }
 
 // DGKS retry, scatter half: round each compact retry column c to f32, SCATTER it
@@ -423,6 +445,10 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         CUDA_CHECK(cudaMalloc(&ctx->dybx,      p_cap * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&ctx->dscale,    p_cap * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ctx->didx,      p_cap * sizeof(int)));
+        // DGKS retry: flagged columns are processed in chunks of retry_cols,
+        // so the compact first-pass T needs only (max_terms, retry_cols).
+        ctx->retry_cols = std::min(p_cap, std::max<size_t>(256, max_terms));
+        CUDA_CHECK(cudaMalloc(&ctx->dT_retry, max_terms * ctx->retry_cols * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&ctx->dsrc_xcol, p_cap * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ctx->dsrc_basis, p_cap * sizeof(int)));
         // dXscaled is allocated lazily in context_sync_xcols (needs p_x).
@@ -496,6 +522,8 @@ void context_destroy(Context *ctx)
     cudaFree(ctx->dybx);
     cudaFree(ctx->dscale);
     cudaFree(ctx->didx);
+    cudaFree(ctx->dT_retry);
+    cudaFree(ctx->dyres);
     cudaFree(ctx->dXscaled);
     cudaFree(ctx->dsrc_xcol);
     cudaFree(ctx->dsrc_basis);
@@ -574,6 +602,21 @@ void context_set_target(Context *ctx, const float *y)
     ctx->target_ptr = y;
 }
 
+void context_set_residual(Context *ctx, const float *yres, size_t tag)
+{
+    if (ctx->yres_ptr == yres && ctx->yres_tag == tag) {
+        return;  // unchanged since the last append
+    }
+    if (!ctx->dyres) {
+        CUDA_CHECK(cudaMalloc(&ctx->dyres, ctx->n * sizeof(float)));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(ctx->dyres, yres, ctx->n * sizeof(float),
+                               cudaMemcpyHostToDevice, ctx->stream));
+    CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+    ctx->yres_ptr = yres;
+    ctx->yres_tag = tag;
+}
+
 void context_sync_xcols(Context *ctx, size_t p_x,
                         const float *X, size_t ldX, const float *s,
                         const int *cols, size_t ncols)
@@ -606,14 +649,25 @@ void context_sync_xcols(Context *ctx, size_t p_x,
     }
 }
 
+// Where output column j's B·x came from, so the DGKS retry can recompute it in
+// f64: x_j = X + xcol[j]*n (xcol non-null, batched path) or X (per-eval path),
+// times B[:, basis[j]]. All device pointers.
+struct FillSrc {
+    const float *X;
+    const int   *xcol;
+    const int   *basis;
+};
+
 // Shared post-fill pipeline for P candidate columns already laid out in
 // dBx_f32 (rounded) / dBx_f64 (widened): T = Boᵀ·Bx, project out Bo, fused
-// round + norm + (optional) Σ Bx·y, DGKS retry on cancelling columns, and
-// scale-fold. On return ctx->ds / ctx->dscale / ctx->dybx (if want_dot) hold
-// the per-column results; the caller owns any downloads and the final sync.
+// round + norm + (optional) Σ Bx·t with t the residual target (else y), DGKS
+// retry on cancelling columns, and scale-fold. On return ctx->ds /
+// ctx->dscale / ctx->dybx (if want_dot) hold the per-column results; the caller
+// owns any downloads and the final sync.
 static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
-                           std::atomic<long> *dgks_counter)
+                           const FillSrc &src, std::atomic<long> *dgks_counter)
 {
+    const float *ydot = ctx->dyres ? ctx->dyres : ctx->dy;
     const size_t n   = ctx->n;
     const size_t ldT = ctx->ldT;
     const double tol = ctx->tol;
@@ -681,7 +735,7 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     // writes its own index, so the aliasing is benign.
     prof_mark(ctx, 2);
     round_reduce_kernel<<<grid_reduce, block, 0, s>>>(
-        ctx->dBx_f64, ctx->dBx_f32, ctx->dy, n, ctx->ds, ctx->dybx_raw, want_dot,
+        ctx->dBx_f64, ctx->dBx_f32, ydot, n, ctx->ds, ctx->dybx_raw, want_dot,
         ctx->dBx_f32);
     check_launch();
     prof_mark(ctx, 3);
@@ -707,30 +761,48 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     }
 
     if (fired > 0) {
-        // Surgical retry: gather the `fired` flagged residual columns (rounded,
-        // in dBx_f32) into a compact n×fired f64 buffer -- reusing dBx_f64, which
-        // is dead after the main round_reduce. Re-orthogonalize ONLY those in f64
-        // (T = Boᵀ·Bx then Bx -= Bo·T at width `fired`, reusing dT), then round
-        // and scatter each refined column back to its global slot with fresh
-        // ds/ybx_raw. The f64 GEMMs are the weak path on this card, so their
-        // cost must scale with the cancelling columns, not the batch width.
+        // Surgical retry, entirely in f64 and at width `fired` (the f64 GEMMs
+        // are the weak path on this card, so their cost must scale with the
+        // cancelling columns, not the batch). Each flagged column restarts from
+        // its f64 B·x -- recomputed into dBx_f64, dead after round_reduce --
+        // NOT from the rounded residual in dBx_f32: the f32 projection left
+        // out-of-span noise ~eps_f32·√m·‖T‖ there that re-projecting cannot
+        // remove. Two f64 passes then follow, r1 = Bx - Bo·T with the
+        // first-pass (f64-accumulated) T, and r2 = r1 - Bo·(Boᵀ·r1); each
+        // refined column is rounded and scattered back to its global slot with
+        // fresh ds/ybx_raw. Chunked by retry_cols to bound the compact T.
         CUDA_CHECK(cudaMemcpyAsync(ctx->didx, ctx->h_idx.data(),
                                    (size_t)fired * sizeof(int),
                                    cudaMemcpyHostToDevice, s));
-        const dim3 grid_gather((unsigned)((n + BLOCK - 1) / BLOCK), (unsigned)fired);
-        gather_widen_kernel<<<grid_gather, block, 0, s>>>(
-            ctx->dBx_f32, n, ctx->didx, ctx->dBx_f64);
-        check_launch();
-        CUBLAS_CHECK(cublasDgemm(ctx->handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                 (int)m, fired, (int)n, &one, ctx->dBo_f64, (int)n,
-                                 ctx->dBx_f64, (int)n, &zero, ctx->dT, (int)ldT));
-        CUBLAS_CHECK(cublasDgemm(ctx->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                 (int)n, fired, (int)m, &neg_one, ctx->dBo_f64, (int)n,
-                                 ctx->dT, (int)ldT, &one, ctx->dBx_f64, (int)n));
-        round_reduce_scatter_kernel<<<(unsigned)fired, block, 0, s>>>(
-            ctx->dBx_f64, n, ctx->didx, ctx->dBx_f32, ctx->dy,
-            ctx->ds, ctx->dybx_raw, want_dot);
-        check_launch();
+        const size_t R = ctx->retry_cols;
+        for (size_t c0 = 0; c0 < (size_t)fired; c0 += R) {
+            const int  w   = (int)std::min(R, (size_t)fired - c0);
+            const int *idx = ctx->didx + c0;
+            gather_cols_f64_kernel<<<dim3((unsigned)((m + BLOCK - 1) / BLOCK), (unsigned)w),
+                                     block, 0, s>>>(ctx->dT, ldT, m, idx,
+                                                    ctx->dT_retry, ctx->max_terms);
+            check_launch();
+            refill_widen_kernel<<<dim3((unsigned)((n + BLOCK - 1) / BLOCK), (unsigned)w),
+                                  block, 0, s>>>(ctx->dB, n, src.X, src.xcol, src.basis,
+                                                 idx, ctx->dBx_f64);
+            check_launch();
+            CUBLAS_CHECK(cublasDgemm(ctx->handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                     (int)n, w, (int)m, &neg_one, ctx->dBo_f64, (int)n,
+                                     ctx->dT_retry, (int)ctx->max_terms,
+                                     &one, ctx->dBx_f64, (int)n));
+            CUBLAS_CHECK(cublasDgemm(ctx->handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                                     (int)m, w, (int)n, &one, ctx->dBo_f64, (int)n,
+                                     ctx->dBx_f64, (int)n, &zero,
+                                     ctx->dT_retry, (int)ctx->max_terms));
+            CUBLAS_CHECK(cublasDgemm(ctx->handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                     (int)n, w, (int)m, &neg_one, ctx->dBo_f64, (int)n,
+                                     ctx->dT_retry, (int)ctx->max_terms,
+                                     &one, ctx->dBx_f64, (int)n));
+            round_reduce_scatter_kernel<<<(unsigned)w, block, 0, s>>>(
+                ctx->dBx_f64, n, idx, ctx->dBx_f32, ydot,
+                ctx->ds, ctx->dybx_raw, want_dot);
+            check_launch();
+        }
         if (dgks_counter) {
             dgks_counter->fetch_add(fired, std::memory_order_relaxed);
         }
@@ -774,7 +846,8 @@ void orthonormalize(Context *ctx, size_t m, size_t p,
     check_launch();
     prof_mark(ctx, 7);
 
-    project_reduce(ctx, m, p, want_dot, dgks_counter);
+    project_reduce(ctx, m, p, want_dot, FillSrc{ctx->dx, nullptr, ctx->dmask},
+                   dgks_counter);
 
     if (ybx) {
         CUDA_CHECK(cudaMemcpyAsync(ybx, ctx->dybx, p * sizeof(double),
@@ -831,7 +904,9 @@ void orthonormalize_batch(Context *ctx, size_t m, size_t P,
     check_launch();
     prof_mark(ctx, 7);
 
-    project_reduce(ctx, m, P, /*want_dot=*/1, dgks_counter);
+    project_reduce(ctx, m, P, /*want_dot=*/1,
+                   FillSrc{ctx->dXscaled, ctx->dsrc_xcol, ctx->dsrc_basis},
+                   dgks_counter);
 
     CUDA_CHECK(cudaMemcpyAsync(ybx, ctx->dybx, P * sizeof(double),
                                cudaMemcpyDeviceToHost, s));

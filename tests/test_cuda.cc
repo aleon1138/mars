@@ -713,3 +713,54 @@ TEST(CudaSweepTest, MatchesCpuEvalSmallN)
     // Fewer rows than one chunk (tests the single-chunk / short-tile paths).
     check_sweep(601, 8, 12, 0x5EF0, nullptr);
 }
+
+// ---------------------------------------------------------------------------
+// Linear delta-SSE of the GPU paths against the f64 oracle, in the regime where
+// the DGKS retry fires on most candidates (uncentered, correlated inputs, a
+// large basis; tests/linear_problem.h). The f32 projection of the first pass
+// leaves out-of-span noise ~eps_f32·sqrt(m)·||T|| on a cancelling column, so a
+// retry that restarted from that residual was off by up to tens of percent at
+// m=400 (numpy model); the retry now restarts from the f64 B·x. Runs with the
+// default blocked-f32 T GEMM (MARS_CUDA_KCHUNK unset) -- the production path.
+// ---------------------------------------------------------------------------
+#include "linear_problem.h"
+
+TEST(CudaKernelsTest, LinearDsseMatchesOracleCollinearLargeBasis)
+{
+    if (!cuda_available()) {
+        GTEST_SKIP() << "no CUDA device available";
+    }
+    unsetenv("MARS_CUDA_KCHUNK");
+    const size_t N = 6000, PX = 6, M = 400;
+    linear_problem::Problem P = linear_problem::make(N, PX, 3.0f, 0xD6C6);
+    MarsAlgo algo(P.X.data(), P.y.data(), P.w.data(), N, PX, M + 2, N);
+    linear_problem::grow(algo, P, M, 0xD6C7);
+    ASSERT_EQ((size_t)algo.nbasis(), M);
+
+    std::vector<double> ref, kappa;
+    linear_problem::oracle(algo, P, ref, kappa);
+
+    std::vector<double> cpu(PX * M), gpu(PX * M), hinge(PX * M), cut(PX * M);
+    std::vector<char> mask(PX * M, 1);
+    for (size_t c = 0; c < PX; ++c) {
+        algo.eval(cpu.data() + c * M, hinge.data(), cut.data(), (int)c,
+                  (const bool *)mask.data(), 1, 0, /*linear_only=*/true, /*cuda=*/false);
+        algo.eval(gpu.data() + c * M, hinge.data(), cut.data(), (int)c,
+                  (const bool *)mask.data(), 1, 0, /*linear_only=*/true, /*cuda=*/true);
+    }
+    std::vector<double> batch(PX * M);
+    algo.eval_batch(batch.data(), hinge.data(), cut.data(),
+                    (const bool *)mask.data(), (int)PX, (int)M);
+
+    const char *names[] = {"cpu", "gpu eval", "gpu eval_batch"};
+    const std::vector<double> *ests[] = {&cpu, &gpu, &batch};
+    for (int t = 0; t < 3; ++t) {
+        SCOPED_TRACE(names[t]);
+        const auto S = linear_problem::compare(*ests[t], ref, kappa, 1e-10, 1e4);
+        std::printf("[ linear dsse ] n=%zu m=%zu %-15s: %d candidates, rel err median %.1e max %.1e\n",
+                    N, M, names[t], S.count, S.med_rel, S.max_rel);
+        ASSERT_GT(S.count, (int)(PX * M / 4));
+        EXPECT_LT(S.med_rel, 3e-7);
+        EXPECT_LT(S.max_rel, 5e-4);
+    }
+}

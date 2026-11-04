@@ -1,47 +1,65 @@
 # TODO
 
-Ideas and notes for future performance/quality work, not planned for a specific
-release. Completed work lives in git history; rejected approaches and why they
-were rejected live in CLAUDE.md's performance notes. Items are ordered by
-expected value per unit of risk as of the 2026-10-23 review. Timings below are
-single-threaded on the EPYC 9845 server (`tests/bench_sweep`, n=5e5, pinned to
-one core); see the benchmarking note at the end before trusting any A/B.
+Open ideas for future performance/quality work, not planned for a specific
+release. Only open work lives here: completed work is in git history, and the
+measurements, lessons and rejected approaches it produced are in CLAUDE.md's
+notes (dated). Items are ordered by expected value per unit of risk as of the
+2026-11-04 review. Timings are single-threaded on the EPYC 9845 server
+(`tests/bench_sweep`, n=5e5, pinned to one core) unless noted; see the
+benchmarking note in CLAUDE.md before trusting any A/B.
 
-## 1. Hinge sweep (CPU hinge fits): resolved, with a lesson
+## 1. Linear-only scoring: numerics and speed (2026-11-04 review)
 
-The sweep (`covariates_impl` over sorted rows) was ~75% of `eval(hinge)` and ran
-~3× slower than the identical loop in a standalone microbench. Bisection
-(2026-10-23) stripped the on-grid work, support bookkeeping, scalar
-accumulators and gathers one at a time: together they cost <5%. Replacing the
-gathered `Bo` row by an L1-resident one cut the sweep from 2.8 s to 0.93 s,
-yet no prefetch variant changed anything -- because **the binary contained no
-prefetch instructions**. GCC 13 deletes a loop of `__builtin_prefetch` calls
-inside a lambda at every -O level (plain loops, single calls and inline asm
-survive; clang keeps all forms). The pre-review code had a single call that
-survived but covered only the first line of each row.
+Found by a numpy model of both paths against an f64 ground truth on the same
+f32 data (fit-like basis, correlated features with mean/std = 3; n=2e4, m=120
+and n=6e3, m=400). The GPU numbers are emulated with OpenBLAS sgemm, not
+measured on the device. κ = ‖Bx‖ / ‖residual‖.
 
-With `prefetch_line()` (inline asm) prefetching the full `Bo` row and the
-`b`/`bx`/`y` gathers 4 rows ahead, the sweep at n=5e5 is 1.3 s vs 4.6 s before
-the review at m=100 and 6.7 s vs 21.9 s at m=250, bit-identical; tuning
-confirmed distance 4, 4 columns per row and the forced inline. The
-orthonormalize GEMMs (item 3) are now ~45% of a CPU hinge eval. Remaining headroom is small: the compute floor of the
-loop (2 loads, 1 widening load, 2 FMAs, 2 stores per 4 lanes) is ~0.9 s at
-this size. What is left is the store traffic of `f`/`g` (one load + one
-store each per FMA); amortizing it across 2 sorted rows per step is possible
-algebraically (`f += (d1+d2)·g + d2·b1·x1`) but changes the f64 summation
-order and needs the on-grid positions handled exactly -- low priority.
+**Numerics** (#1, the residual target, and #2, the GPU DGKS retry restarting
+from the f64 `B·x`, landed 2026-11-04 -- CLAUDE.md note)
 
-**Lesson:** after any change to prefetch code, check
-`objdump -d marslib*.so | grep -c prefetcht0`.
+2. **Exactly in-span candidates on the GPU: thin margin.** They still score 0,
+   but in the model their residual reached 0.4·tol at m=400, n=6e3 (`tol` sits
+   at its f32 floor at small n and the f32-projection noise grows as √m). Add
+   a duplicate-candidate case at m≈1000, small n to `test_cuda`.
+3. **f32 normalize scale** adds ±1.2e-7 relative per-candidate noise to
+   ΔSSE (both paths). Free fix: `ΔSSE = <r,y>²/(s+tol)` in f64.
+4. **`grid.y = P` can exceed 65535** in the batched GPU path: `p_cap =
+   8e9/(16n)` passes it for n < ~7600, so a large block fails to launch.
+   Clamp `p_cap` or loop over `grid.y`.
 
-## 2. CUDA: the hinge sweep
+**Speed**
 
-**Landed and tuned on-device (2026-11-03, `cuda/hinge_sweep.cu`; see the
-CLAUDE.md note of that date).** `fit(cuda=True)` runs the hinge sweep on the
-GPU as a two-pass chunked f64 recurrence: 76 ms per X column at n=5e5, m=100
-(CPU one core 2.1 s, 28×) and 386 ms at m=250 (12.4 s, 32×). Pass 1 (carries)
-is at ~1.9× the f64 FMA floor (27 / 165 ms vs 14 / 88 ms) and the grid scoring
-adds ~12 / 31 ms. The f64-only levers are spent. Future work, in order:
+- **B. Closed-form linear scoring (both paths, ~2×, more accurate).**
+  `den = ‖Bx‖² − TᵀT + TᵀET`, `u = <Bx,y> − Tᵀybo + TᵀE·ybo` with
+  `E = BoᵀBo − I` (m×m f64, one row per `append()`, O(nm)). Only `T` stays
+  O(nmp); the projection, round, normalize and dot passes and most DGKS
+  retries go (roughly half the 2026-06-17 GPU profile). Model accuracy:
+  median 1e-10, max 5e-7 up to κ~1e9. The full E is required (diagonal only:
+  max 1.7e-3). Keep the explicit path as a fallback for near-degenerate
+  columns; the hinge sweep still needs the explicit normalized column. This is
+  also the only lever on the DGKS cost: on uncentered inputs the retry fires on
+  nearly every candidate and costs a full second Phase 1/2a pass (CPU
+  `eval(linear)` 3.8 → 7.6 s at n=2e5, m=80, p=16; batching the retry did not
+  change that -- CLAUDE.md, 2026-11-04).
+- **C. Cache `T` across epochs (linear_only, ~m/2 less work).** `Bo`, `B` and
+  the scaled X never change, so `T[k', (k,c)]` never changes: per epoch only a
+  new row for every candidate plus the new parent's columns are needed, two
+  (m×n)·(n×p_x) GEMMs instead of p_x·m single-column passes. Memory
+  m_max²·p_x f64 (128 MB at 400·400·100). Incremental `TᵀET` (O(m) per
+  candidate) or a Cholesky of `BoᵀBo` (`z = L⁻¹T`). Builds on B.
+- **D. Centering x is not worth it alone:** exact in exact arithmetic
+  (b_k·const ∈ span) but only cut the DGKS rate from 89% to 86%.
+- Smaller: ~244 sgemm + accumulate launches per batch at n=5e5 (a
+  strided-batched sgemm plus one reduction would do); a host sync mid
+  `project_reduce` for the DGKS gate.
+
+## 2. CUDA follow-ups
+
+The GPU hinge sweep landed on 2026-11-03 (CLAUDE.md note of that date): 76 ms
+per X column at n=5e5, m=100 (28x one CPU core) and 386 ms at m=250. Pass 1
+(carries) is at ~1.9x the f64 FMA floor and the grid scoring adds ~12 / 31 ms;
+the f64-only levers are spent. Open items, in order:
 
 1. **Blocked f32 for pass 1 -- the remaining factor of several, and a numerics
    decision (not yet taken).** With the carry defined at the end of step b-1,
@@ -94,11 +112,6 @@ adds ~12 / 31 ms. The f64-only levers are spent. Future work, in order:
      columns; cutting it further needs an algorithmic change (re-orthogonalize
      against only the relevant `Bo` columns). High risk for the remaining slice.
 
-Lesson kept from that profile (commit `3d27433`): the random-`Bo` benches never
-fire the DGKS retry, so a perf benchmark must exercise it or it measures a path
-production never takes. `CudaKernelsTest.BatchDgksRetryMatchesPerColumn` covers
-the batched retry.
-
 ## 3. Orthonormalize Phase 1/2a GEMMs are store-port-bound (CPU)
 
 `eval(linear)` is 1.14 s at n=5e5, m=100 and 5.8 s at m=250 (23 ms per basis),
@@ -121,15 +134,14 @@ accumulates in f32 and `dgemm` needs f64 inputs.
 and, since the sweep fix, ~45% of a CPU hinge eval (1.1 of 2.4 s at m=100,
 5.8 of 12.5 s at m=250). Expected ~2× on Phase 1/2a, so ~1.3× on a hinge fit.
 
-## 4. Python orchestration: resolved
+## 4. CPU hinge sweep: f/g store traffic (low priority)
 
-`fit()` now keeps `degree[k]` and a `(p, M)` boolean `contains[i, k]` alongside
-the `basis` list and applies the degree / self-interaction filter as array
-operations over the whole candidate block; a user `xfilter` is called only on
-the survivors (and never when not supplied). Models are bit-identical to the
-list-comprehension version; the Python side of an epoch went 3.3 → 1.0 ms at
-p=200, M=150. The ~130 ms/epoch this item used to quote was mostly the strided
-modified-GS `append()` (fixed in the 2026-10-22 pass), not this loop.
+The sweep runs at its compute floor since the 2026-10-22 prefetch fix (1.3 s at
+n=5e5, m=100 vs a ~0.9 s floor for 2 loads, 1 widening load, 2 FMAs and 2
+stores per 4 lanes). What is left is the store traffic of `f`/`g` (one load +
+one store each per FMA). Amortizing it across 2 sorted rows per step is
+possible algebraically (`f += (d1+d2)·g + d2·b1·x1`) but changes the f64
+summation order and needs the on-grid positions handled exactly.
 
 ## 5. MARS algorithmic improvements
 
@@ -149,7 +161,7 @@ against before investing here:
   the same input at adjacent tail knots (1.83, 1.92, 2.01, 2.07) on one parent
   with coefficients −21, +165, −350, +211: knots placed `min_span` apart across
   *epochs* on the same (input, parent), fitting a wiggle in a 2% tail. This is
-  the failure chain items 1–2 below target (nothing forbids a new knot next to
+  the failure chain items 5.1–5.2 below target (nothing forbids a new knot next to
   an existing one on the same input/parent; `end_span` is a fraction of n, not
   Friedman's formula).
 
@@ -206,24 +218,6 @@ boundary half-tents extrapolate cleanly; unit-test $B_j(x) = \beta_j^\top
 plateaus and spikes, B-spline path smooth), and a real surface under bootstrap
 (more stable selected terms). A multi-month project; keep the hinge path as the
 oracle throughout.
-
-## Dropped
-
-- **`argsort` LRU cache (Fast-MARS).** `argsort` is now an O(n) stable radix
-  sort (~5 ms at n=5e5 vs 51 ms for the indirect `stable_sort`); caching
-  permutations no longer pays for its memory.
-- **Row-order sensitivity of the constructor reductions.** They are f64 sums
-  (~√n·eps_f64); the row-order dependence `tests/repro_shuffle.py` measures
-  comes from tie-breaking in the sort (by row index), not from these.
-
-## Benchmarking note
-
-On the shared EPYC server, timings differ by ±20% between cores and between
-concurrent runs — enough to invert small A/B results. Build each variant as its
-own binary, `taskset -c <one core>`, run variants back to back on that core,
-and diff `bench_sweep`'s dump files for bit-exactness. The bench's basis must
-stay well conditioned (random hinges on random parents make the summed
-delta-SSEs noise-dominated and useless for A/B).
 
 ## References
 

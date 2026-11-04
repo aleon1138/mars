@@ -83,6 +83,17 @@ void context_sync_basis(Context *ctx, size_t m,
 void context_set_target(Context *ctx, const float *y);
 
 /*
+ *  Upload the residual target y_res = y - Bo·ybo (n f32), the vector the
+ *  `ybx` outputs of orthonormalize()/orthonormalize_batch() are dotted with
+ *  once set (until then they use the target y). y_res changes with every
+ *  append, so it is re-uploaded whenever `tag` (the caller's basis count)
+ *  changes. Scoring against y_res instead of y keeps the f32 orthogonality
+ *  defect of Bo out of the linear ΔSSE at first order (see MarsAlgo::eval()).
+ *  The hinge sweep keeps using y.
+ */
+void context_set_residual(Context *ctx, const float *yres, size_t tag);
+
+/*
  *  Ensure the given X-columns are resident on the device as the *scaled*
  *  candidates x_c = X[:,c]·s[c] (f32). Lazy and idempotent: a column is uploaded
  *  and scaled only the first time it is requested (the scaled candidate is fixed
@@ -106,7 +117,9 @@ void context_sync_xcols(Context *ctx, size_t p_x,
  *      s        = ||Bx[:,j]||^2  over the rounded f32
  *      Bx[:,j] *= (s > tol) ? 1/sqrt(s + tol) : 0
  *  with one f64 DGKS retry per column whose residual energy is < 1/9 of its
- *  projection energy (matching the CPU gate). Requires context_sync_basis to
+ *  projection energy (matching the CPU gate). The retry restarts from the f64
+ *  B·x, not from the f32-projected residual: the f32 projection leaves
+ *  out-of-span noise ~eps_f32·√m·‖T‖ that no further projection can remove. Requires context_sync_basis to
  *  have brought columns [0, m) of B/Bo onto the device first.
  *
  *      m    : live orthonormal basis count (columns of resident Bo).
@@ -117,9 +130,10 @@ void context_sync_xcols(Context *ctx, size_t p_x,
  *             Pass nullptr to skip the (large) device->host copy -- e.g. in the
  *             linear_only path, where only `ybx` is needed.
  *      ybx  : (p) f64 host pointer [output, optional]. If non-null, the device
- *             computes ybx[j] = Σ_i Bx[i,j]·y[i] (f64 accumulation, matching
+ *             computes ybx[j] = Σ_i Bx[i,j]·t[i] (f64 accumulation, matching
  *             mars::dot_widen) and copies back just these p doubles -- so the
- *             n×p Bx matrix never crosses PCIe. Requires context_set_target().
+ *             n×p Bx matrix never crosses PCIe. t is the residual target if
+ *             context_set_residual() was called, else y; requires one of them.
  *      dgks_counter (optional): host atomic, incremented per column the retry
  *             fires on (nullptr in production; used by tests).
  *

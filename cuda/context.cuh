@@ -118,6 +118,9 @@ struct Context {
     float  *dBo_rm  = nullptr;  // (n, max_terms) ROW-major, ld max_terms -- the hinge sweep's row gather
     float  *dy      = nullptr;  // (n) normalized target
     const float *target_ptr = nullptr;  // host y pointer last uploaded to dy
+    float  *dyres   = nullptr;  // (n) residual target y - Bo·ybo (ybx dot target once set)
+    const float *yres_ptr = nullptr;    // host y_res pointer last uploaded to dyres
+    size_t  yres_tag = (size_t)-1;      // caller's basis count at that upload
 
     // blocked-f32 T = Boᵀ·Bx: split K=n into chunks, cublasSgemm each in f32,
     // accumulate the chunk results into the f64 dT. Default 2048 (on);
@@ -138,6 +141,8 @@ struct Context {
     double *dybx     = nullptr;  // (p_cap) scale·ybx_raw -- the ΔSSE input
     float  *dscale   = nullptr;  // (p_cap)
     int    *didx    = nullptr;  // (p_cap) compact global indices of DGKS-flagged cols
+    double *dT_retry = nullptr; // (max_terms, retry_cols) compact T of the flagged cols
+    size_t  retry_cols = 0;     // flagged columns per retry chunk
 
     // batched path: resident scaled candidates (x_c = X[:,c]·s[c]) and the
     // per-output-column source maps. dXscaled is allocated (n, p_x) on the first

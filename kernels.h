@@ -60,7 +60,9 @@ constexpr double HINGE_DEN_REL = 8.0 * 1.1920928955078125e-07;  // 8 * FLT_EPSIL
  *              should be ~O(n * eps_f32^2) for the f32 storage floor.
  *
  *  Uses AVX2 + FMA in the inner loops when available, scalar fallback otherwise.
- *  No heap allocations.
+ *  The DGKS retry re-runs the flagged columns as one batch (two more sweeps
+ *  over Bo, not two per column); its index list is the only heap allocation,
+ *  thread-local and grown on demand.
  *
  *  dgks_counter (optional): if non-null, atomically incremented each time the
  *  DGKS re-orthogonalization branch fires for a column. Lets callers measure

@@ -147,41 +147,100 @@ inline double dot_m(const double *a, const double *b, size_t m)
 }
 
 /*
- *  For each row i: bx[i] -= dot(Bo[i,:], tc). Subtraction is done in f64,
- *  rounded back to f32 on store. Returns sum (stored f32)^2 -- the post-store
- *  norm, not the pre-round value -- so downstream normalize() uses the same
- *  quantity that's actually in memory.
+ *  Column selector for the batched phases below: with Indexed the c-th active
+ *  column is cols[c] (the DGKS retry's compacted flagged set), otherwise c
+ *  itself (the main pass, compiled exactly as the plain loops it replaced).
  */
-inline double project_subtract_and_norm(
-    size_t n, size_t m,
-    const float *Bo, size_t ldBo,
-    const double *tc,
-    float *bx)
+template <bool Indexed>
+inline size_t sel_col(const int *cols, size_t c)
 {
-    double s = 0.0;
-    for (size_t i = 0; i < n; ++i) {
-        const double v = (double)bx[i] - dot_bo(Bo + i * ldBo, tc, m);
-        const float  v_f32 = (float)v;
-        bx[i] = v_f32;
-        const double v_back = (double)v_f32;
-        s += v_back * v_back;
+    if constexpr (Indexed) {
+        return (size_t)cols[c];
     }
-    return s;
+    else {
+        (void)cols;
+        return c;
+    }
 }
 
 /*
- *  tc = Bo^T * bx (single column). Bo and bx are both f32, upcast to f64
- *  inside axpy_m / at the bx[i] load.
+ *  Phase 1 over a column set: T[:, j] = Bo^T * Bx[:, j] for each selected j,
+ *  an f32-in / f64-accumulate GEMM no BLAS offers (sgemm accumulates in f32,
+ *  dgemm needs f64 inputs). Bo is row-major, so the outer loop over i loads
+ *  bo_row once and reuses it across all nc columns; Bx[i,j] is upcast at the
+ *  axpy_m call site. With i outermost every T element is stored on every FMA,
+ *  which makes this phase store-port-bound (~2.6x off the FMA peak); an
+ *  i-blocked register tile would fix that -- TODO.md item 3.
  */
-inline void compute_BoT_bx_col(
-    size_t n, size_t m,
-    const float *Bo, size_t ldBo,
-    const float *bx,
-    double *tc)
+template <bool Indexed>
+inline void bo_t_bx(size_t n, size_t m, const int *cols, size_t nc,
+                    const float *Bo, size_t ldBo,
+                    const float *Bx, size_t ldBx,
+                    double *T, size_t ldT)
 {
-    std::fill_n(tc, m, 0.0);
+    for (size_t c = 0; c < nc; ++c) {
+        std::fill_n(T + sel_col<Indexed>(cols, c) * ldT, m, 0.0);
+    }
     for (size_t i = 0; i < n; ++i) {
-        axpy_m(tc, Bo + i * ldBo, (double)bx[i], m);
+        const float *bo_row = Bo + i * ldBo;
+        for (size_t c = 0; c < nc; ++c) {
+            const size_t j = sel_col<Indexed>(cols, c);
+            axpy_m(T + j * ldT, bo_row, (double)Bx[i + j * ldBx], m);
+        }
+    }
+}
+
+/*
+ *  Phase 2a over a column set: Bx[:, j] -= Bo * T[:, j] and s_buf[j] =
+ *  ||Bx[:, j]||^2 for each selected j, fused into a single sweep over Bo: each
+ *  row of Bo is loaded once and reused across all nc columns, so the Bo DRAM
+ *  traffic is n*m rather than nc*n*m. The subtract is done in f64, the result
+ *  rounded back to f32 on store; s_buf accumulates the *stored* squared values
+ *  so the downstream normalization sees the same magnitude that's in memory.
+ */
+template <bool Indexed>
+inline void project_out(size_t n, size_t m, const int *cols, size_t nc,
+                        const float *Bo, size_t ldBo,
+                        const double *T, size_t ldT,
+                        float *Bx, size_t ldBx,
+                        double *s_buf)
+{
+    for (size_t c = 0; c < nc; ++c) {
+        s_buf[sel_col<Indexed>(cols, c)] = 0.0;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const float *bo_row = Bo + i * ldBo;
+        size_t c = 0;
+        // Blocks of 4 columns share the bo_row load+widen (see dot_bo4).
+        for (; c + 4 <= nc; c += 4) {
+            size_t j[4];
+            for (int q = 0; q < 4; ++q) {
+                j[q] = sel_col<Indexed>(cols, c + q);
+            }
+            double proj[4];
+            dot_bo4(bo_row,
+                    T + j[0] * ldT, T + j[1] * ldT,
+                    T + j[2] * ldT, T + j[3] * ldT,
+                    m, proj);
+            for (int q = 0; q < 4; ++q) {
+                float       *bx    = Bx + j[q] * ldBx;
+                const double v     = (double)bx[i] - proj[q];
+                const float  v_f32 = (float)v;
+                bx[i]    = v_f32;
+                const double v_back = (double)v_f32;
+                s_buf[j[q]] += v_back * v_back;
+            }
+        }
+        for (; c < nc; ++c) {
+            const size_t  jc    = sel_col<Indexed>(cols, c);
+            const double *tc    = T  + jc * ldT;
+            float        *bx    = Bx + jc * ldBx;
+            const double  v     = (double)bx[i] - dot_bo(bo_row, tc, m);
+            const float   v_f32 = (float)v;
+            bx[i]    = v_f32;
+            const double v_back = (double)v_f32;
+            s_buf[jc] += v_back * v_back;
+        }
     }
 }
 
@@ -303,82 +362,43 @@ void orthonormalize(
     }
 
     /*
-     *  Phase 1: T = Bo^T * Bx, an f32-in / f64-accumulate GEMM no BLAS offers
-     *  (sgemm accumulates in f32, dgemm needs f64 inputs). Bo is row-major, so
-     *  the outer loop over i loads bo_row once and reuses it across all p
-     *  columns; Bx[i,j] is upcast at the axpy_m call site. With i outermost
-     *  every T element is stored on every FMA, which makes this phase
-     *  store-port-bound (~2.6x off the FMA peak); an i-blocked register tile
-     *  would fix that -- TODO.md item 3.
+     *  Phase 1: T = Bo^T * Bx (see bo_t_bx).
      */
-    for (size_t j = 0; j < p; ++j) {
-        std::fill_n(T + j * ldT, m, 0.0);
-    }
-    for (size_t i = 0; i < n; ++i) {
-        const float *bo_row = Bo + i * ldBo;
-        for (size_t j = 0; j < p; ++j) {
-            axpy_m(T + j * ldT, bo_row, (double)Bx[i + j * ldBx], m);
-        }
-    }
+    bo_t_bx<false>(n, m, nullptr, p, Bo, ldBo, Bx, ldBx, T, ldT);
 
     /*
-     *  Phase 2: project out Bo and normalize each column of Bx, with a DGKS
-     *  retry when most of the column's energy ends up inside span(Bo).
+     *  Phase 2a: project out Bo and take each column's squared norm, in one
+     *  sweep over Bo (see project_out).
+     */
+    project_out<false>(n, m, nullptr, p, Bo, ldBo, T, ldT, Bx, ldBx, s_buf);
+
+    /*
+     *  Phase 2b: DGKS retry on the columns where most of the energy landed
+     *  inside span(Bo). The tol check skips columns we'd discard as degenerate
+     *  anyway. See DGKS_GATE_RATIO_SQ in kernels.h.
      *
-     *  Phase 2a fuses the per-column subtract into a single sweep over Bo: each
-     *  row of Bo is loaded once and reused across all p columns, dropping the
-     *  Bo DRAM traffic from p*n*m to n*m. The subtract is done in f64, the
-     *  result rounded back to f32 on store; s_buf accumulates the *stored*
-     *  squared values so the downstream normalization sees the same magnitude
-     *  that's in memory.
+     *  The flagged columns are re-run through the same batched Phase 1/2a,
+     *  compacted to an index list: two sweeps over Bo in total rather than two
+     *  per flagged column. The retry is not rare -- on uncentered inputs most
+     *  candidates are dominated by their in-span part (x = mean + noise, and
+     *  b * mean is in span), and the per-column retry doubled eval(linear).
      */
-    std::fill_n(s_buf, p, 0.0);
-    for (size_t i = 0; i < n; ++i) {
-        const float *bo_row = Bo + i * ldBo;
-        size_t j = 0;
-        // Blocks of 4 columns share the bo_row load+widen (see dot_bo4).
-        for (; j + 4 <= p; j += 4) {
-            double proj[4];
-            dot_bo4(bo_row,
-                    T + (j + 0) * ldT, T + (j + 1) * ldT,
-                    T + (j + 2) * ldT, T + (j + 3) * ldT,
-                    m, proj);
-            for (int c = 0; c < 4; ++c) {
-                float       *bx    = Bx + (j + c) * ldBx;
-                const double v     = (double)bx[i] - proj[c];
-                const float  v_f32 = (float)v;
-                bx[i]    = v_f32;
-                const double v_back = (double)v_f32;
-                s_buf[j + c] += v_back * v_back;
-            }
-        }
-        for (; j < p; ++j) {
-            const double *tc    = T  + j * ldT;
-            float        *bx    = Bx + j * ldBx;
-            const double  v     = (double)bx[i] - dot_bo(bo_row, tc, m);
-            const float   v_f32 = (float)v;
-            bx[i]    = v_f32;
-            const double v_back = (double)v_f32;
-            s_buf[j] += v_back * v_back;
+    thread_local std::vector<int> flagged;
+    flagged.clear();
+    for (size_t j = 0; j < p; ++j) {
+        const double *tc      = T + j * ldT;
+        const double  t_norm2 = dot_m(tc, tc, m);
+        if (s_buf[j] > tol && s_buf[j] * DGKS_GATE_RATIO_SQ < t_norm2) {
+            flagged.push_back((int)j);
         }
     }
-
-    /*
-     *  Phase 2b: DGKS retry on the (rare) columns where most of the energy
-     *  landed inside span(Bo). The tol check skips columns we'd discard as
-     *  degenerate anyway. See DGKS_GATE_RATIO_SQ in kernels.h.
-     */
-    for (size_t j = 0; j < p; ++j) {
-        double *tc = T  + j * ldT;
-        float  *bx = Bx + j * ldBx;
-        const double t_norm2 = dot_m(tc, tc, m);
-        if (s_buf[j] > tol && s_buf[j] * DGKS_GATE_RATIO_SQ < t_norm2) {
-            if (dgks_counter) {
-                dgks_counter->fetch_add(1, std::memory_order_relaxed);
-            }
-            compute_BoT_bx_col(n, m, Bo, ldBo, bx, tc);
-            s_buf[j] = project_subtract_and_norm(n, m, Bo, ldBo, tc, bx);
+    if (!flagged.empty()) {
+        if (dgks_counter) {
+            dgks_counter->fetch_add((long)flagged.size(), std::memory_order_relaxed);
         }
+        const size_t nf = flagged.size();
+        bo_t_bx<true>(n, m, flagged.data(), nf, Bo, ldBo, Bx, ldBx, T, ldT);
+        project_out<true>(n, m, flagged.data(), nf, Bo, ldBo, T, ldT, Bx, ldBx, s_buf);
     }
 
     /*

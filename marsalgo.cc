@@ -292,6 +292,8 @@ struct MarsData {
     std::vector<float>  B;      // all basis (col-major, n x max_terms preallocated; col stride n)
     std::vector<float>  Bo;     // orthonormalized basis (ROW-major; row stride == bo_stride)
     std::vector<double> ybo;    // dot product of basis Bo with Y target
+    std::vector<double> yres_d; // residual target y - Bo*ybo (f64, updated per append)
+    std::vector<float>  yres;   // f32 copy of yres_d: the linear delta-SSE dot target (see eval())
     std::vector<float>  s;      // normalization constant for columns of 'X' (1/rms)
     std::vector<int64_t> nnz;   // exact nonzero count of each stored B column (support size)
 };
@@ -330,7 +332,7 @@ inline double *align64(double *p)
  *  in `orthonormalize()`/`append()` is f64:
  *    - DGKS retry (kernels.cc) and `append()`: orthogonality is bounded by
  *      eps(f32) (~1e-7) against Bo.
- *    - linear_dsse: ybx = Bx^T * y accumulates in f64.
+ *    - linear_dsse: ybx = Bx^T * y_res accumulates in f64.
  *    - hinge sweep: bx_k = (double)Bx[k[i], j] upcasts at the load; Bo rows
  *      are gathered on the fly via Bo_data + k[i]*ldBo with a software
  *      prefetch a few iterations ahead.
@@ -493,6 +495,18 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
     _data->nnz[0] = count_nonzero(b0, n);
 
     /*
+     *  Residual target y_res = y - Bo*ybo, kept in f64 and extended by one
+     *  column per append(); the f32 copy is what eval() scores against. See the
+     *  linear delta-SSE in eval() for why the residual and not y.
+     */
+    _data->yres_d.resize(n);
+    _data->yres.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        _data->yres_d[i] = (double)yp[i] - (double)bo0[i] * _data->ybo[0];
+        _data->yres[i]   = (float)_data->yres_d[i];
+    }
+
+    /*
      *  Compute the sample variance of the (normalized) target 'y'.
      */
     double ymean_sum = 0.0;
@@ -553,6 +567,15 @@ double MarsAlgo::dsse() const
 double MarsAlgo::yvar() const
 {
     return _yvar;
+}
+const float *MarsAlgo::basis() const
+{
+    return _data->B.data();
+}
+const float *MarsAlgo::ortho_basis(size_t *ld_bo) const
+{
+    *ld_bo = _data->bo_stride;
+    return _data->Bo.data();
 }
 
 void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
@@ -627,11 +650,12 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
             _cuda = mars::cuda::context_create(n, _max_terms, _tol);
         }
         mars::cuda::context_set_target(_cuda, _data->y.data());
+        mars::cuda::context_set_residual(_cuda, _data->yres.data(), _m);
         mars::cuda::context_sync_basis(_cuda, _m,
                                        _data->B.data(),  _data->n,
                                        _data->Bo.data(), _data->bo_stride);
         /*
-         *  ybx = Bxᵀ*y is computed on the GPU (only p doubles come back). Bx
+         *  ybx = Bxᵀ*y_res is computed on the GPU (only p doubles come back). Bx
          *  itself is downloaded only when the hinge sweep needs it (i.e. not
          *  linear_only) -- in linear_only the n×p matrix never leaves the device.
          */
@@ -656,13 +680,24 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     }
 
     /*
-     *  Calculate the linear delta SSE and map to the output buffer. Bx.col(j)
-     *  and y are both contiguous f32; mars::dot_widen upcasts each at the load
-     *  and accumulates in f64. See kernels.h.
+     *  Calculate the linear delta SSE and map to the output buffer: the squared
+     *  dot of the unit candidate q = Bx.col(j) with the RESIDUAL target
+     *  y_res = y - Bo*ybo rather than with y. The two agree in exact arithmetic
+     *  (q is orthogonal to Bo), but Bo is f32 storage, so BoᵀBo = I + E, and a
+     *  single projection pass leaves q with an in-span error of O(E·T). Against
+     *  y, whose in-span part Bo*ybo is O(1), that error enters ybx at first
+     *  order -- dominated by the intercept, whose constant column rounds
+     *  coherently (‖bo₀‖² - 1 ~ eps_f32, not damped by √n): ΔSSE was off by
+     *  ~1e-6 median, 1.5e-3 max relative on uncentered data. y_res has an
+     *  in-span part of only O(E·ybo), so the error becomes second order (~6e-8
+     *  median). Bx.col(j) and y_res are contiguous f32; mars::dot_widen upcasts
+     *  each at the load and accumulates in f64. The hinge sweep uses ybx as
+     *  q's coefficient in the projection of y, which the same argument makes
+     *  more accurate there too.
      */
     for (size_t j = 0; j < p; ++j) {
         if (!cuda) {
-            ybx[j] = mars::dot_widen(Bx + j*n, _data->y.data(), n);
+            ybx[j] = mars::dot_widen(Bx + j*n, _data->yres.data(), n);
         }  // else: ybx was filled on the GPU by orthonormalize()
         linear_dsse[bcols[j]] = ybx[j]*ybx[j];
     }
@@ -899,6 +934,7 @@ void MarsAlgo::eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge
         _cuda = mars::cuda::context_create(n, _max_terms, _tol);
     }
     mars::cuda::context_set_target(_cuda, _data->y.data());
+    mars::cuda::context_set_residual(_cuda, _data->yres.data(), m);  // ybx target (see eval())
     mars::cuda::context_sync_basis(_cuda, m,
                                    _data->B.data(),  _data->n,
                                    _data->Bo.data(), _data->bo_stride);
@@ -1082,12 +1118,13 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
          *  mse = (||y||^2 - ||ybo||^2) / n collapses to (1 - ||ybo||^2) / n.
          *  The new entry is the f64 dot of the *stored* f32 Bo column with the
          *  *stored* f32 target (each upcast on the load), for the same reason
-         *  as ybo[0] in the constructor.
+         *  as ybo[0] in the constructor. (float)v[i] is that stored value, read
+         *  contiguously instead of down the strided Bo column.
          */
         const float *y = _data->y.data();
         double ybo_m = 0.0;
         for (size_t i = 0; i < n; ++i) {
-            ybo_m += (double)Bo[i*ldBo + _m] * (double)y[i];
+            ybo_m += (double)(float)v[i] * (double)y[i];
         }
         double ybo_sq = ybo_m * ybo_m;
         for (double e : _data->ybo) {
@@ -1096,6 +1133,17 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
         const double mse = (1. - ybo_sq) / n;
         if (mse >= -_tol) { // gracefully handle values close to zero
             _data->nnz[_m] = count_nonzero(Bm, n);
+            /*
+             *  Extend the residual target: y_res -= bo_m * ybo_m, with the
+             *  stored f32 bo_m, in f64 (no rounding drift accumulates across
+             *  appends); the f32 copy is re-rounded from it.
+             */
+            double *yres_d = _data->yres_d.data();
+            float  *yres   = _data->yres.data();
+            for (size_t i = 0; i < n; ++i) {
+                yres_d[i] -= (double)(float)v[i] * ybo_m;
+                yres[i]    = (float)yres_d[i];
+            }
             _m += 1;
             _data->ybo.push_back(ybo_m); // extend the cache for next iteration
             return std::max(mse,0.0);

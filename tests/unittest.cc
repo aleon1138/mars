@@ -1,4 +1,5 @@
 #include "../marsalgo.h"
+#include "linear_problem.h"
 #include <Eigen/Dense>
 #include <gtest/gtest.h>
 #include <vector>
@@ -471,6 +472,43 @@ TEST(MarsTest, DegenerateCandidateIsZeroAtSmallN)
 
         EXPECT_LT(algo.append('l', 3, 0, 0), 0.0) << "N=" << N;  // duplicate rejected
         EXPECT_EQ(algo.nbasis(), 3) << "N=" << N;
+    }
+}
+
+/*
+ *  Linear delta-SSE against an f64 oracle on uncentered, correlated inputs
+ *  (tests/linear_problem.h). Bo is f32, so BoᵀBo = I + E with a coherent
+ *  ~eps_f32 defect on the constant intercept; scoring the unit candidate
+ *  against y let that defect into ybx at first order whenever the DGKS retry
+ *  did not fire (observed: max 1.5e-3 relative). Scoring against the residual
+ *  target y - Bo*ybo makes it second order.
+ */
+TEST(MarsTest, LinearDsseMatchesOracleOnUncenteredInputs)
+{
+    const size_t N = 20000, PX = 12, M = 120;
+    // mu = mean/std of the inputs: 3 makes most candidates in-span-dominated
+    // (the DGKS retry fires), 0 leaves most to the single projection pass.
+    for (float mu : {3.0f, 0.0f}) {
+        SCOPED_TRACE("mu=" + std::to_string(mu));
+        linear_problem::Problem P = linear_problem::make(N, PX, mu, 0xC0FFEE);
+        MarsAlgo algo(P.X.data(), P.y.data(), P.w.data(), N, PX, M + 2, N);
+        linear_problem::grow(algo, P, M, 0xBA5E);
+
+        std::vector<double> ref, kappa;
+        linear_problem::oracle(algo, P, ref, kappa);
+
+        std::vector<double> est(PX * M), hinge(M), cut(M);
+        std::vector<char> mask(M, 1);
+        for (size_t c = 0; c < PX; ++c) {
+            algo.eval(est.data() + c * M, hinge.data(), cut.data(), (int)c,
+                      (const bool *)mask.data(), 1, 0, /*linear_only=*/true);
+        }
+        const auto S = linear_problem::compare(est, ref, kappa, 1e-10, 1e4);
+        std::printf("[ linear dsse ] n=%zu m=%zu mu=%g: %d candidates, rel err median %.1e max %.1e\n",
+                    N, M, mu, S.count, S.med_rel, S.max_rel);
+        ASSERT_GT(S.count, (int)(PX * M / 2));
+        EXPECT_LT(S.med_rel, 1.5e-7);
+        EXPECT_LT(S.max_rel, 2.5e-5);
     }
 }
 
