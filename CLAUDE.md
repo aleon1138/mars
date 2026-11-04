@@ -55,7 +55,7 @@ explicit BLAS-style strides (see the 2026-06-09 note). Key internal state (in
 - `yres` — the residual target `y − Bo·ybo` (f64 master + f32 copy, extended per
   `append()`): the linear ΔSSE dot target (see the 2026-11-04 note)
 - `E`, `Eybo` — `BoᵀBo − I` (m×m f64, one row/column per `append()` via
-  `mars::gram_col`) and `E·ybo`: the first-order Gram correction of the
+  `mars::store_col`) and `E·ybo`: the first-order Gram correction of the
   closed-form linear ΔSSE (2026-11-04 performance note)
 - `lin` — the CPU `linear_only` T cache, one `LinCache` per X column
   (2026-11-04 note). `lin_cache` (the `MARS_LINEAR_CACHE_GB` budget check)
@@ -402,10 +402,11 @@ errors up to 1.7e-3 in a numpy model. Accuracy vs the span(`Bo`) oracle
 mean/std 3 / 0 (explicit path: median ~7e-8, max ~1.1e-5). Speed, one core,
 n=2e5, m=80, p=16, two noisy back-to-back runs each: uncentered 8.1 / 10.8 →
 3.7 / 4.1 s (2.2–2.6×, the DGKS retry is gone), centered 3.9 / 5.7 → 3.6 /
-4.0 s (~1.1–1.4×): Phase 2a was the cheap half, so Phase 1 (store-bound, TODO.md
-item 3) is now nearly the whole cost. `T`'s accuracy is load-bearing: `den`
-takes a `T` error at first order, which is why the GPU (blocked-f32 `T`, ~2e-7·κ²
-relative at n=5e5) does not use the closed form yet -- see TODO.md item 1.C.
+4.0 s (~1.1–1.4×): Phase 2a was the cheap half, so Phase 1 (then store-bound;
+register-tiled since, next note) was nearly the whole cost. `T`'s accuracy is
+load-bearing: `den` takes a `T` error at first order, so the GPU's blocked-f32
+`T` (~2e-7·κ² relative at n=5e5) cannot feed the closed form; the GPU scores
+it only from its own f64 T cache (the GPU T cache note below).
 Tests: `KernelsTest.LinearDsseMatchesExactProjection` (closed form, high κ,
 fallback with a residual, in-span, zero column), and the tightened
 `MarsTest.LinearDsseMatchesOracleOnUncenteredInputs`.
@@ -564,7 +565,11 @@ fit-like basis on uncentered features (mean/std = 3) fired it on 66–89% of
 candidates in a 2026-11-04 numpy emulation, and the same offset doubled CPU
 `eval(linear)` (3.8 → 7.6 s, n=2e5, m=80, p=16, one core). The 2026-06-17 GPU
 profile had DGKS at 19%; `CudaKernelsTest.BatchDgksRetryMatchesPerColumn` covers the
-batched retry).
+batched retry). For whole `linear_only` fits, `tests/bench_linear.py` (`--cuda`
+for the GPU) A/Bs the T cache against `MARS_LINEAR_CACHE_GB=0` in one process
+and checks the models match; `tests/bench_eval.py` is the whole-fit bench for
+hinge fits (`--cuda`, `--linear-only`), with `MARS_CUDA_PROFILE=1` for the
+per-phase GPU breakdown.
 
 **Data requirements:** `X` must be `float32`, **column-major** (Fortran order).
 `y` and `w` must be `float32` column-major 1D arrays. The bindings assert these

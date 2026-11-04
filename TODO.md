@@ -8,6 +8,36 @@ notes (dated). Items are ordered by expected value per unit of risk as of the
 (`tests/bench_sweep`, n=5e5, pinned to one core) unless noted; see the
 benchmarking note in CLAUDE.md before trusting any A/B.
 
+## 0. Where we left off (2026-11-04)
+
+The 2026-11-04 round (commits 00e4870..4bbb549; CLAUDE.md notes of that
+date) reworked `linear_only` end to end: residual target, f64 GPU DGKS
+restart, closed-form scoring, register-tiled Phase 1, CPU and GPU T caches,
+threaded `append()`, dead-on-append. Whole linear-only fits: GPU n=5e5,
+p=50, 53 terms 5.12 → 0.70 s; CPU n=2e5, p=16, 72 terms 1.37 → 0.54 s (16
+threads), with identical models. Every test passes on the sm_120 box (14
+`test_cuda`, 23 `unittest`, 42 pytest).
+
+Suggested next steps, in order:
+
+1. **Profile a whole hinge fit** (`linear_only=False`, the normal MARS use;
+   untouched by that round except ~10% from the Phase 1 tiling and the
+   threaded `append()`), CPU and GPU, with `tests/bench_eval.py` (`--cuda`,
+   `MARS_CUDA_PROFILE=1`) -- see §2 item 2. The profile decides between the
+   two big hinge-path items: blocked-f32 GPU sweep pass 1 (§2 item 1) and
+   CPU Phase 2a tiling (§3, needs a quiet box).
+2. The small `linear_only` items in §1: the f64 ΔSSE on the uncached paths
+   (#3), the GPU in-span margin test (#2), the GPU basis upload.
+3. On a quiet box: §3, and re-check the 12×4 vs 8×4 Phase 1 tile.
+
+Workflow reminders: the sandbox has no GPU, so CUDA code is compiled here
+(a build dir under the session scratchpad, `--target test_cuda`) and the
+user runs the device tests and benches; CPU A/B runs go in a scratch copy of
+the tree, never by editing the sources in place; commit messages are
+written to a file for `git commit -F`. Keep the CPU and GPU paths separate
+(CLAUDE.md, Architecture). `tests/bench_linear.py` A/Bs a `linear_only` fit
+with and without the T cache (CPU or `--cuda`) and checks the models match.
+
 ## 1. Linear-only scoring: numerics and speed (2026-11-04 review)
 
 Found by a numpy model of both paths against an f64 ground truth on the same
@@ -29,10 +59,14 @@ from the f64 `B·x`, landed 2026-11-04 -- CLAUDE.md note)
 
 **Speed**
 
+- **Where a cached GPU `linear_only` fit spends its time** (n=5e5, p=50, 53
+  terms, 0.70 s): ~0.38 s outside eval (threaded `append()`, the Python
+  loop), and in eval the basis upload (below, 68–130 ms), fresh slots 74 ms,
+  row extension 52 ms, explicit fallback 43 ms (28 candidates, all dead:
+  products reached in two orders), scoring 2 ms. No single item dominates.
 - **GPU `context_sync_basis` gathers each new `Bo` column on one thread**
-  (strided reads down the row-major host `Bo`, then a sync): ~2.5 ms per
-  append at n=5e5, ~130 ms of a 0.92 s cached GPU fit (the largest piece of
-  its eval). Fix it inside the CUDA path (CPU and GPU paths stay separate;
+  (strided reads down the row-major host `Bo`, then a sync): ~1.3–2.5 ms per
+  append at n=5e5 (68–130 ms per fit, run to run). Fix it inside the CUDA path (CPU and GPU paths stay separate;
   the CPU `append()` must not carry GPU work): e.g. a pinned staging buffer
   gathered by several host threads, or one `cudaMemcpy2DAsync` straight
   from the strided host column.
@@ -71,11 +105,11 @@ the f64-only levers are spent. Open items, in order:
    so f32 there is ~1e-10 relative), which would make the whole sweep
    tensor-core shaped.
 2. **Profile a whole hinge fit** (`MARS_CUDA_PROFILE=1 python3
-   tests/bench_eval.py --cuda --n 500000 --p 20 --max-terms 101 --repeat 1`)
-   and attack what dominates there. Candidates now that an eval is <0.1 s:
-   `append()` (28 ms at m=100, CPU classical GS), `context_sync_basis` (a host
-   gather plus a strided row-major scatter per appended column, 308 ms over
-   the 100-column bench), and the per-column serialization -- the cuda path
+   tests/bench_eval.py --cuda --n 500000 --p 20 --max-terms 101 --repeat 1`,
+   and the same without `--cuda` for the CPU) and attack what dominates
+   there. Candidates now that an eval is <0.1 s: `append()` (threaded since
+   2026-11-04: ~1.5 ms per call at n=5e5, m≈50, 16 threads, vs ~17 ms on one),
+   `context_sync_basis` (see §1), and the per-column serialization -- the cuda path
    evaluates X columns one `eval()` at a time on one stream, so for small m
    the GPU is underfilled; sweeping several X columns per launch (grid.z) or
    overlapping the CPU-side work of column i+1 with the GPU's column i would
@@ -96,10 +130,8 @@ the f64-only levers are spent. Open items, in order:
      as the minuend of the fused subtract. Reading the f32 `Bx` instead needs
      the f32 projection in its own buffer (it currently overwrites `dBx_f32`).
      Bit-identical result, delicate aliasing change, low ROI.
-   - **`context_sync_basis` host gather.** The new `Bo` column is gathered on
-     the host from the row-major `Bo` (one cache line per row); `append()` has
-     the same column contiguous as f64 `v` just before scattering it. Staging a
-     contiguous f32 copy on `MarsData` and uploading that avoids the gather.
+   - **`context_sync_basis` host gather**: see §1 (fix it on the CUDA side;
+     a contiguous copy staged by `append()` would break the CPU/GPU split).
    - **DGKS 19%** is genuine f64 re-orthogonalization of real near-collinear
      columns; cutting it further needs an algorithmic change (re-orthogonalize
      against only the relevant `Bo` columns). High risk for the remaining slice.

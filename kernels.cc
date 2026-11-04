@@ -164,8 +164,8 @@ inline size_t sel_col(const int *cols, size_t c)
 }
 
 /*
- *  Phase 1, register-tiled (TODO.md item 3). The rows are walked in panels of
- *  P1_ROWS. Per panel, the Bo rows are packed as f64 in k-tile order (P1_KT
+ *  Phase 1, register-tiled (CLAUDE.md, 2026-11-04 note). The rows are walked
+ *  in panels of P1_ROWS. Per panel, the Bo rows are packed as f64 in k-tile order (P1_KT
  *  consecutive T rows per tile, the panel's rows contiguous within a tile) and
  *  the selected Bx columns are widened to f64. A P1_KT x P1_JT block of T is
  *  then accumulated in registers across the whole panel and added to T once,
