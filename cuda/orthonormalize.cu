@@ -516,10 +516,12 @@ void context_destroy(Context *ctx)
                          "  row extension      %10.1f ms  (%ld slot-rows)\n"
                          "  fresh slots        %10.1f ms  (%ld slots)\n"
                          "  closed-form score  %10.1f ms\n"
-                         "  f64 fallback       %10.1f ms  (%ld candidates, %ld dead)\n",
+                         "  f64 fallback       %10.1f ms  (%ld candidates, %ld dead)\n"
+                         "  dead on append                   (%ld slots)\n",
                          ctx->n_lc_calls, ctx->ms_lc_ext, ctx->n_lc_rows,
                          ctx->ms_lc_fresh, ctx->n_lc_fresh, ctx->ms_lc_score,
-                         ctx->ms_lc_fb, ctx->n_lc_fb, ctx->n_lc_dead);
+                         ctx->ms_lc_fb, ctx->n_lc_fb, ctx->n_lc_dead,
+                         ctx->n_lc_dead_append);
         }
         for (int i = 0; i < 8; ++i) {
             if (ctx->ev[i]) {

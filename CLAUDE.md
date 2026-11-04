@@ -67,7 +67,8 @@ Three methods drive the algorithm:
   intrinsics in the inner loop (`covariates()`); sweeps `JB=4` basis columns per
   gathered `Bo` row and stops a column once the cut passes below its parent's
   support (every later hinge is then in the span -- see the 2026-10-22 note).
-- `append()` — commits a chosen basis (type `'l'`, `'+'`, or `'-'`), updates `Bo` and `ybo`.
+- `append()` — commits a chosen basis (type `'l'`, `'+'`, or `'-'`), updates `Bo`, `ybo`,
+  `y_res` and `E` (row passes threaded over fixed blocks; 2026-11-04 note).
 - `nbasis()` / `dsse()` / `yvar()` — read-only accessors.
 
 **pybind11 bindings (`marslib.cc`)** — exposes `MarsAlgo` as `marslib.MarsAlgo`.
@@ -463,12 +464,41 @@ terms: 5.12 → 1.78 s (eval 3.66 → 0.33 s; extension 52 ms, fresh slots 74
 ms, scoring 2 ms, fallback 106 ms for 79 candidates, all dead). Identical
 models with and without the cache. The uncached path's cost was mostly the
 DGKS retry (2.8 of 3.6 s: it fires on ~2/3 of uncentered candidates). The
-fit is now bound by the CPU `append()` (~0.84 s of the 1.78 s; TODO.md 1).
+fit was then bound by the CPU `append()` (~0.84 s of the 1.78 s), threaded
+next (note below).
 `CudaKernelsTest.LinearCacheMatchesCpuOverEpochs` drives the device cache
 against the CPU cache on one MarsAlgo over a 90-term fit with random masks,
 inactive X columns, lagged calls (multi-row extensions) and double appends:
 max 4.2e-8 relative apart over 6305 comparisons (931 candidates 0 on both),
 final scores median 7.1e-10 / max 1.9e-7 from the span(`Bo`) oracle. Same change: the batch capacity `p_cap` is clamped to 65535 (`grid.y`).
+
+**Performance note (2026-11-04) — threaded `append()`, dead-on-append:**
+with the T caches, `append()` became the largest per-epoch cost of a
+`linear_only` fit (12–20 ms per call at n=5e5, single-threaded: ~half of a
+GPU fit). Its row passes now run over fixed 4096-row blocks
+(`mars::row_blocks`, `ROW_BLOCK`) on the `threads` OpenMP threads `fit()`
+passes (`append(..., threads)`; the binding resolves ≤ 0 like `eval()`).
+Every reduction is formed per block and combined in block order, so B, Bo,
+the MSE and all downstream scores are bit-identical for any thread count
+(`MarsTest.AppendIsThreadCountIndependent`). The new Bo column, its Gram
+column for `E` and the new `ybo` entry come out of one sweep
+(`mars::store_col`, which replaced `gram_col`), and the `y_res` update counts
+the support in the same pass. n=5e5, 53 appends: 634 ms total at 1 thread
+(839 before the fusion), 260 / 131 / 79 / 65 ms at 4 / 8 / 16 / 32 (the 16-
+and 32-thread runs unpinned; pinned to 16 busy cores of the shared box it
+collapsed to 50 ms per call, so oversubscription hurts here as in `eval()`).
+Whole CPU fit, n=2e5, p=16, 72 terms, 16 threads: 1.37 → 0.6 s, identical
+model. **Dead-on-append:** the linear candidate (c, k) just appended is the
+new B column bit for bit, so `append('l', ...)` marks its slot dead in the
+CPU `LinCache` and (`linear_cache_mark_dead`) the device cache instead of
+letting the next eval prove it through the explicit fallback; dead slots are
+never filled. Candidates in span by other routes (b_j·x_c·x_c' reached in
+both orders) still take the fallback. GPU `fit(linear_only=True,
+cuda=True)`, n=5e5, p=50, 53 terms: 1.78 → 0.92 s with the cache
+(orchestration 1.37 → 0.49 s; fallbacks 79 → 28, 106 → 44 ms; 52 slots dead
+on append), identical model. Of the 0.32 s eval, `context_sync_basis` is now
+the largest piece (~130 ms: a single-threaded strided gather of each new
+`Bo` column from the row-major host copy; TODO.md 1).
 
 **Performance note (2026-10-23) — `expand()` is a row-blocked C++ kernel:**
 `mars.expand()` used to build `B` column by column in numpy on one core (three

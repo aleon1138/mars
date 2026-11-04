@@ -1,8 +1,10 @@
 #include "../marsalgo.h"
+#include "../kernels.h"
 #include "linear_problem.h"
 #include <Eigen/Dense>
 #include <gtest/gtest.h>
 #include <vector>
+#include <cstring>
 #include <random>
 #include <thread>
 #include <cmath>
@@ -598,6 +600,49 @@ TEST(MarsTest, LinearCacheMatchesUncached)
                 S.med_rel, S.max_rel);
     EXPECT_LT(S.med_rel, 2e-8);
     EXPECT_LT(S.max_rel, 5e-6);
+}
+
+/*
+ *  append() runs its row passes over fixed row blocks with the partials
+ *  combined in block order, so B, Bo, the returned MSE and every score
+ *  derived from them must be bit-identical for any thread count. n spans
+ *  several blocks plus a partial one; hinges and linear terms both appear.
+ */
+TEST(MarsTest, AppendIsThreadCountIndependent)
+{
+    const size_t N = 3 * mars::ROW_BLOCK + 777, PX = 6, M = 40;
+    linear_problem::Problem P = linear_problem::make(N, PX, 3.0f, 0xA9E7D);
+    MarsAlgo a(P.X.data(), P.y.data(), P.w.data(), N, PX, M, N);
+    MarsAlgo b(P.X.data(), P.y.data(), P.w.data(), N, PX, M, N);
+    std::mt19937 rng(0xA9E7E);
+    for (size_t t = 1; t < M; ++t) {
+        const int  xc   = (int)(rng() % PX);
+        const int  bc   = (int)(rng() % (size_t)a.nbasis());
+        const char type = "l+-"[rng() % 3];
+        const float h   = P.X[(size_t)xc * N + rng() % N];
+        const double ra = a.append(type, xc, bc, h, 1);
+        const double rb = b.append(type, xc, bc, h, 7);
+        ASSERT_EQ(ra, rb) << "append " << t;
+        ASSERT_EQ(a.nbasis(), b.nbasis());
+    }
+    const size_t m = a.nbasis();
+    ASSERT_GT(m, M / 2);
+    size_t lda = 0, ldb = 0;
+    const float *boa = a.ortho_basis(&lda), *bob = b.ortho_basis(&ldb);
+    ASSERT_EQ(lda, ldb);
+    EXPECT_EQ(0, std::memcmp(boa, bob, N * lda * sizeof(float)));
+    EXPECT_EQ(0, std::memcmp(a.basis(), b.basis(), N * m * sizeof(float)));
+
+    std::vector<double> la(m), lb(m), ha(m), hb(m), ca(m), cb(m);
+    std::vector<char> all(m, 1);
+    for (size_t c = 0; c < PX; ++c) {
+        a.eval(la.data(), ha.data(), ca.data(), (int)c, (const bool *)all.data(), 1, 0, false);
+        b.eval(lb.data(), hb.data(), cb.data(), (int)c, (const bool *)all.data(), 1, 0, false);
+        for (size_t k = 0; k < m; ++k) {
+            EXPECT_EQ(la[k], lb[k]);
+            EXPECT_EQ(ha[k], hb[k]);
+        }
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////

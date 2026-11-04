@@ -138,6 +138,10 @@ public:
      *
      *  h : float
      *      hinge cut point (ignored for linear basis).
+     *
+     *  threads : int
+     *      OpenMP threads for the row passes. The result is identical for
+     *      any thread count (fixed row blocks, partials combined in order).
      */
-    double append(char type, int xcol, int bcol, float h);
+    double append(char type, int xcol, int bcol, float h, int threads = 1);
 };

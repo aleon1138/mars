@@ -293,6 +293,24 @@ bool linear_cache_init(Context *ctx, size_t p_x)
     return true;
 }
 
+void linear_cache_mark_dead(Context *ctx, int xcol, int basis)
+{
+    if (ctx->lc_on <= 0) {
+        return;
+    }
+    const size_t sl = (size_t)xcol * ctx->max_terms + (size_t)basis;
+    if (sl >= ctx->lc_slots || ctx->h_lstate[sl] == 2) {
+        return;
+    }
+    if (ctx->h_lstate[sl] == 1) {
+        auto &lv = ctx->h_llive;
+        lv.erase(std::lower_bound(lv.begin(), lv.end(), (int)sl));
+        ctx->lc_live_dirty = true;
+    }
+    ctx->h_lstate[sl] = 2;
+    ctx->n_lc_dead_append++;
+}
+
 void linear_cache_eval(Context *ctx, size_t m, size_t P,
                        const int *src_xcol, const int *src_basis,
                        const double *E, size_t ldE, const double *ybo, const double *Eybo,

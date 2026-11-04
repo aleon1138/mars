@@ -236,6 +236,7 @@ struct Context {
     std::vector<double> h_lout;
     double ms_lc_ext = 0, ms_lc_fresh = 0, ms_lc_score = 0, ms_lc_fb = 0;
     long   n_lc_calls = 0, n_lc_fresh = 0, n_lc_fb = 0, n_lc_dead = 0, n_lc_rows = 0;
+    long   n_lc_dead_append = 0;   // slots marked dead by append() (linear_cache_mark_dead)
 };
 
 // Where output column j's B·x came from, so an f64 re-projection can recompute

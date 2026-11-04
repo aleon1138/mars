@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>  // size_t
 
@@ -105,13 +106,16 @@ void orthonormalize(
  *      tol  : degeneracy threshold (same scale as orthonormalize()'s tol)
  *
  *  dgks_counter (optional): atomically incremented if the DGKS retry fires.
+ *  threads: OpenMP threads for the row passes (see row_blocks()); the result
+ *  does not depend on it.
  */
 double orthonormalize_col(
     size_t n, size_t m,
     double       *v,
     const float  *Bo,   size_t ldBo,
     double tol,
-    std::atomic<long> *dgks_counter = nullptr);
+    std::atomic<long> *dgks_counter = nullptr,
+    int threads = 1);
 
 /*
  *  Fallback threshold of the closed-form linear delta-SSE (linear_dsse()): a
@@ -218,11 +222,50 @@ void cross_rows(size_t n, const float *B, size_t ldB, const int *parents, size_t
                 double *T, size_t ldT);
 
 /*
- *  One column of the Gram of Bo: g[k] = sum_i Bo[i,k] * Bo[i,col] for k < m1
- *  (col < m1), f64-accumulated from the f32 storage. append() uses it to extend
- *  E = BoᵀBo - I. One streaming sweep over the first m1 entries of each row.
+ *  Store a new column of the row-major Bo and reduce what append() needs from
+ *  the stored values, in one sweep over the first col+1 entries of each row:
+ *
+ *      Bo[i, col] = (float)v[i]
+ *      g[k]       = sum_i Bo[i,k] * Bo[i,col]    k <= col  (a column of BoᵀBo)
+ *      yb         = sum_i Bo[i,col] * y[i]
+ *
+ *  f64-accumulated. g extends E = BoᵀBo - I; yb is the new ybo entry.
+ *  threads as in orthonormalize_col().
  */
-void gram_col(size_t n, size_t m1, const float *Bo, size_t ldBo, size_t col, double *g);
+void store_col(size_t n, size_t col, const double *v, float *Bo, size_t ldBo,
+               const float *y, double *g, double &yb, int threads = 1);
+
+/*
+ *  Rows per block of the parallel row passes in append(). Every reduction is
+ *  formed per fixed block and the partials are combined in block order, so
+ *  the results are identical for any thread count (and to a 1-thread run).
+ */
+constexpr size_t ROW_BLOCK = 4096;
+
+inline size_t row_block_count(size_t n)
+{
+    return (n + ROW_BLOCK - 1) / ROW_BLOCK;
+}
+
+/*
+ *  f(b, i0, i1) for each row block b = [i0, i1) of [0, n), on up to `threads`
+ *  OpenMP threads (statically scheduled). f must only write state of its own
+ *  block (per-block partials, rows i0..i1-1).
+ */
+template <class F>
+inline void row_blocks(size_t n, int threads, F &&f)
+{
+    const long nb = (long)row_block_count(n);
+    const int  t  = (int)std::min<long>(std::max(threads, 1), std::max(nb, 1L));
+#ifdef _OPENMP
+    #pragma omp parallel for num_threads(t) schedule(static) if(t > 1)
+#endif
+    for (long b = 0; b < nb; ++b) {
+        const size_t i0 = (size_t)b * ROW_BLOCK;
+        f((size_t)b, i0, std::min(n, i0 + ROW_BLOCK));
+    }
+    (void)t;
+}
 
 /*
  *  Dot product of two contiguous f32 vectors, accumulated in f64:

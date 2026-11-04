@@ -29,20 +29,12 @@ from the f64 `B·x`, landed 2026-11-04 -- CLAUDE.md note)
 
 **Speed**
 
-- **`append()` now dominates GPU `linear_only` fits.** With the device T
-  cache (2026-11-04), eval is ~0.3 s of a 1.7 s fit at n=5e5, p=50, 53
-  terms; `append()` (single-threaded CPU: classical GS + DGKS, `gram_col`
-  for `E`, the `yres` update) is 12–20 ms per call there, ~0.84 s. Options:
-  thread its row passes (OpenMP over row blocks; all are reductions or
-  per-row updates), or run it on the device, which already holds `B`/`Bo`
-  (then `sync_basis`, 75 ms over that fit, goes away too).
-- **Dead-on-append.** The candidate (c, k) just appended as a linear term is
-  the new `B` column bit for bit, so its slot is in span by construction, yet
-  both caches prove it through the explicit fallback the next epoch. In the
-  fit above the GPU ran 79 fallbacks (106 ms of the 0.33 s eval), all of
-  which died: up to 52 are these, the rest products reached in two orders
-  (b_j·x_c then ·x_c' vs b_j·x_c' then ·x_c). Marking the appended slot dead
-  in `append('l', ...)` skips the former; keep the fallback for the rest.
+- **GPU `context_sync_basis` gathers each new `Bo` column on one thread**
+  (strided reads down the row-major host `Bo`, then a sync): ~2.5 ms per
+  append at n=5e5, ~130 ms of a 0.92 s cached GPU fit (the largest piece of
+  its eval). `append()` already holds the column contiguously (`v`, before
+  `store_col` rounds it into `Bo`): keep an f32 copy for the upload, or
+  gather it with `row_blocks`.
 - **C (CPU follow-up).** A newly requested parent's Phase 1 column is a single
   column, so it takes the store-bound axpy loop; batching the fresh parents of
   several X columns into one tiled pass (they share `Bo`) would cut the

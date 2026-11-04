@@ -350,7 +350,7 @@ def fit(X, y, w=None, **kwargs):
                 break
             # append() returns -1 for a numerically degenerate column; an exact
             # 0 (noise-free y) is a valid fit.
-            mse = algo.append(htype, xcol, bcol, hcut)
+            mse = algo.append(htype, xcol, bcol, hcut, threads)
             if mse >= 0:
                 # fmt:off
                 basis.append(basis[bcol] + [xcol])

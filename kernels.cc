@@ -388,17 +388,41 @@ inline double cgs_project_col(
     size_t n, size_t m,
     double *v,
     const float *Bo, size_t ldBo,
-    double *c, double &v_norm2)
+    double *c, double &v_norm2, int threads)
 {
+    // Per-row-block partials of c = Boᵀv and of ||v - Bo c||², combined in
+    // block order (row_blocks): thread-count independent.
+    const size_t nb = row_block_count(n);
+    thread_local std::vector<double> part;
+    part.resize(nb * m + nb);
+    double *pc = part.data();     // (not `part` inside the regions: thread_local)
+    double *pn = part.data() + nb * m;
+    row_blocks(n, threads, [&](size_t b, size_t i0, size_t i1) {
+        double *cb = pc + b * m;
+        std::fill_n(cb, m, 0.0);
+        for (size_t i = i0; i < i1; ++i) {
+            axpy_m(cb, Bo + i * ldBo, v[i], m);
+        }
+    });
     std::fill_n(c, m, 0.0);
-    for (size_t i = 0; i < n; ++i) {
-        axpy_m(c, Bo + i * ldBo, v[i], m);
+    for (size_t b = 0; b < nb; ++b) {
+        const double *cb = pc + b * m;
+        for (size_t k = 0; k < m; ++k) {
+            c[k] += cb[k];
+        }
     }
+    row_blocks(n, threads, [&](size_t b, size_t i0, size_t i1) {
+        double s = 0.0;
+        for (size_t i = i0; i < i1; ++i) {
+            const double r = v[i] - dot_bo(Bo + i * ldBo, c, m);
+            v[i] = r;
+            s += r * r;
+        }
+        pn[b] = s;
+    });
     v_norm2 = 0.0;
-    for (size_t i = 0; i < n; ++i) {
-        const double r = v[i] - dot_bo(Bo + i * ldBo, c, m);
-        v[i] = r;
-        v_norm2 += r * r;
+    for (size_t b = 0; b < nb; ++b) {
+        v_norm2 += pn[b];
     }
     return dot_m(c, c, m);
 }
@@ -471,11 +495,12 @@ double orthonormalize_col(
     double       *v,
     const float  *Bo,   size_t ldBo,
     double tol,
-    std::atomic<long> *dgks_counter)
+    std::atomic<long> *dgks_counter,
+    int threads)
 {
     std::vector<double> c(m);
     double v_norm2 = 0.0;
-    const double proj_norm2 = cgs_project_col(n, m, v, Bo, ldBo, c.data(), v_norm2);
+    const double proj_norm2 = cgs_project_col(n, m, v, Bo, ldBo, c.data(), v_norm2, threads);
 
     /*
      *  DGKS retry: re-orthogonalize once when the residual energy is small
@@ -486,14 +511,16 @@ double orthonormalize_col(
         if (dgks_counter) {
             dgks_counter->fetch_add(1, std::memory_order_relaxed);
         }
-        cgs_project_col(n, m, v, Bo, ldBo, c.data(), v_norm2);
+        cgs_project_col(n, m, v, Bo, ldBo, c.data(), v_norm2, threads);
     }
 
     const double w = std::sqrt(v_norm2);
     if (w * w > tol) {
-        for (size_t i = 0; i < n; ++i) {
-            v[i] /= w;
-        }
+        row_blocks(n, threads, [&](size_t, size_t i0, size_t i1) {
+            for (size_t i = i0; i < i1; ++i) {
+                v[i] /= w;
+            }
+        });
     }
     return w;
 }
@@ -591,12 +618,36 @@ void orthonormalize(
     }
 }
 
-void gram_col(size_t n, size_t m1, const float *Bo, size_t ldBo, size_t col, double *g)
+void store_col(size_t n, size_t col, const double *v, float *Bo, size_t ldBo,
+               const float *y, double *g, double &yb, int threads)
 {
+    const size_t m1 = col + 1;
+    const size_t w  = m1 + 1;                 // g partial + yb partial per block
+    const size_t nb = row_block_count(n);
+    thread_local std::vector<double> part;
+    part.resize(nb * w);
+    double *pp = part.data();    // (not `part` inside the region: thread_local)
+    row_blocks(n, threads, [&](size_t b, size_t i0, size_t i1) {
+        double *pg = pp + b * w;
+        std::fill_n(pg, w, 0.0);
+        double s = 0.0;
+        for (size_t i = i0; i < i1; ++i) {
+            float *row = Bo + i * ldBo;
+            const float f = (float)v[i];
+            row[col] = f;
+            axpy_m(pg, row, (double)f, m1);
+            s += (double)f * (double)y[i];
+        }
+        pg[m1] = s;
+    });
     std::fill_n(g, m1, 0.0);
-    for (size_t i = 0; i < n; ++i) {
-        const float *row = Bo + i * ldBo;
-        axpy_m(g, row, (double)row[col], m1);
+    yb = 0.0;
+    for (size_t b = 0; b < nb; ++b) {
+        const double *pg = pp + b * w;
+        for (size_t k = 0; k < m1; ++k) {
+            g[k] += pg[k];
+        }
+        yb += pg[m1];
     }
 }
 

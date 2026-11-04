@@ -425,7 +425,20 @@ PYBIND11_MODULE(marslib, m)
         )
     .def("nbasis",       &MarsAlgo::nbasis)
     .def("yvar",         &MarsAlgo::yvar)
-    .def("append",       &MarsAlgo::append)
+    .def("append",
+         [](MarsAlgo &algo, char type, int xcol, int bcol, float h, int threads) {
+             // Same resolution as eval(): <= 0 means all cores, capped at 64.
+             // The result does not depend on the thread count.
+             const int n_procs = omp_get_num_procs();
+             threads = threads <= 0 ? std::min(64, n_procs) : std::min(threads, n_procs);
+             return algo.append(type, xcol, bcol, h, std::max(threads, 1));
+         }
+         , py::arg("type")
+         , py::arg("xcol")
+         , py::arg("bcol")
+         , py::arg("h")
+         , py::arg("threads") = -1
+        )
     ;
 
     m.def("expand", &expand

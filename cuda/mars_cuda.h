@@ -243,5 +243,12 @@ void linear_cache_eval(Context *ctx, size_t m, size_t P,
                        const double *E, size_t ldE, const double *ybo, const double *Eybo,
                        double *dsse, std::atomic<long> *fallback_counter = nullptr);
 
+/*
+ *  Mark slot (xcol, basis) dead: the caller knows that candidate is in
+ *  span(Bo) (MarsAlgo::append() of that very linear term), so it scores 0
+ *  from now on and is never filled or extended. No-op without the cache.
+ */
+void linear_cache_mark_dead(Context *ctx, int xcol, int basis);
+
 } // namespace cuda
 } // namespace mars

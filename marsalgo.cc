@@ -713,8 +713,9 @@ void MarsAlgo::eval_linear_cached(double *linear_dsse, int xcol, const float *x,
     thread_local std::vector<int> fresh;
     fresh.clear();
     for (size_t j = 0; j < p; ++j) {
-        if ((size_t)bcols[j] >= L.cap || !L.have[bcols[j]]) {
-            fresh.push_back(bcols[j]);
+        const size_t k = (size_t)bcols[j];
+        if (k >= L.cap || (!L.have[k] && !L.dead[k])) {
+            fresh.push_back(bcols[j]);   // (dead-on-append slots are never filled)
         }
     }
     if (!fresh.empty()) {
@@ -1304,7 +1305,7 @@ void MarsAlgo::eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge
 #endif
 }
 
-double MarsAlgo::append(char type, int xcol, int bcol, float h)
+double MarsAlgo::append(char type, int xcol, int bcol, float h, int threads)
 {
     if (_m >= _max_terms) {
         throw std::runtime_error("basis matrix is full");
@@ -1340,30 +1341,48 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
     const float *bp = _data->B.data() + bcol*n;             // parent basis column
     const float *xp = _data->X        + xcol*_data->ldX;    // candidate X column
     float       *Bm = _data->B.data() + _m*n;               // new basis column
+    if (type != 'l' && type != '+' && type != '-') {
+        throw std::runtime_error("invalid basis type");
+    }
+
+    /*
+     *  Every pass below runs over fixed row blocks (mars::row_blocks) on up to
+     *  `threads` threads, with reductions combined in block order: the result
+     *  does not depend on the thread count. `nb` per-block partials live in
+     *  `part`.
+     */
+    const size_t nb = mars::row_block_count(n);
+    std::vector<double> part(nb);
 
     /*
      *  Form the raw column in f32 with the same operation order eval() uses
      *  (scale x first, then multiply by the parent), so the appended linear
-     *  column is bit-identical to the candidate that was scored.
+     *  column is bit-identical to the candidate that was scored; widen it into
+     *  the f64 residual v and take its squared norm.
      */
-    switch(type) {
-        case 'l':
-            for (size_t i = 0; i < n; ++i) {
-                Bm[i] = bp[i]*(xp[i]*s);
+    std::vector<double> v(n);
+    mars::row_blocks(n, threads, [&](size_t b, size_t i0, size_t i1) {
+        double acc = 0.0;
+        for (size_t i = i0; i < i1; ++i) {
+            float f;
+            if (type == 'l') {
+                f = bp[i]*(xp[i]*s);
             }
-            break;
-        case '+':
-            for (size_t i = 0; i < n; ++i) {
-                Bm[i] = bp[i]*(std::max(xp[i]-h, 0.0f)*s);
+            else if (type == '+') {
+                f = bp[i]*(std::max(xp[i]-h, 0.0f)*s);
             }
-            break;
-        case '-':
-            for (size_t i = 0; i < n; ++i) {
-                Bm[i] = bp[i]*(std::max(h-xp[i], 0.0f)*s);
+            else {
+                f = bp[i]*(std::max(h-xp[i], 0.0f)*s);
             }
-            break;
-        default:
-            throw std::runtime_error("invalid basis type");
+            Bm[i] = f;
+            v[i]  = (double)f;
+            acc  += v[i] * v[i];
+        }
+        part[b] = acc;
+    });
+    double v_raw_norm2 = 0.0;
+    for (double e : part) {
+        v_raw_norm2 += e;
     }
 
     /*
@@ -1375,89 +1394,113 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
      *  cut lies outside the parent's support) is rejected before it can be
      *  divided by zero.
      */
-    std::vector<double> v(n);
-    double v_raw_norm2 = 0.0;
-    for (size_t i = 0; i < n; ++i) {
-        v[i] = (double)Bm[i];
-        v_raw_norm2 += v[i] * v[i];
-    }
     if (!(v_raw_norm2 > _tol)) {
         return -1.;
     }
     const float v_raw_norm = (float)std::sqrt(v_raw_norm2);
-    for (size_t i = 0; i < n; ++i) {
-        Bm[i] /= v_raw_norm;
-    }
+    mars::row_blocks(n, threads, [&](size_t, size_t i0, size_t i1) {
+        for (size_t i = i0; i < i1; ++i) {
+            Bm[i] /= v_raw_norm;
+        }
+    });
 
     const double w = mars::orthonormalize_col(
-                         n, _m, v.data(), _data->Bo.data(), _data->bo_stride, _tol);
+                         n, _m, v.data(), _data->Bo.data(), _data->bo_stride, _tol,
+                         nullptr, threads);
 
     if (w*w > _tol) {
         /*
-         *  orthonormalize_col left v as the unit residual; store it (f32) into
-         *  Bo's new column _m (row-major, stride bo_stride).
+         *  orthonormalize_col left v as the unit residual. One sweep stores it
+         *  (f32) into Bo's new column _m (row-major, stride bo_stride) and,
+         *  from the stored values, reduces the new column of BoᵀBo (for E) and
+         *  the new ybo entry: the f64 dot of the *stored* f32 Bo column with
+         *  the *stored* f32 target, for the same reason as ybo[0] in the
+         *  constructor.
          */
         float       *Bo   = _data->Bo.data();
         const size_t ldBo = _data->bo_stride;
-        for (size_t i = 0; i < n; ++i) {
-            Bo[i*ldBo + _m] = (float)v[i];
-        }
+        const size_t m1   = _m + 1;
+        std::vector<double> g(m1);
+        double ybo_m = 0.0;
+        mars::store_col(n, _m, v.data(), Bo, ldBo, _data->y.data(), g.data(), ybo_m,
+                        threads);
 
         /*
          *  Extend the cached ybo with one new entry; relies on ||y|| == 1 so
          *  mse = (||y||^2 - ||ybo||^2) / n collapses to (1 - ||ybo||^2) / n.
-         *  The new entry is the f64 dot of the *stored* f32 Bo column with the
-         *  *stored* f32 target (each upcast on the load), for the same reason
-         *  as ybo[0] in the constructor. (float)v[i] is that stored value, read
-         *  contiguously instead of down the strided Bo column.
          */
-        const float *y = _data->y.data();
-        double ybo_m = 0.0;
-        for (size_t i = 0; i < n; ++i) {
-            ybo_m += (double)(float)v[i] * (double)y[i];
-        }
         double ybo_sq = ybo_m * ybo_m;
         for (double e : _data->ybo) {
             ybo_sq += e * e;
         }
         const double mse = (1. - ybo_sq) / n;
         if (mse >= -_tol) { // gracefully handle values close to zero
-            _data->nnz[_m] = count_nonzero(Bm, n);
             /*
              *  Extend the residual target: y_res -= bo_m * ybo_m, with the
              *  stored f32 bo_m, in f64 (no rounding drift accumulates across
-             *  appends); the f32 copy is re-rounded from it.
+             *  appends); the f32 copy is re-rounded from it. Count the new
+             *  column's support in the same pass.
              */
             double *yres_d = _data->yres_d.data();
             float  *yres   = _data->yres.data();
-            for (size_t i = 0; i < n; ++i) {
-                yres_d[i] -= (double)(float)v[i] * ybo_m;
-                yres[i]    = (float)yres_d[i];
-            }
-            /*
-             *  Extend E = BoᵀBo - I by the new column's Gram entries (from
-             *  the stored f32 values), then refresh Eybo = E * ybo.
-             */
-            {
-                const size_t m1  = _m + 1;
-                const size_t ldE = _data->ldE;
-                double *E = _data->E.data();
-                std::vector<double> g(m1);
-                mars::gram_col(n, m1, Bo, ldBo, _m, g.data());
-                for (size_t k = 0; k < _m; ++k) {
-                    E[k + _m * ldE] = E[_m + k * ldE] = g[k];
+            mars::row_blocks(n, threads, [&](size_t b, size_t i0, size_t i1) {
+                size_t nz = 0;
+                for (size_t i = i0; i < i1; ++i) {
+                    yres_d[i] -= (double)(float)v[i] * ybo_m;
+                    yres[i]    = (float)yres_d[i];
+                    nz += Bm[i] != 0.0f;
                 }
-                E[_m + _m * ldE] = g[_m] - 1.0;
+                part[b] = (double)nz;
+            });
+            size_t nnz = 0;
+            for (double e : part) {
+                nnz += (size_t)e;
             }
+            _data->nnz[_m] = nnz;
+
+            /*
+             *  Extend E = BoᵀBo - I by the new column's Gram entries, then
+             *  refresh Eybo = E * ybo.
+             */
+            const size_t ldE = _data->ldE;
+            double *E = _data->E.data();
+            for (size_t k = 0; k < _m; ++k) {
+                E[k + _m * ldE] = E[_m + k * ldE] = g[k];
+            }
+            E[_m + _m * ldE] = g[_m] - 1.0;
             _m += 1;
             _data->ybo.push_back(ybo_m); // extend the cache for next iteration
             _data->Eybo.assign(_m, 0.0);
             for (size_t k = 0; k < _m; ++k) {
                 double acc = 0.0;
                 for (size_t l = 0; l < _m; ++l) {
-                    acc += _data->E[k + l * _data->ldE] * _data->ybo[l];
+                    acc += E[k + l * ldE] * _data->ybo[l];
                 }
                 _data->Eybo[k] = acc;
+            }
+
+            /*
+             *  Dead-on-append: the linear candidate (xcol, bcol) just appended
+             *  IS the new B column (formed bit for bit as eval() forms it), so
+             *  it is in span(Bo) by construction. Mark it dead in the T caches
+             *  instead of letting the next eval prove it via the explicit
+             *  fallback.
+             */
+            if (type == 'l' && !_data->lin.empty()) {
+                LinCache &L = _data->lin[xcol];
+                L.reserve((size_t)bcol + 1, _max_terms, _max_terms);
+                if (!L.dead[bcol]) {
+                    L.dead[bcol] = 1;
+                    if (L.have[bcol]) {
+                        L.parents.erase(std::remove(L.parents.begin(), L.parents.end(), bcol),
+                                        L.parents.end());
+                    }
+                }
+#ifdef MARS_USE_CUDA
+                if (_cuda) {
+                    mars::cuda::linear_cache_mark_dead(_cuda, xcol, bcol);
+                }
+#endif
             }
             return std::max(mse,0.0);
         }
