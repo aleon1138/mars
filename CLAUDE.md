@@ -57,6 +57,8 @@ explicit BLAS-style strides (see the 2026-06-09 note). Key internal state (in
 - `E`, `Eybo` — `BoᵀBo − I` (m×m f64, one row/column per `append()` via
   `mars::gram_col`) and `E·ybo`: the first-order Gram correction of the
   closed-form linear ΔSSE (2026-11-04 performance note)
+- `lin` — the `linear_only` T cache, one `LinCache` per X column (2026-11-04
+  note); sized against `MARS_LINEAR_CACHE_GB`
 
 Three methods drive the algorithm:
 - `eval()` — for each candidate `X` column, computes the delta-SSE improvement
@@ -396,6 +398,48 @@ relative at n=5e5) does not use the closed form yet -- see TODO.md item 1.C.
 Tests: `KernelsTest.LinearDsseMatchesExactProjection` (closed form, high κ,
 fallback with a residual, in-span, zero column), and the tightened
 `MarsTest.LinearDsseMatchesOracleOnUncenteredInputs`.
+
+**Performance note (2026-11-04) — register-tiled Phase 1:** `bo_t_bx`
+(`T = BoᵀBx`, f32 in / f64 accumulate) walks the rows in 128-row panels,
+packs the panel's `Bo` rows as f64 in 12-row k-tiles and widens the `Bx`
+columns, and accumulates a 12×4 block of `T` in YMM registers across the
+panel (12 accumulators + 3 `Bo` vectors + 1 broadcast = all 16 registers),
+adding it to `T` once per panel. The old loop stored a `T` element on every
+FMA. Fewer than 4 columns (small DGKS retries) keep the old loop. Sums become
+two-level, so `T` is not bit-identical to before (slightly more accurate);
+all tests unchanged. `bench_sweep 500000 {100,250}`, one core, interleaved
+A/B under heavy shared load: `eval(linear)` 0.63 → 0.30 s at m=100 and 4.8 →
+1.7–2.2 s at m=250 (2.0–2.2×, on top of the closed form); `eval(hinge)` gains
+~10% (it shares Phase 1). ~15 GFMA/s at m=250, ~60–80% of one core's AVX2
+peak. Tried and rejected: an AVX-512 16×4 tile (15–30% slower; same story as
+the 2026-05-16 note); panel rows 64/256/512 (no difference within the noise);
+the 8×4 tile is ~10–15% slower than 12×4 -- re-check on a quiet box.
+
+**Performance note (2026-11-04) — `linear_only` T cache (CPU):** `Bo`, `B`
+and the scaled X never change, so `T[r, (k,c)] = <bo_r, fl(b_k·x_c)>` never
+changes once computed. `MarsAlgo::eval_linear_cached` keeps, per X column c
+(`LinCache`), the `T` column of every parent the mask has requested plus
+`‖Bx‖²`, `<Bx,y>`, `TᵀT`, `TᵀET`, `Tᵀybo`; each eval extends the live
+parents by the rows appended since c's last eval (`mars::cross_rows`, one
+pass over their `B` columns, the f32 product formed as the fill forms it --
+an unrounded `B·(bo⊙x)` GEMM would read `B` once for all c but perturb `den`
+at first order), adds a full Phase 1 column for newly requested parents, and
+scores in closed form at O(m) per candidate (only `TᵀE·ybo` is recomputed).
+Per X column per epoch that is O(n·m) instead of O(n·m·p). A candidate the
+explicit fallback finds in span(`Bo`) (residual ≤ tol) is marked dead: the
+span only grows, so it scores 0 for good and is no longer extended. Without
+that, every appended (c, k) pair was re-proven degenerate (projection + DGKS
+retry) every later epoch, which cut the gain from ~5× to 2.5×. Memory: up to
+`max_terms²` f64 per X column, enabled when that worst case fits
+`MARS_LINEAR_CACHE_GB` (default 8; 0 disables). Whole `fit(linear_only=True)`,
+n=2e5, p=16 uncentered inputs, one core, under heavy shared load: 60 terms
+13.5 → 2.8 s (eval 13.0 → 2.3 s), 120 max terms (stops at 72) 23.2 → 4.0 s
+(eval 22.6 → 3.4 s); identical models. What remains per column per epoch is
+the new parent's Phase 1 column (a single column takes the store-bound axpy
+loop) and the row extension. `MarsTest.LinearCacheMatchesUncached` drives
+both paths through 79 lagged, randomly masked epochs: max 3e-8 relative
+apart, final scores within median 4.5e-10 / max 2e-8 of the oracle. The GPU
+half (device cache, f64 new-row GEMMs) is TODO.md item 1.C.
 
 **Performance note (2026-10-23) — `expand()` is a row-blocked C++ kernel:**
 `mars.expand()` used to build `B` column by column in numpy on one core (three

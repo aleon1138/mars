@@ -276,6 +276,45 @@ void restride_rows(float *X, size_t n, size_t old_stride, size_t new_stride)
     }
 }
 
+/*
+ *  The linear_only T cache of one X column c (see the cached path in eval()).
+ *  Column k of T is Bo^T fl(B[:,k] .* x_c) for parent k, complete through row
+ *  `rows` (the basis count at the last eval of c); Bo, B and x_c never change,
+ *  so cached entries stay valid and each eval only adds the rows of the basis
+ *  columns appended since. The per-parent scalars are the pieces of the closed
+ *  form (mars::linear_dsse) that do not involve E*ybo: ||Bx||^2, <Bx, y>, T'T,
+ *  T'E T and T'ybo, each extended row by row. Parents enter only when the mask
+ *  first requests them, so parents a column can never take (degree limits,
+ *  self-interaction) cost nothing. A candidate the explicit path finds in
+ *  span(Bo) (residual energy <= tol) stays there -- the span only grows -- so
+ *  it is marked dead: scored 0 and no longer extended. Without that, every
+ *  appended (c, k) pair was re-proven degenerate (a projection plus a DGKS
+ *  retry) every later epoch, which dominated a cached fit.
+ */
+struct LinCache {
+    size_t rows = 0;               // T rows complete for every cached parent
+    size_t cap  = 0;               // parent slots allocated (parent k needs k < cap)
+    std::vector<int>     parents;  // cached live parents (extended each eval)
+    std::vector<uint8_t> have;     // (cap) parent k cached?
+    std::vector<uint8_t> dead;     // (cap) candidate found in span(Bo): scores 0 for good
+    std::vector<double>  T;        // (ldT, cap) col-major, ldT = max_terms
+    std::vector<double>  nb, by, tt, tet, ty;   // (cap)
+
+    void reserve(size_t k1, size_t ldT, size_t max_terms)
+    {
+        if (k1 <= cap) {
+            return;
+        }
+        cap = std::min(max_terms, std::max(k1, 2 * cap));
+        have.resize(cap, 0);
+        dead.resize(cap, 0);
+        T.resize(ldT * cap, 0.0);   // ld fixed: existing columns keep their place
+        for (auto *v : {&nb, &by, &tt, &tet, &ty}) {
+            v->resize(cap, 0.0);
+        }
+    }
+};
+
 struct MarsData {
     MarsData(const float *x, size_t n, size_t m, size_t ldx, size_t max_terms)
         : n(n), p(m), ldX(ldx), X(x)
@@ -300,6 +339,7 @@ struct MarsData {
     std::vector<double> E;      // Bo^T Bo - I (f64, symmetric, col-major; leading _m x _m live)
     std::vector<double> Eybo;   // E * ybo (live _m entries)
     std::vector<float>  s;      // normalization constant for columns of 'X' (1/rms)
+    std::vector<LinCache> lin;  // (p) linear_only T cache per X column; empty = disabled
     std::vector<int64_t> nnz;   // exact nonzero count of each stored B column (support size)
 };
 
@@ -558,6 +598,20 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
         verify(std::isfinite(rms), "not all columns in X are finite");
         _data->s[j] = rms > 0.0 ? (float)(1.0 / rms) : 1.0f;
     }
+
+    /*
+     *  The linear_only T cache (eval()) holds up to max_terms x max_terms f64
+     *  per X column. Enable it when that worst case fits MARS_LINEAR_CACHE_GB
+     *  (default 8; 0 disables it); otherwise linear_only recomputes T per eval.
+     */
+    double cache_gb = 8.0;
+    if (const char *e = std::getenv("MARS_LINEAR_CACHE_GB")) {
+        cache_gb = std::atof(e);
+    }
+    const double cache_worst = (double)m * (double)p * (double)(p + 6) * sizeof(double);
+    if (cache_gb > 0.0 && cache_worst <= cache_gb * 1e9) {
+        _data->lin.resize(m);
+    }
 }
 
 MarsAlgo::~MarsAlgo()
@@ -597,6 +651,161 @@ const float *MarsAlgo::ortho_basis(size_t *ld_bo) const
 {
     *ld_bo = _data->bo_stride;
     return _data->Bo.data();
+}
+
+/*
+ *  linear_only on the CPU with the T cache of X column xcol (LinCache): bring
+ *  the cache up to the current basis, then score each requested parent in
+ *  closed form from its cached pieces -- O(m) per candidate instead of a Phase
+ *  1 pass. The work per eval is one pass over the cached parents' B columns
+ *  per basis column appended since the last eval of xcol (mars::cross_rows),
+ *  plus one Phase 1 column per newly requested parent. Near-degenerate
+ *  candidates take the explicit path as in mars::linear_dsse. Not
+ *  thread-safe for the same xcol (the binding gives each X column to one
+ *  thread).
+ */
+void MarsAlgo::eval_linear_cached(double *linear_dsse, int xcol, const float *x,
+                                  const int *bcols, size_t p, Scratch &S)
+{
+    LinCache &L = _data->lin[xcol];
+    const size_t n    = _data->n;
+    const size_t m    = _m;
+    const size_t ldT  = _max_terms;
+    const size_t ldE  = _data->ldE;
+    const size_t ldBo = _data->bo_stride;
+    const float  *B    = _data->B.data();
+    const float  *Bo   = _data->Bo.data();
+    const double *E    = _data->E.data();
+    const double *ybo  = _data->ybo.data();
+    const double *Eybo = _data->Eybo.data();
+
+    /*
+     *  1. Extend the cached parents by the rows appended since the last eval,
+     *     and their scalars row by row (E and ybo entries of old rows never
+     *     change, so T'E T gains 2 t_r (E[r,:r] T[:r]) + E[r,r] t_r^2).
+     */
+    if (L.rows < m && !L.parents.empty()) {
+        const size_t r0 = L.rows;
+        mars::cross_rows(n, B, n, L.parents.data(), L.parents.size(), x, Bo, ldBo,
+                         r0, m, L.T.data(), ldT);
+        for (int k : L.parents) {
+            const double *t = L.T.data() + (size_t)k * ldT;
+            for (size_t r = r0; r < m; ++r) {
+                const double  tr = t[r];
+                const double *Er = E + r * ldE;          // column r == row r
+                double el = 0.0;
+                for (size_t l = 0; l < r; ++l) {
+                    el += Er[l] * t[l];
+                }
+                L.tet[k] += 2.0 * tr * el + Er[r] * tr * tr;
+                L.tt[k]  += tr * tr;
+                L.ty[k]  += tr * ybo[r];
+            }
+        }
+    }
+    L.rows = m;
+
+    /*
+     *  2. Parents requested for the first time: a full Phase 1 column each.
+     */
+    float  *Bx = S.Bx.data();          // (n, pcap), col stride n
+    double *Tw = S.BoTBx.data();       // (cap, pcap), col stride S.cap
+    thread_local std::vector<int> fresh;
+    fresh.clear();
+    for (size_t j = 0; j < p; ++j) {
+        if ((size_t)bcols[j] >= L.cap || !L.have[bcols[j]]) {
+            fresh.push_back(bcols[j]);
+        }
+    }
+    if (!fresh.empty()) {
+        L.reserve((size_t)*std::max_element(fresh.begin(), fresh.end()) + 1, ldT, _max_terms);
+        const float *y = _data->y.data();
+        for (size_t c = 0; c < fresh.size(); ++c) {
+            const size_t k = (size_t)fresh[c];
+            mars::fill_stats(B + k * n, x, y, Bx + c * n, n, L.nb[k], L.by[k]);
+        }
+        mars::phase1(n, m, fresh.size(), Bo, ldBo, Bx, n, Tw, S.cap);
+        for (size_t c = 0; c < fresh.size(); ++c) {
+            const size_t  k  = (size_t)fresh[c];
+            const double *tw = Tw + c * S.cap;
+            double       *t  = L.T.data() + k * ldT;
+            std::copy(tw, tw + m, t);
+            double tt = 0.0, tet = 0.0, ty = 0.0;
+            for (size_t r = 0; r < m; ++r) {
+                const double *Er = E + r * ldE;
+                double et = 0.0;
+                for (size_t l = 0; l < m; ++l) {
+                    et += Er[l] * t[l];
+                }
+                tt  += t[r] * t[r];
+                tet += t[r] * et;
+                ty  += t[r] * ybo[r];
+            }
+            L.tt[k] = tt;
+            L.tet[k] = tet;
+            L.ty[k] = ty;
+            L.have[k] = 1;
+            L.parents.push_back((int)k);
+        }
+    }
+
+    /*
+     *  3. Score. Only u's E*ybo term changes every append, so it is the one
+     *     O(m) dot per candidate.
+     */
+    thread_local std::vector<int> fb;
+    fb.clear();
+    for (size_t j = 0; j < p; ++j) {
+        const size_t  k = (size_t)bcols[j];
+        if (L.dead[k]) {
+            continue;                                   // linear_dsse[k] stays 0
+        }
+        const double *t = L.T.data() + k * ldT;
+        double tey = 0.0;
+        for (size_t r = 0; r < m; ++r) {
+            tey += t[r] * Eybo[r];
+        }
+        const double den = L.nb[k] - L.tt[k] + L.tet[k];
+        if (den * mars::LINEAR_KAPPA2_MAX < L.nb[k]) {
+            fb.push_back((int)k);
+            continue;
+        }
+        const double u = L.by[k] - L.ty[k] + tey;
+        linear_dsse[k] = (den > _tol) ? u * u / (den + _tol) : 0.0;
+    }
+    if (fb.empty()) {
+        return;
+    }
+
+    /*
+     *  4. Near-degenerate candidates: the explicit path on compact copies (the
+     *     DGKS retry overwrites its T, which must not touch the cache).
+     */
+    const float *y = _data->y.data();
+    for (size_t c = 0; c < fb.size(); ++c) {
+        const size_t k = (size_t)fb[c];
+        double nb_unused, by_unused;
+        mars::fill_stats(B + k * n, x, y, Bx + c * n, n, nb_unused, by_unused);
+        const double *t = L.T.data() + k * ldT;
+        std::copy(t, t + m, Tw + c * S.cap);
+    }
+    double *sb   = S.lin_work.data();
+    double *dsse = S.lin_dsse.data();
+    mars::explicit_dsse(n, m, nullptr, fb.size(), Bo, ldBo, Tw, S.cap, Bx, n,
+                        _data->yres.data(), _tol, sb, dsse);
+    bool died = false;
+    for (size_t c = 0; c < fb.size(); ++c) {
+        linear_dsse[fb[c]] = dsse[c];
+        if (!(sb[c] > _tol)) {
+            L.dead[fb[c]] = 1;
+            died = true;
+        }
+    }
+    if (died) {
+        L.parents.erase(std::remove_if(L.parents.begin(), L.parents.end(),
+                                       [&](int k) { return L.dead[k] != 0; }),
+                        L.parents.end());
+    }
 }
 
 void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
@@ -650,6 +859,10 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
      *  near-degenerate columns. The hinge sweep needs the explicit normalized
      *  Bx, so it keeps orthonormalize() below.
      */
+    if (linear_only && !cuda && !_data->lin.empty()) {
+        eval_linear_cached(linear_dsse, xcol, x, bcols, p, S);
+        return;
+    }
     if (linear_only && !cuda) {
         double *dsse = S.lin_dsse.data();
         mars::linear_dsse(

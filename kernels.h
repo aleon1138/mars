@@ -175,6 +175,49 @@ void linear_dsse(
     std::atomic<long> *fallback_counter = nullptr);
 
 /*
+ *  The explicit linear delta-SSE of nc candidate columns whose Phase 1 T is
+ *  already computed: Bx_j -= Bo T_j, a DGKS retry where gated (see
+ *  orthonormalize()), then dsse[j] = <r, yres>^2 / (s + tol) in f64, with
+ *  s = ||r||^2 over the stored f32 residual (0 if s <= tol). Column j is
+ *  cols[c] (or c when cols is null); it indexes T, Bx, sb and dsse alike.
+ *  linear_dsse()'s fallback for near-degenerate columns. T is overwritten for
+ *  retried columns.
+ */
+void explicit_dsse(size_t n, size_t m, const int *cols, size_t nc,
+                   const float *Bo, size_t ldBo, double *T, size_t ldT,
+                   float *Bx, size_t ldBx, const float *yres, double tol,
+                   double *sb, double *dsse);
+
+/*
+ *  Phase 1 alone: T[:, j] = Bo^T * Bx[:, j] for j < nc (f32 in, f64
+ *  accumulate; the register-tiled kernel orthonormalize() and linear_dsse()
+ *  use). Layouts as in orthonormalize().
+ */
+void phase1(size_t n, size_t m, size_t nc, const float *Bo, size_t ldBo,
+            const float *Bx, size_t ldBx, double *T, size_t ldT);
+
+/*
+ *  bx = b .* x (f32 multiply, stored f32 -- the fill of orthonormalize() and
+ *  linear_dsse()) with nb = ||bx||^2 and by = <bx, y> accumulated in f64 from
+ *  the stored values.
+ */
+void fill_stats(const float *b, const float *x, const float *y, float *bx, size_t n,
+                double &nb, double &by);
+
+/*
+ *  New rows of cached Phase 1 columns: for each parent k = parents[c],
+ *  T[r, k] += sum_i Bo[i, r] * fl(B[i, k] * x[i]) for r in [r0, r1) (T column
+ *  k at T + k*ldT). The product is the f32 one the fill forms, so the result
+ *  equals those rows of a full Phase 1 up to f64 summation order. One
+ *  streaming pass over the parents' B columns; the new Bo columns are gathered
+ *  per 256-row panel. The linear_only T cache (MarsAlgo::eval) extends every
+ *  cached candidate by the basis columns appended since its last eval.
+ */
+void cross_rows(size_t n, const float *B, size_t ldB, const int *parents, size_t np,
+                const float *x, const float *Bo, size_t ldBo, size_t r0, size_t r1,
+                double *T, size_t ldT);
+
+/*
  *  One column of the Gram of Bo: g[k] = sum_i Bo[i,k] * Bo[i,col] for k < m1
  *  (col < m1), f64-accumulated from the f32 storage. append() uses it to extend
  *  E = BoᵀBo - I. One streaming sweep over the first m1 entries of each row.

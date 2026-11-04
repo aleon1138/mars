@@ -164,13 +164,84 @@ inline size_t sel_col(const int *cols, size_t c)
 }
 
 /*
+ *  Phase 1, register-tiled (TODO.md item 3). The rows are walked in panels of
+ *  P1_ROWS. Per panel, the Bo rows are packed as f64 in k-tile order (P1_KT
+ *  consecutive T rows per tile, the panel's rows contiguous within a tile) and
+ *  the selected Bx columns are widened to f64. A P1_KT x P1_JT block of T is
+ *  then accumulated in registers across the whole panel and added to T once,
+ *  so each T load/store serves P1_ROWS FMAs instead of one (the unblocked loop
+ *  stored a T element on every FMA and was store-port-bound, ~2.6x off the FMA
+ *  peak). Products are exact in f64 (f32 x f32); the sums become two-level
+ *  (within the panel, then across panels), which is slightly more accurate
+ *  than the old row-sequential order but not bit-identical to it.
+ */
+constexpr size_t P1_ROWS = 128;   // rows per panel: packed Bo panel m*128*8 B (100 KB at m=100)
+constexpr size_t P1_KT   = 12;    // T rows per register tile (three 4-wide f64 vectors)
+constexpr size_t P1_JT   = 4;     // T columns per register tile
+
+/*
+ *  T[k0 : k0+kn, j] += sum_r bo[r, :] * bx[c][r] for the P1_JT columns tcol[c]
+ *  (the f64 AVX2 tile; an AVX-512 16x4 variant measured 15-30% slower on the
+ *  EPYC box, in line with the 2026-05-16 AVX-512 note).
+ *  bo: the packed tile, P1_KT doubles per row; bx: P1_JT widened columns, each
+ *  `ldbx` doubles apart. kn < P1_KT only on the last tile (the packed tail is
+ *  zero, so only the store needs the bound).
+ */
+inline void p1_tile(size_t r, const double *bo, const double *bx, size_t ldbx,
+                    double *const tcol[P1_JT], size_t kn)
+{
+#if defined(__AVX__)
+    /*
+     *  12 accumulators + 3 Bo vectors + 1 broadcast = all 16 YMM registers:
+     *  7 loads per 12 FMAs (an 8x4 tile was 6 per 8, ~10% slower at m=250).
+     */
+    __m256d a[P1_JT][3];
+    for (size_t c = 0; c < P1_JT; ++c) {
+        a[c][0] = a[c][1] = a[c][2] = _mm256_setzero_pd();
+    }
+    const double *xs[P1_JT] = {bx, bx + ldbx, bx + 2 * ldbx, bx + 3 * ldbx};
+    for (size_t i = 0; i < r; ++i) {
+        const __m256d b0 = _mm256_loadu_pd(bo + i * P1_KT);
+        const __m256d b1 = _mm256_loadu_pd(bo + i * P1_KT + 4);
+        const __m256d b2 = _mm256_loadu_pd(bo + i * P1_KT + 8);
+        for (size_t c = 0; c < P1_JT; ++c) {
+            const __m256d x = _mm256_broadcast_sd(xs[c] + i);
+            a[c][0] = _mm256_fmadd_pd(b0, x, a[c][0]);
+            a[c][1] = _mm256_fmadd_pd(b1, x, a[c][1]);
+            a[c][2] = _mm256_fmadd_pd(b2, x, a[c][2]);
+        }
+    }
+    alignas(32) double acc[P1_JT][P1_KT];
+    for (size_t c = 0; c < P1_JT; ++c) {
+        for (size_t h = 0; h < 3; ++h) {
+            _mm256_store_pd(acc[c] + 4 * h, a[c][h]);
+        }
+    }
+#else
+    double acc[P1_JT][P1_KT] = {};
+    for (size_t i = 0; i < r; ++i) {
+        for (size_t c = 0; c < P1_JT; ++c) {
+            const double xv = bx[c * ldbx + i];
+            for (size_t kk = 0; kk < P1_KT; ++kk) {
+                acc[c][kk] += bo[i * P1_KT + kk] * xv;
+            }
+        }
+    }
+#endif
+    for (size_t c = 0; c < P1_JT; ++c) {
+        for (size_t kk = 0; kk < kn; ++kk) {
+            tcol[c][kk] += acc[c][kk];
+        }
+    }
+}
+
+/*
  *  Phase 1 over a column set: T[:, j] = Bo^T * Bx[:, j] for each selected j,
  *  an f32-in / f64-accumulate GEMM no BLAS offers (sgemm accumulates in f32,
- *  dgemm needs f64 inputs). Bo is row-major, so the outer loop over i loads
- *  bo_row once and reuses it across all nc columns; Bx[i,j] is upcast at the
- *  axpy_m call site. With i outermost every T element is stored on every FMA,
- *  which makes this phase store-port-bound (~2.6x off the FMA peak); an
- *  i-blocked register tile would fix that -- TODO.md item 3.
+ *  dgemm needs f64 inputs). Register-tiled over row panels (see p1_tile);
+ *  fewer than P1_JT columns (e.g. a small DGKS retry) take the plain loop,
+ *  where packing would not pay for itself: with i outermost it loads bo_row
+ *  once per row and stores a T element on every FMA.
  */
 template <bool Indexed>
 inline void bo_t_bx(size_t n, size_t m, const int *cols, size_t nc,
@@ -181,11 +252,71 @@ inline void bo_t_bx(size_t n, size_t m, const int *cols, size_t nc,
     for (size_t c = 0; c < nc; ++c) {
         std::fill_n(T + sel_col<Indexed>(cols, c) * ldT, m, 0.0);
     }
-    for (size_t i = 0; i < n; ++i) {
-        const float *bo_row = Bo + i * ldBo;
+    if (nc < P1_JT) {
+        for (size_t i = 0; i < n; ++i) {
+            const float *bo_row = Bo + i * ldBo;
+            for (size_t c = 0; c < nc; ++c) {
+                const size_t j = sel_col<Indexed>(cols, c);
+                axpy_m(T + j * ldT, bo_row, (double)Bx[i + j * ldBx], m);
+            }
+        }
+        return;
+    }
+
+    const size_t nkt = (m + P1_KT - 1) / P1_KT;
+    thread_local std::vector<double> bop, bxp;   // packed Bo panel, widened Bx panel
+    bop.resize(nkt * P1_ROWS * P1_KT);
+    bxp.resize(nc * P1_ROWS);
+    for (size_t i0 = 0; i0 < n; i0 += P1_ROWS) {
+        const size_t r = std::min(P1_ROWS, n - i0);
+        for (size_t i = 0; i < r; ++i) {
+            const float *row = Bo + (i0 + i) * ldBo;
+            size_t k = 0;
+            for (size_t t = 0; t < nkt; ++t) {
+                double *dst = bop.data() + (t * P1_ROWS + i) * P1_KT;
+                for (size_t kk = 0; kk < P1_KT; ++kk, ++k) {
+                    dst[kk] = (k < m) ? (double)row[k] : 0.0;
+                }
+            }
+        }
         for (size_t c = 0; c < nc; ++c) {
-            const size_t j = sel_col<Indexed>(cols, c);
-            axpy_m(T + j * ldT, bo_row, (double)Bx[i + j * ldBx], m);
+            const float *src = Bx + sel_col<Indexed>(cols, c) * ldBx + i0;
+            double      *dst = bxp.data() + c * P1_ROWS;
+            for (size_t i = 0; i < r; ++i) {
+                dst[i] = (double)src[i];
+            }
+        }
+        size_t c = 0;
+        for (; c + P1_JT <= nc; c += P1_JT) {
+            for (size_t t = 0; t < nkt; ++t) {
+                const size_t k0 = t * P1_KT;
+                double *tcol[P1_JT];
+                for (size_t q = 0; q < P1_JT; ++q) {
+                    tcol[q] = T + sel_col<Indexed>(cols, c + q) * ldT + k0;
+                }
+                p1_tile(r, bop.data() + t * P1_ROWS * P1_KT, bxp.data() + c * P1_ROWS,
+                        P1_ROWS, tcol, std::min(P1_KT, m - k0));
+            }
+        }
+        // Leftover columns (< P1_JT): axpy over the packed panel, one T column
+        // at a time (still one T store per P1_KT-wide FMA, per row).
+        for (; c < nc; ++c) {
+            double       *tc = T + sel_col<Indexed>(cols, c) * ldT;
+            const double *xv = bxp.data() + c * P1_ROWS;
+            for (size_t t = 0; t < nkt; ++t) {
+                const size_t  k0 = t * P1_KT;
+                const size_t  kn = std::min(P1_KT, m - k0);
+                const double *bo = bop.data() + t * P1_ROWS * P1_KT;
+                double acc[P1_KT] = {};
+                for (size_t i = 0; i < r; ++i) {
+                    for (size_t kk = 0; kk < P1_KT; ++kk) {
+                        acc[kk] += bo[i * P1_KT + kk] * xv[i];
+                    }
+                }
+                for (size_t kk = 0; kk < kn; ++kk) {
+                    tc[k0 + kk] += acc[kk];
+                }
+            }
         }
     }
 }
@@ -527,18 +658,22 @@ void linear_dsse(
         fallback_counter->fetch_add((long)fallback.size(), std::memory_order_relaxed);
     }
 
-    /*
-     *  Explicit path on the near-degenerate columns: project with the Phase 1
-     *  T, then a DGKS retry where gated (as in orthonormalize()), and score the
-     *  f32 residual against yres in f64.
-     */
-    const int   *fb = fallback.data();
-    const size_t nf = fallback.size();
-    project_out<true>(n, m, fb, nf, Bo, ldBo, T, ldT, Bx, ldBx, sb);
+    explicit_dsse(n, m, fallback.data(), fallback.size(), Bo, ldBo, T, ldT,
+                  Bx, ldBx, yres, tol, sb, dsse);
+}
+
+namespace {
+template <bool Indexed>
+void explicit_dsse_impl(size_t n, size_t m, const int *cols, size_t nc,
+                        const float *Bo, size_t ldBo, double *T, size_t ldT,
+                        float *Bx, size_t ldBx, const float *yres, double tol,
+                        double *sb, double *dsse)
+{
+    project_out<Indexed>(n, m, cols, nc, Bo, ldBo, T, ldT, Bx, ldBx, sb);
     thread_local std::vector<int> retry;
     retry.clear();
-    for (size_t c = 0; c < nf; ++c) {
-        const size_t  j  = (size_t)fb[c];
+    for (size_t c = 0; c < nc; ++c) {
+        const size_t  j  = sel_col<Indexed>(cols, c);
         const double *tc = T + j * ldT;
         if (sb[j] > tol && sb[j] * DGKS_GATE_RATIO_SQ < dot_m(tc, tc, m)) {
             retry.push_back((int)j);
@@ -548,14 +683,75 @@ void linear_dsse(
         bo_t_bx<true>(n, m, retry.data(), retry.size(), Bo, ldBo, Bx, ldBx, T, ldT);
         project_out<true>(n, m, retry.data(), retry.size(), Bo, ldBo, T, ldT, Bx, ldBx, sb);
     }
-    for (size_t c = 0; c < nf; ++c) {
-        const size_t j = (size_t)fb[c];
+    for (size_t c = 0; c < nc; ++c) {
+        const size_t j = sel_col<Indexed>(cols, c);
         if (sb[j] > tol) {
             const double u = dot_widen(Bx + j * ldBx, yres, n);
             dsse[j] = u * u / (sb[j] + tol);
         }
         else {
             dsse[j] = 0.0;
+        }
+    }
+}
+} // namespace
+
+void explicit_dsse(size_t n, size_t m, const int *cols, size_t nc,
+                   const float *Bo, size_t ldBo, double *T, size_t ldT,
+                   float *Bx, size_t ldBx, const float *yres, double tol,
+                   double *sb, double *dsse)
+{
+    if (cols) {
+        explicit_dsse_impl<true>(n, m, cols, nc, Bo, ldBo, T, ldT, Bx, ldBx, yres, tol, sb, dsse);
+    }
+    else {
+        explicit_dsse_impl<false>(n, m, cols, nc, Bo, ldBo, T, ldT, Bx, ldBx, yres, tol, sb, dsse);
+    }
+}
+
+void phase1(size_t n, size_t m, size_t nc, const float *Bo, size_t ldBo,
+            const float *Bx, size_t ldBx, double *T, size_t ldT)
+{
+    bo_t_bx<false>(n, m, nullptr, nc, Bo, ldBo, Bx, ldBx, T, ldT);
+}
+
+void fill_stats(const float *b, const float *x, const float *y, float *bx, size_t n,
+                double &nb, double &by)
+{
+    fill_col_stats(b, x, y, bx, n, nb, by);
+}
+
+void cross_rows(size_t n, const float *B, size_t ldB, const int *parents, size_t np,
+                const float *x, const float *Bo, size_t ldBo, size_t r0, size_t r1,
+                double *T, size_t ldT)
+{
+    constexpr size_t PR = 256;           // rows per panel
+    const size_t nr = r1 - r0;
+    if (nr == 0 || np == 0) {
+        return;
+    }
+    thread_local std::vector<double> bp, v;
+    bp.resize(nr * PR);
+    v.resize(PR);
+    for (size_t i0 = 0; i0 < n; i0 += PR) {
+        const size_t r = std::min(PR, n - i0);
+        for (size_t i = 0; i < r; ++i) {        // the new Bo columns, panel-contiguous
+            const float *row = Bo + (i0 + i) * ldBo + r0;
+            for (size_t kk = 0; kk < nr; ++kk) {
+                bp[kk * PR + i] = (double)row[kk];
+            }
+        }
+        for (size_t c = 0; c < np; ++c) {
+            const size_t k  = (size_t)parents[c];
+            const float *bk = B + k * ldB + i0;
+            const float *xx = x + i0;
+            for (size_t i = 0; i < r; ++i) {
+                v[i] = (double)(bk[i] * xx[i]);  // the f32 product, as the fill forms it
+            }
+            double *tk = T + k * ldT + r0;
+            for (size_t kk = 0; kk < nr; ++kk) {
+                tk[kk] += dot_m(v.data(), bp.data() + kk * PR, r);
+            }
         }
     }
 }

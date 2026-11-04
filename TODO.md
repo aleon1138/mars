@@ -30,19 +30,21 @@ from the f64 `B·x`, landed 2026-11-04 -- CLAUDE.md note)
 
 **Speed**
 
-- **C. Cache `T` across epochs, and the GPU closed form (next after item 3).**
-  B landed on the CPU (2026-11-04, CLAUDE.md). `Bo`, `B` and the scaled X
-  never change, so `T[k', (k,c)]` never changes: per epoch only a new row for
-  every candidate plus the new parent's columns are needed, two
-  (m×n)·(n×p_x) GEMMs instead of p_x·m single-column passes (~m/2 less work).
-  Memory m_max²·p_x f64 (128 MB at 400·400·100). Keep `TᵀT`, `TᵀET`, `Tᵀybo`,
-  `TᵀE·ybo`, `‖Bx‖²`, `<Bx,y>` per candidate and extend them incrementally
-  (O(m) per candidate per epoch via E's new row), or a Cholesky of `BoᵀBo`.
-  **The GPU closed form belongs here:** `den` takes `T` errors at first order,
-  and the blocked-f32 `T` (~eps_f32·L/√(3n) relative per coherent entry, so
-  ~2e-7·κ² on `den` at n=5e5, L=2048) is too coarse, while a full Dgemm `T`
-  costs more than it saves on the weak-f64 card. With the cache, each epoch's
-  new rows are two thin GEMMs, cheap enough in f64.
+- **C (GPU half). Device `T` cache + closed form for `eval_batch`.** The CPU
+  cache landed 2026-11-04 (CLAUDE.md; ~5–7× on a whole linear-only fit). On
+  the GPU, keep the per-(X column, parent) `T` columns and scalars resident
+  (m_max²·p_x f64, 128 MB at 400·400·100); per epoch compute the new rows for
+  all cached candidates and the new parents' columns as f64 GEMMs (two thin
+  (m×n)·(n×p_x)-shaped products -- cheap enough in f64, unlike a full `T`),
+  score in closed form in one kernel, mark in-span candidates dead, and send
+  near-degenerate ones through the existing f64 retry path. The blocked-f32
+  `T` cannot feed the closed form: `den` takes `T` errors at first order
+  (~eps_f32·L/√(3n) per coherent entry, ~2e-7·κ² on `den` at n=5e5).
+  Needs device runs to validate.
+- **C (CPU follow-up).** A newly requested parent's Phase 1 column is a single
+  column, so it takes the store-bound axpy loop; batching the fresh parents of
+  several X columns into one tiled pass (they share `Bo`) would cut the
+  remaining per-epoch cost.
 - **D. Centering x is not worth it alone:** exact in exact arithmetic
   (b_k·const ∈ span) but only cut the DGKS rate from 89% to 86%.
 - Smaller: ~244 sgemm + accumulate launches per batch at n=5e5 (a
@@ -107,28 +109,18 @@ the f64-only levers are spent. Open items, in order:
      columns; cutting it further needs an algorithmic change (re-orthogonalize
      against only the relevant `Bo` columns). High risk for the remaining slice.
 
-## 3. Orthonormalize Phase 1/2a GEMMs are store-port-bound (CPU)
+## 3. Register-tile Phase 2a (CPU hinge eval; re-measure on a quiet box)
 
-`eval(linear)` is 1.14 s at n=5e5, m=100 and 5.8 s at m=250 (23 ms per basis),
-~2.6× off the FMA bound. Phase 1 (`axpy_m` building `T = Boᵀ·Bx` with `i`
-outermost) stores a `T` element on every FMA and x86 retires ~1 store/cycle;
-Phase 2a is load-bound the same way. Keeping `i` outermost reads `Bo`/`Bx`
-exactly once, but `T` (m×p f64) cannot live in registers.
-
-**Fix:** an `i`-blocked, register-tiled kernel: hold a `T` tile in YMM
-accumulators across a panel of 8–16 rows, so each `T` load/store serves 8–16
-FMAs and the `Bo` panel is re-read from L1. Same shape for Phase 2a. ~100 lines
-of AVX with three tail cases; tune the panel on the server (the arm64 dev box
-takes the scalar path).
-
-**Why it can't just call BLAS:** `Bo`/`Bx` are f32 storage but `T` must
-accumulate in f64 (the precision contract behind the f32 buffers); `sgemm`
-accumulates in f32 and `dgemm` needs f64 inputs.
-
-**Value:** since the closed-form linear ΔSSE (2026-11-04), Phase 1 is nearly
-the whole cost of CPU `linear_only`; and, since the sweep fix, ~45% of a CPU
-hinge eval (1.1 of 2.4 s at m=100,
-5.8 of 12.5 s at m=250). Expected ~2× on Phase 1/2a, so ~1.3× on a hinge fit.
+Phase 1 (`T = Boᵀ·Bx`) is register-tiled since 2026-11-04 (CLAUDE.md): ~2× on
+`eval(linear)`. Phase 2a (`project_out`: `Bx -= Bo·T` plus the norms), which
+only the hinge eval and the closed form's fallback use, is still the
+row-at-a-time `dot_bo4` loop, load-bound at ~1.25 loads per FMA. The same
+treatment applies with the roles swapped: per output tile of 4 rows × 3
+columns keep 12 YMM accumulators along k (7 loads per 12 FMAs), horizontal-sum
+at the end, subtract/round/norm as now. Expected ~10% of a hinge eval -- too
+small to see while the EPYC box is under heavy shared load (±30% run to run on
+2026-11-04), so measure it, and re-check the 12×4 vs 8×4 Phase 1 tile choice
+(~10–15%, measured under that load), when the box is quiet.
 
 ## 4. CPU hinge sweep: f/g store traffic (low priority)
 

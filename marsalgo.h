@@ -19,6 +19,8 @@ struct Context;
 }
 }
 
+struct Scratch;
+
 class MarsAlgo {
     struct MarsData *_data = nullptr;
     mars::cuda::Context *_cuda = nullptr;  // lazily created on first cuda eval
@@ -26,6 +28,9 @@ class MarsAlgo {
     size_t  _max_terms = 0;  // capacity cap: B/Bo grow up to this many columns
     double  _yvar      = 0;  // variance of 'y'
     double  _tol       = 0;  // numerical error tolerance
+
+    void eval_linear_cached(double *linear_dsse, int xcol, const float *x,
+                            const int *bcols, size_t p, Scratch &S);
 
 public:
     /*

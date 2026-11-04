@@ -517,6 +517,89 @@ TEST(MarsTest, LinearDsseMatchesOracleOnUncenteredInputs)
     }
 }
 
+/*
+ *  The linear_only T cache (MarsAlgo::eval_linear_cached) against the
+ *  uncached closed form (MARS_LINEAR_CACHE_GB=0), driven like fit(): every
+ *  epoch evaluates a random subset of X columns (so a column's cache lags by
+ *  several appends) with a random parent mask (Fast-MARS), then appends the
+ *  best candidate to both. Afterwards every candidate is checked against the
+ *  span(Bo) oracle.
+ */
+TEST(MarsTest, LinearCacheMatchesUncached)
+{
+    const size_t N = 8000, PX = 10, M = 80;
+    linear_problem::Problem P = linear_problem::make(N, PX, 3.0f, 0xCAC4E);
+    setenv("MARS_LINEAR_CACHE_GB", "0", 1);
+    MarsAlgo plain(P.X.data(), P.y.data(), P.w.data(), N, PX, M + 2, N);
+    unsetenv("MARS_LINEAR_CACHE_GB");
+    MarsAlgo cached(P.X.data(), P.y.data(), P.w.data(), N, PX, M + 2, N);
+
+    std::mt19937 rng(0xCAC4F);
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    std::vector<double> a(M), b(M), hinge(M), cut(M);
+    double max_rel = 0.0;
+    int compared = 0, epochs = 0;
+    while ((size_t)cached.nbasis() < M && epochs < 400) {
+        ++epochs;
+        const size_t m = cached.nbasis();
+        ASSERT_EQ(plain.nbasis(), (int)m);
+        double best = -1.0;
+        int bx = -1, bk = -1;
+        for (size_t c = 0; c < PX; ++c) {
+            if (U(rng) < 0.3) {
+                continue;                       // skipped this epoch: the cache lags
+            }
+            std::vector<char> mask(m);
+            for (auto &v : mask) {
+                v = U(rng) < 0.6;
+            }
+            cached.eval(a.data(), hinge.data(), cut.data(), (int)c,
+                        (const bool *)mask.data(), 1, 0, /*linear_only=*/true);
+            plain.eval(b.data(), hinge.data(), cut.data(), (int)c,
+                       (const bool *)mask.data(), 1, 0, /*linear_only=*/true);
+            for (size_t k = 0; k < m; ++k) {
+                SCOPED_TRACE("epoch " + std::to_string(epochs) + " c=" + std::to_string(c) +
+                             " k=" + std::to_string(k));
+                if (!mask[k]) {
+                    EXPECT_EQ(a[k], 0.0);
+                    continue;
+                }
+                EXPECT_NEAR(a[k], b[k], 1e-6 * std::max(a[k], b[k]) + 1e-13);
+                if (b[k] > 1e-10) {
+                    max_rel = std::max(max_rel, std::abs(a[k] - b[k]) / b[k]);
+                    ++compared;
+                }
+                if (a[k] > best) {
+                    best = a[k];
+                    bx = (int)c;
+                    bk = (int)k;
+                }
+            }
+        }
+        if (bx >= 0 && best > 0.0) {
+            const double r1 = cached.append('l', bx, bk, 0.0f);
+            const double r2 = plain.append('l', bx, bk, 0.0f);
+            ASSERT_EQ(r1 < 0.0, r2 < 0.0);
+        }
+    }
+    ASSERT_EQ((size_t)cached.nbasis(), M);
+
+    std::vector<double> ref, kappa;
+    linear_problem::oracle(cached, P, ref, kappa);
+    std::vector<double> est(PX * M);
+    std::vector<char> all(M, 1);
+    for (size_t c = 0; c < PX; ++c) {
+        cached.eval(est.data() + c * M, hinge.data(), cut.data(), (int)c,
+                    (const bool *)all.data(), 1, 0, /*linear_only=*/true);
+    }
+    const auto S = linear_problem::compare(est, ref, kappa, 1e-10, 1e4);
+    std::printf("[ linear cache ] %d epochs, %d comparisons: cached vs uncached max rel %.1e;"
+                " vs oracle: median %.1e max %.1e\n", epochs, compared, max_rel,
+                S.med_rel, S.max_rel);
+    EXPECT_LT(S.med_rel, 2e-8);
+    EXPECT_LT(S.max_rel, 5e-6);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 /*
