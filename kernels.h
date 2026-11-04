@@ -114,6 +114,74 @@ double orthonormalize_col(
     std::atomic<long> *dgks_counter = nullptr);
 
 /*
+ *  Fallback threshold of the closed-form linear delta-SSE (linear_dsse()): a
+ *  candidate whose residual carries less than 1/LINEAR_KAPPA2_MAX of its energy
+ *  (kappa^2 = ||Bx||^2 / den above this) is scored by explicit projection
+ *  instead. The closed form subtracts O(||Bx||^2) f64 sums to get den, so its
+ *  relative error grows as ~eps_f64*sqrt(n)*kappa^2 (the sequential T and
+ *  ||Bx||^2 sums); 1e6 keeps that under ~1e-7 at n=5e5. Exactly in-span
+ *  candidates (kappa = inf) always take the explicit path, which zeroes them.
+ */
+constexpr double LINEAR_KAPPA2_MAX = 1e6;
+
+/*
+ *  Linear delta-SSE of p candidate columns, in closed form. For each j, with
+ *  Bx_j = B[:, mask[j]] .* x (f32 product, stored f32 -- the same column
+ *  orthonormalize() forms and append() would store) and T_j = Bo^T Bx_j:
+ *
+ *      den = ||Bx_j||^2 - T_j'T_j + T_j'E T_j          (residual energy)
+ *      u   = <Bx_j, y>  - T_j'ybo + T_j'E ybo          (residual . y)
+ *      dsse[j] = (den > tol) ? u^2 / (den + tol) : 0
+ *
+ *  This is the projection onto the complement of span(Bo) with the exact Gram
+ *  BoᵀBo = I + E taken to first order in E (E ~ eps_f32, so the dropped
+ *  term is ~||E||^2*kappa^2, ~5e-9 at the fallback gate): it needs only
+ *  Phase 1 (T), not the
+ *  projection, the DGKS retry or the normalize, and never rounds the residual
+ *  to f32. Columns whose kappa^2 = ||Bx_j||^2 / den exceeds LINEAR_KAPPA2_MAX
+ *  fall back to the explicit path: Bx_j -= Bo T_j, a DGKS retry when gated
+ *  (see orthonormalize()), then dsse[j] = <r, yres>^2 / (s + tol), with f64
+ *  throughout and no f32 normalize scale.
+ *
+ *  Layouts (caller's responsibility):
+ *      B, x, mask, Bo   : as in orthonormalize()
+ *      y     : (n) f32 target;  yres : (n) f32 residual target y - Bo*ybo
+ *      ybo   : (m) Bo^T y;      E : (m, m) symmetric, col-major, col stride ldE
+ *      Eybo  : (m) E * ybo
+ *      Bx    : (n, p) col-major float, col stride ldBx   [workspace]
+ *      T     : (m, p) col-major double, col stride ldT   [workspace]
+ *      work  : (3p + m) double                           [workspace]
+ *      dsse  : (p) double                                [output]
+ *
+ *  fallback_counter (optional): incremented by the number of explicit-path
+ *  columns.
+ */
+void linear_dsse(
+    size_t n, size_t m, size_t p,
+    const float  *B,    size_t ldB,
+    const float  *x,
+    const int    *mask,
+    const float  *Bo,   size_t ldBo,
+    const float  *y,
+    const float  *yres,
+    const double *ybo,
+    const double *E,    size_t ldE,
+    const double *Eybo,
+    float        *Bx,   size_t ldBx,
+    double       *T,    size_t ldT,
+    double       *work,
+    double tol,
+    double       *dsse,
+    std::atomic<long> *fallback_counter = nullptr);
+
+/*
+ *  One column of the Gram of Bo: g[k] = sum_i Bo[i,k] * Bo[i,col] for k < m1
+ *  (col < m1), f64-accumulated from the f32 storage. append() uses it to extend
+ *  E = BoᵀBo - I. One streaming sweep over the first m1 entries of each row.
+ */
+void gram_col(size_t n, size_t m1, const float *Bo, size_t ldBo, size_t col, double *g);
+
+/*
  *  Dot product of two contiguous f32 vectors, accumulated in f64:
  *
  *      returns  sum_{i<n} (double)a[i] * (double)b[i]

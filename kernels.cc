@@ -272,6 +272,43 @@ inline double cgs_project_col(
     return dot_m(c, c, m);
 }
 
+/*
+ *  bx[i] = b[i] * x[i] (f32 multiply, stored f32 -- the same rounding as the
+ *  fill in orthonormalize()), and, from the stored values, nb = ||bx||^2 and
+ *  by = <bx, y> accumulated in f64.
+ */
+inline void fill_col_stats(const float *b, const float *x, const float *y,
+                           float *bx, size_t n, double &nb, double &by)
+{
+    size_t i = 0;
+#if defined(__AVX__)
+    __m256d n0 = _mm256_setzero_pd(), n1 = _mm256_setzero_pd();
+    __m256d y0 = _mm256_setzero_pd(), y1 = _mm256_setzero_pd();
+    for (; i + 8 <= n; i += 8) {
+        const __m256 v8 = _mm256_mul_ps(_mm256_loadu_ps(b + i), _mm256_loadu_ps(x + i));
+        _mm256_storeu_ps(bx + i, v8);
+        const __m256d vlo = _mm256_cvtps_pd(_mm256_castps256_ps128(v8));
+        const __m256d vhi = _mm256_cvtps_pd(_mm256_extractf128_ps(v8, 1));
+        n0 = _mm256_fmadd_pd(vlo, vlo, n0);
+        n1 = _mm256_fmadd_pd(vhi, vhi, n1);
+        y0 = _mm256_fmadd_pd(vlo, loadu_ps_pd(y + i),     y0);
+        y1 = _mm256_fmadd_pd(vhi, loadu_ps_pd(y + i + 4), y1);
+    }
+    double sn = hsum256_pd(_mm256_add_pd(n0, n1));
+    double sy = hsum256_pd(_mm256_add_pd(y0, y1));
+#else
+    double sn = 0.0, sy = 0.0;
+#endif
+    for (; i < n; ++i) {
+        const float v = b[i] * x[i];
+        bx[i] = v;
+        sn += (double)v * (double)v;
+        sy += (double)v * (double)y[i];
+    }
+    nb = sn;
+    by = sy;
+}
+
 } // namespace
 
 double dot_widen(const float *a, const float *b, size_t n)
@@ -419,6 +456,106 @@ void orthonormalize(
 #endif
         for (; i < n; ++i) {
             bx[i] *= scale;
+        }
+    }
+}
+
+void gram_col(size_t n, size_t m1, const float *Bo, size_t ldBo, size_t col, double *g)
+{
+    std::fill_n(g, m1, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        const float *row = Bo + i * ldBo;
+        axpy_m(g, row, (double)row[col], m1);
+    }
+}
+
+void linear_dsse(
+    size_t n, size_t m, size_t p,
+    const float  *B,    size_t ldB,
+    const float  *x,
+    const int    *mask,
+    const float  *Bo,   size_t ldBo,
+    const float  *y,
+    const float  *yres,
+    const double *ybo,
+    const double *E,    size_t ldE,
+    const double *Eybo,
+    float        *Bx,   size_t ldBx,
+    double       *T,    size_t ldT,
+    double       *work,
+    double tol,
+    double       *dsse,
+    std::atomic<long> *fallback_counter)
+{
+    double *nb = work;           // (p) ||Bx_j||^2
+    double *by = work + p;       // (p) <Bx_j, y>
+    double *sb = work + 2 * p;   // (p) explicit-path residual energy
+    double *et = work + 3 * p;   // (m) E * T_j
+
+    /*
+     *  Fill Bx with the column statistics, then Phase 1: T = Bo^T * Bx.
+     */
+    for (size_t j = 0; j < p; ++j) {
+        fill_col_stats(B + (size_t)mask[j] * ldB, x, y, Bx + j * ldBx, n, nb[j], by[j]);
+    }
+    bo_t_bx<false>(n, m, nullptr, p, Bo, ldBo, Bx, ldBx, T, ldT);
+
+    /*
+     *  Closed form, first order in E. O(m^2) per column for T'E T against the
+     *  O(n*m) of Phase 1. Columns too close to span(Bo) for the f64
+     *  cancellation in den are queued for the explicit path.
+     */
+    thread_local std::vector<int> fallback;
+    fallback.clear();
+    for (size_t j = 0; j < p; ++j) {
+        const double *tc = T + j * ldT;
+        for (size_t k = 0; k < m; ++k) {
+            et[k] = dot_m(E + k * ldE, tc, m);   // E symmetric: column k == row k
+        }
+        const double den = nb[j] - dot_m(tc, tc, m) + dot_m(tc, et, m);
+        if (den * LINEAR_KAPPA2_MAX < nb[j]) {
+            fallback.push_back((int)j);
+            continue;
+        }
+        const double u = by[j] - dot_m(tc, ybo, m) + dot_m(tc, Eybo, m);
+        dsse[j] = (den > tol) ? u * u / (den + tol) : 0.0;
+    }
+    if (fallback.empty()) {
+        return;
+    }
+    if (fallback_counter) {
+        fallback_counter->fetch_add((long)fallback.size(), std::memory_order_relaxed);
+    }
+
+    /*
+     *  Explicit path on the near-degenerate columns: project with the Phase 1
+     *  T, then a DGKS retry where gated (as in orthonormalize()), and score the
+     *  f32 residual against yres in f64.
+     */
+    const int   *fb = fallback.data();
+    const size_t nf = fallback.size();
+    project_out<true>(n, m, fb, nf, Bo, ldBo, T, ldT, Bx, ldBx, sb);
+    thread_local std::vector<int> retry;
+    retry.clear();
+    for (size_t c = 0; c < nf; ++c) {
+        const size_t  j  = (size_t)fb[c];
+        const double *tc = T + j * ldT;
+        if (sb[j] > tol && sb[j] * DGKS_GATE_RATIO_SQ < dot_m(tc, tc, m)) {
+            retry.push_back((int)j);
+        }
+    }
+    if (!retry.empty()) {
+        bo_t_bx<true>(n, m, retry.data(), retry.size(), Bo, ldBo, Bx, ldBx, T, ldT);
+        project_out<true>(n, m, retry.data(), retry.size(), Bo, ldBo, T, ldT, Bx, ldBx, sb);
+    }
+    for (size_t c = 0; c < nf; ++c) {
+        const size_t j = (size_t)fb[c];
+        if (sb[j] > tol) {
+            const double u = dot_widen(Bx + j * ldBx, yres, n);
+            dsse[j] = u * u / (sb[j] + tol);
+        }
+        else {
+            dsse[j] = 0.0;
         }
     }
 }

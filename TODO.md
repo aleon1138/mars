@@ -30,24 +30,19 @@ from the f64 `B·x`, landed 2026-11-04 -- CLAUDE.md note)
 
 **Speed**
 
-- **B. Closed-form linear scoring (both paths, ~2×, more accurate).**
-  `den = ‖Bx‖² − TᵀT + TᵀET`, `u = <Bx,y> − Tᵀybo + TᵀE·ybo` with
-  `E = BoᵀBo − I` (m×m f64, one row per `append()`, O(nm)). Only `T` stays
-  O(nmp); the projection, round, normalize and dot passes and most DGKS
-  retries go (roughly half the 2026-06-17 GPU profile). Model accuracy:
-  median 1e-10, max 5e-7 up to κ~1e9. The full E is required (diagonal only:
-  max 1.7e-3). Keep the explicit path as a fallback for near-degenerate
-  columns; the hinge sweep still needs the explicit normalized column. This is
-  also the only lever on the DGKS cost: on uncentered inputs the retry fires on
-  nearly every candidate and costs a full second Phase 1/2a pass (CPU
-  `eval(linear)` 3.8 → 7.6 s at n=2e5, m=80, p=16; batching the retry did not
-  change that -- CLAUDE.md, 2026-11-04).
-- **C. Cache `T` across epochs (linear_only, ~m/2 less work).** `Bo`, `B` and
-  the scaled X never change, so `T[k', (k,c)]` never changes: per epoch only a
-  new row for every candidate plus the new parent's columns are needed, two
-  (m×n)·(n×p_x) GEMMs instead of p_x·m single-column passes. Memory
-  m_max²·p_x f64 (128 MB at 400·400·100). Incremental `TᵀET` (O(m) per
-  candidate) or a Cholesky of `BoᵀBo` (`z = L⁻¹T`). Builds on B.
+- **C. Cache `T` across epochs, and the GPU closed form (next after item 3).**
+  B landed on the CPU (2026-11-04, CLAUDE.md). `Bo`, `B` and the scaled X
+  never change, so `T[k', (k,c)]` never changes: per epoch only a new row for
+  every candidate plus the new parent's columns are needed, two
+  (m×n)·(n×p_x) GEMMs instead of p_x·m single-column passes (~m/2 less work).
+  Memory m_max²·p_x f64 (128 MB at 400·400·100). Keep `TᵀT`, `TᵀET`, `Tᵀybo`,
+  `TᵀE·ybo`, `‖Bx‖²`, `<Bx,y>` per candidate and extend them incrementally
+  (O(m) per candidate per epoch via E's new row), or a Cholesky of `BoᵀBo`.
+  **The GPU closed form belongs here:** `den` takes `T` errors at first order,
+  and the blocked-f32 `T` (~eps_f32·L/√(3n) relative per coherent entry, so
+  ~2e-7·κ² on `den` at n=5e5, L=2048) is too coarse, while a full Dgemm `T`
+  costs more than it saves on the weak-f64 card. With the cache, each epoch's
+  new rows are two thin GEMMs, cheap enough in f64.
 - **D. Centering x is not worth it alone:** exact in exact arithmetic
   (b_k·const ∈ span) but only cut the DGKS rate from 89% to 86%.
 - Smaller: ~244 sgemm + accumulate launches per batch at n=5e5 (a
@@ -130,8 +125,9 @@ takes the scalar path).
 accumulate in f64 (the precision contract behind the f32 buffers); `sgemm`
 accumulates in f32 and `dgemm` needs f64 inputs.
 
-**Value:** the whole cost of CPU `linear_only` (production uses the GPU there)
-and, since the sweep fix, ~45% of a CPU hinge eval (1.1 of 2.4 s at m=100,
+**Value:** since the closed-form linear ΔSSE (2026-11-04), Phase 1 is nearly
+the whole cost of CPU `linear_only`; and, since the sweep fix, ~45% of a CPU
+hinge eval (1.1 of 2.4 s at m=100,
 5.8 of 12.5 s at m=250). Expected ~2× on Phase 1/2a, so ~1.3× on a hinge fit.
 
 ## 4. CPU hinge sweep: f/g store traffic (low priority)

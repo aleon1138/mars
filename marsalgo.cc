@@ -281,6 +281,8 @@ struct MarsData {
         : n(n), p(m), ldX(ldx), X(x)
         , B (n*max_terms, 0.0f)
         , Bo(n*max_terms, 0.0f)
+        , ldE(max_terms)
+        , E(max_terms*max_terms, 0.0)
         , nnz(max_terms, 0) {}
 
     const size_t n;             // rows in X / length of y / rows of B, Bo
@@ -294,6 +296,9 @@ struct MarsData {
     std::vector<double> ybo;    // dot product of basis Bo with Y target
     std::vector<double> yres_d; // residual target y - Bo*ybo (f64, updated per append)
     std::vector<float>  yres;   // f32 copy of yres_d: the linear delta-SSE dot target (see eval())
+    const size_t ldE;           // E column stride (== max_terms)
+    std::vector<double> E;      // Bo^T Bo - I (f64, symmetric, col-major; leading _m x _m live)
+    std::vector<double> Eybo;   // E * ybo (live _m entries)
     std::vector<float>  s;      // normalization constant for columns of 'X' (1/rms)
     std::vector<int64_t> nnz;   // exact nonzero count of each stored B column (support size)
 };
@@ -356,6 +361,8 @@ struct Scratch {
     std::vector<double>  hinge_sse;// (cap) best hinge delta-SSE per j (leading p)
     std::vector<double>  hinge_cut;// (cap) best hinge cut value per j (cuda sweep output)
     std::vector<double>  BoTBx;    // (cap, pcap) column-major (col stride cap) -- Bo^T*Bx workspace
+    std::vector<double>  lin_work; // linear_dsse() workspace (3*pcap + cap)
+    std::vector<double>  lin_dsse; // (pcap) linear_dsse() output
 
     /*
      *  Grow the n-sized buffers to `n_` rows and the basis-sized buffers to at
@@ -402,6 +409,8 @@ struct Scratch {
             Bx.resize(n * pcap);
             BoTBx.resize(cap * pcap);
         }
+        lin_work.resize(3 * pcap + cap);
+        lin_dsse.resize(pcap);
     }
 };
 
@@ -499,6 +508,18 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
      *  column per append(); the f32 copy is what eval() scores against. See the
      *  linear delta-SSE in eval() for why the residual and not y.
      */
+    /*
+     *  E = BoᵀBo - I, extended per append() (see the closed-form linear
+     *  delta-SSE, mars::linear_dsse). Not 0 even here: the intercept's f32
+     *  rounding is coherent, so ||bo0||^2 - 1 is ~eps_f32.
+     */
+    double g00 = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        g00 += (double)bo0[i] * (double)bo0[i];
+    }
+    _data->E[0] = g00 - 1.0;
+    _data->Eybo.assign(1, _data->E[0] * _data->ybo[0]);
+
     _data->yres_d.resize(n);
     _data->yres.resize(n);
     for (size_t i = 0; i < n; ++i) {
@@ -621,6 +642,36 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
      *  the (m, p) workspace for the Bo^T*Bx intermediate, col stride S.cap.
      */
     float *Bx  = S.Bx.data();   // (n, pcap) col-major, col stride n
+
+    /*
+     *  CPU linear_only: the closed form (mars::linear_dsse) needs only
+     *  T = Boᵀ·Bx -- no projection, DGKS retry or normalize -- and is more
+     *  accurate than the explicit path, which it falls back to only for
+     *  near-degenerate columns. The hinge sweep needs the explicit normalized
+     *  Bx, so it keeps orthonormalize() below.
+     */
+    if (linear_only && !cuda) {
+        double *dsse = S.lin_dsse.data();
+        mars::linear_dsse(
+            n, _m, p,
+            _data->B.data(),  _data->n,
+            x,
+            bcols,
+            _data->Bo.data(), _data->bo_stride,
+            _data->y.data(),  _data->yres.data(),
+            _data->ybo.data(),
+            _data->E.data(),  _data->ldE,
+            _data->Eybo.data(),
+            Bx,               n,
+            S.BoTBx.data(),   S.cap,
+            S.lin_work.data(),
+            _tol,
+            dsse);
+        for (size_t j = 0; j < p; ++j) {
+            linear_dsse[bcols[j]] = dsse[j];
+        }
+        return;
+    }
 
     /*
      *  `S.ybx` is reused as the per-column squared-norm scratch for
@@ -1144,8 +1195,31 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h)
                 yres_d[i] -= (double)(float)v[i] * ybo_m;
                 yres[i]    = (float)yres_d[i];
             }
+            /*
+             *  Extend E = BoᵀBo - I by the new column's Gram entries (from
+             *  the stored f32 values), then refresh Eybo = E * ybo.
+             */
+            {
+                const size_t m1  = _m + 1;
+                const size_t ldE = _data->ldE;
+                double *E = _data->E.data();
+                std::vector<double> g(m1);
+                mars::gram_col(n, m1, Bo, ldBo, _m, g.data());
+                for (size_t k = 0; k < _m; ++k) {
+                    E[k + _m * ldE] = E[_m + k * ldE] = g[k];
+                }
+                E[_m + _m * ldE] = g[_m] - 1.0;
+            }
             _m += 1;
             _data->ybo.push_back(ybo_m); // extend the cache for next iteration
+            _data->Eybo.assign(_m, 0.0);
+            for (size_t k = 0; k < _m; ++k) {
+                double acc = 0.0;
+                for (size_t l = 0; l < _m; ++l) {
+                    acc += _data->E[k + l * _data->ldE] * _data->ybo[l];
+                }
+                _data->Eybo[k] = acc;
+            }
             return std::max(mse,0.0);
         }
     }

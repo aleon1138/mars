@@ -477,7 +477,9 @@ TEST(MarsTest, DegenerateCandidateIsZeroAtSmallN)
 
 /*
  *  Linear delta-SSE against an f64 oracle on uncentered, correlated inputs
- *  (tests/linear_problem.h). Bo is f32, so BoᵀBo = I + E with a coherent
+ *  (tests/linear_problem.h). linear_only on the CPU scores in closed form
+ *  (mars::linear_dsse); the history below is about the explicit path, which
+ *  the hinge eval and the closed form's fallback still use. Bo is f32, so BoᵀBo = I + E with a coherent
  *  ~eps_f32 defect on the constant intercept; scoring the unit candidate
  *  against y let that defect into ybx at first order whenever the DGKS retry
  *  did not fire (observed: max 1.5e-3 relative). Scoring against the residual
@@ -507,8 +509,11 @@ TEST(MarsTest, LinearDsseMatchesOracleOnUncenteredInputs)
         std::printf("[ linear dsse ] n=%zu m=%zu mu=%g: %d candidates, rel err median %.1e max %.1e\n",
                     N, M, mu, S.count, S.med_rel, S.max_rel);
         ASSERT_GT(S.count, (int)(PX * M / 2));
-        EXPECT_LT(S.med_rel, 1.5e-7);
-        EXPECT_LT(S.max_rel, 2.5e-5);
+        // Closed form (mars::linear_dsse): observed median 4.5e-9 / 1.1e-12, max
+        // 8.5e-7 / 1.5e-10 for mu = 3 / 0; the explicit path it replaced was
+        // median ~7e-8, max ~1.1e-5.
+        EXPECT_LT(S.med_rel, 2e-8);
+        EXPECT_LT(S.max_rel, 5e-6);
     }
 }
 

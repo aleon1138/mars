@@ -1,6 +1,8 @@
 #include "../kernels.h"
 #include <Eigen/Dense>
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <gtest/gtest.h>
 #include <numeric>
 #include <random>
@@ -675,4 +677,94 @@ TEST(KernelsTest, OrthonormalizeColLeavesDegenerateUnnormalized)
     EXPECT_LE(w * w, TOL);        // below the degeneracy floor
     EXPECT_LT(v.norm(), 1e-3);    // left un-normalized (still the tiny residual)
     EXPECT_EQ(counter.load(), 0); // gate needs v_norm2 > tol, so no retry
+}
+
+/*
+ *  Closed-form linear delta-SSE (mars::linear_dsse) against an exact f64
+ *  projection onto span(Bo) (QR of the f32 Bo, so BoᵀBo != I is modelled).
+ *  The candidate set mixes well-conditioned random columns and columns 1e-4
+ *  off span(Bo) (kappa^2 ~ 7e4: both closed form), columns 1e-6 off span(Bo)
+ *  (kappa^2 ~ 7e8 > LINEAR_KAPPA2_MAX: explicit fallback with a real
+ *  residual), columns in span(Bo) up to f32 rounding (fallback, scored ~0)
+ *  and a zero column (closed form, exactly 0).
+ */
+TEST(KernelsTest, LinearDsseMatchesExactProjection)
+{
+    const int n = 4096, m = 48, nb = 40;
+    std::mt19937 rng(0x11DE);
+    MatrixXfC Bo = make_orthonormal_basis(n, m, /*bad_col=*/-1, rng);
+    const MatrixXd Bod = Bo.cast<double>();
+
+    ArrayXf x = 1.0f + 0.5f * ArrayXf::Random(n);      // in [0.5, 1.5]
+    ArrayXf y = ArrayXf::Random(n) + 0.7f;             // nonzero mean
+    MatrixXf B = MatrixXf::Random(n, nb);
+    std::vector<int> expect_fallback;
+    for (int k = 0; k < nb; ++k) {
+        const int kind = k % 5;
+        if (kind == 1 || kind == 2) {   // 1e-4 off span(Bo): closed form at high kappa;
+                                        // 1e-6 off: fallback with a real residual
+            VectorXf v = Bo.col(k % m) + (kind == 1 ? 1e-4f : 1e-6f) * VectorXf::Random(n);
+            B.col(k) = (v.array() / x).matrix();
+            if (kind == 2) {
+                expect_fallback.push_back(k);
+            }
+        }
+        else if (kind == 3) {       // in span(Bo) up to f32 rounding: fallback, ~0
+            B.col(k) = (Bo.col((k + 7) % m).array() / x).matrix();
+            expect_fallback.push_back(k);
+        }
+        else if (k == 4) {          // zero column
+            B.col(k).setZero();
+        }
+    }
+    std::vector<int> mask(nb);
+    std::iota(mask.begin(), mask.end(), 0);
+
+    // E = BoᵀBo - I, ybo, E*ybo, the residual target -- as MarsAlgo keeps them.
+    const MatrixXd E    = Bod.transpose() * Bod - MatrixXd::Identity(m, m);
+    const VectorXd yd   = y.cast<double>().matrix();
+    const VectorXd ybo  = Bod.transpose() * yd;
+    const VectorXd Eybo = E * ybo;
+    const VectorXf yres = (yd - Bod * ybo).cast<float>();
+    const double tol = 1e-13;
+
+    MatrixXf Bx(n, nb);
+    MatrixXd T(m, nb);
+    std::vector<double> work(3 * nb + m), dsse(nb, -1.0);
+    std::atomic<long> fallbacks{0};
+    mars::linear_dsse(n, m, nb, B.data(), (size_t)B.outerStride(), x.data(), mask.data(),
+                      Bo.data(), (size_t)Bo.outerStride(), y.data(), yres.data(),
+                      ybo.data(), E.data(), (size_t)E.outerStride(), Eybo.data(),
+                      Bx.data(), (size_t)Bx.outerStride(), T.data(), (size_t)T.outerStride(),
+                      work.data(), tol, dsse.data(), &fallbacks);
+    EXPECT_EQ(fallbacks.load(), (long)expect_fallback.size());
+
+    // Oracle: exact projection onto span(Bo) of the same f32 candidate.
+    const MatrixXd Q = HouseholderQR<MatrixXd>(Bod).householderQ() * MatrixXd::Identity(n, m);
+    for (int k = 0; k < nb; ++k) {
+        SCOPED_TRACE("column " + std::to_string(k));
+        VectorXd v(n);
+        for (int i = 0; i < n; ++i) {
+            v[i] = (double)(B(i, k) * x[i]);
+        }
+        const VectorXd r  = v - Q * (Q.transpose() * v);
+        const double   rr = r.squaredNorm();
+        const double   ref = rr > tol ? std::pow(r.dot(yd), 2) / (rr + tol) : 0.0;
+        const bool fb = std::find(expect_fallback.begin(), expect_fallback.end(), k)
+                        != expect_fallback.end();
+        if (k == 4) {
+            EXPECT_EQ(dsse[k], 0.0);
+        }
+        else if (!fb) {
+            // Closed form: the f64 cancellation in den costs ~eps_f64*sqrt(n)*
+            // kappa^2 relative -- observed ~3e-10 at kappa^2 ~ 7e4, n = 4096.
+            EXPECT_NEAR(dsse[k], ref, 1e-8 * ref + 1e-15);
+        }
+        else if (k % 5 == 2) {      // explicit fallback with a real residual
+            EXPECT_NEAR(dsse[k], ref, 1e-4 * ref + 1e-12);
+        }
+        else {                      // in span: noise-level, far below a real gain
+            EXPECT_LT(dsse[k], 1e-6);
+        }
+    }
 }

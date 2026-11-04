@@ -54,6 +54,9 @@ explicit BLAS-style strides (see the 2026-06-09 note). Key internal state (in
 - `y`, `ybo` — normalized target and its projection onto the ortho-basis
 - `yres` — the residual target `y − Bo·ybo` (f64 master + f32 copy, extended per
   `append()`): the linear ΔSSE dot target (see the 2026-11-04 note)
+- `E`, `Eybo` — `BoᵀBo − I` (m×m f64, one row/column per `append()` via
+  `mars::gram_col`) and `E·ybo`: the first-order Gram correction of the
+  closed-form linear ΔSSE (2026-11-04 performance note)
 
 Three methods drive the algorithm:
 - `eval()` — for each candidate `X` column, computes the delta-SSE improvement
@@ -368,6 +371,31 @@ eval / eval_batch median 2.6e-7, max 7.5e-6 relative vs the span(`Bo`) oracle
 halves (`CudaSweepTest.MatchesCpuEvalLargeBasis`, m=260: max rel 6.1e-2 before
 and after; pairs > 1e-3 34 → 32, differing cuts 9 → 6) -- that spread is the
 f32 projection on non-retried columns near `HINGE_DEN_REL`, not this change.
+
+**Performance note (2026-11-04) — closed-form linear ΔSSE (CPU
+`linear_only`):** `eval(linear_only)` on the CPU calls `mars::linear_dsse`
+instead of `orthonormalize()` + a dot. With `T = BoᵀBx` (Phase 1),
+`‖Bx‖²` and `<Bx,y>` (fused into the fill), it scores
+`den = ‖Bx‖² − TᵀT + TᵀET`, `u = <Bx,y> − Tᵀybo + TᵀE·ybo`,
+`ΔSSE = u²/(den+tol)`: the projection onto span(`Bo`) with the exact Gram
+`I + E` to first order (the dropped term is ~‖E‖²κ², ~5e-9 at the gate). No
+projection, DGKS retry, normalize or f32 rounding of the residual. Columns
+with κ² = ‖Bx‖²/den > `LINEAR_KAPPA2_MAX` (1e6) fall back to the explicit
+path; the f64 cancellation in `den` costs ~eps_f64·√n·κ² relative, so the
+gate holds that under ~1e-7 at n=5e5 (observed 3e-10 at κ² ~ 7e4, n=4096). The
+full `E` is required: its diagonal alone (the coherent intercept defect) left
+errors up to 1.7e-3 in a numpy model. Accuracy vs the span(`Bo`) oracle
+(n=2e4, m=120): median 4.5e-9 / 1.1e-12, max 8.5e-7 / 1.5e-10 for inputs with
+mean/std 3 / 0 (explicit path: median ~7e-8, max ~1.1e-5). Speed, one core,
+n=2e5, m=80, p=16, two noisy back-to-back runs each: uncentered 8.1 / 10.8 →
+3.7 / 4.1 s (2.2–2.6×, the DGKS retry is gone), centered 3.9 / 5.7 → 3.6 /
+4.0 s (~1.1–1.4×): Phase 2a was the cheap half, so Phase 1 (store-bound, TODO.md
+item 3) is now nearly the whole cost. `T`'s accuracy is load-bearing: `den`
+takes a `T` error at first order, which is why the GPU (blocked-f32 `T`, ~2e-7·κ²
+relative at n=5e5) does not use the closed form yet -- see TODO.md item 1.C.
+Tests: `KernelsTest.LinearDsseMatchesExactProjection` (closed form, high κ,
+fallback with a residual, in-span, zero column), and the tightened
+`MarsTest.LinearDsseMatchesOracleOnUncenteredInputs`.
 
 **Performance note (2026-10-23) — `expand()` is a row-blocked C++ kernel:**
 `mars.expand()` used to build `B` column by column in numpy on one core (three
