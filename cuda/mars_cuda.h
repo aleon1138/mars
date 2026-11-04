@@ -205,5 +205,43 @@ void orthonormalize_batch(Context *ctx, size_t m, size_t P,
                           const int *src_xcol, const int *src_basis,
                           double *ybx, std::atomic<long> *dgks_counter = nullptr);
 
+/*
+ *  The linear_only T cache (cuda/linear_cache.cu): the device counterpart of
+ *  the CPU cache in MarsAlgo::eval_linear_cached. One slot per (X column,
+ *  parent basis) keeps that candidate's f64 T = Boᵀ·Bx column and the scalars
+ *  of the closed-form ΔSSE (mars::linear_dsse), so an epoch costs one f64 pass
+ *  per live slot over the newly appended Bo rows instead of a full T GEMM.
+ *
+ *  linear_cache_init allocates the cache for p_x X columns (p_x · max_terms
+ *  slots, max_terms² f64 per X column) on the first call. It returns false,
+ *  and keeps returning false, if the allocation fails; the caller then uses
+ *  orthonormalize_batch().
+ */
+bool linear_cache_init(Context *ctx, size_t p_x);
+
+/*
+ *  Linear ΔSSE of P candidates (src_xcol[j], src_basis[j]) from the T cache:
+ *  extends every live slot to the m basis rows, fills the newly requested
+ *  slots (f64 Dgemm), scores all candidates in closed form, and re-scores the
+ *  near-degenerate ones (κ² > LINEAR_KAPPA2_MAX) by an explicit f64
+ *  projection, marking those in span(Bo) dead (they score 0 from then on).
+ *  P is not limited by the batch capacity.
+ *
+ *      E, ldE : (m, m) f64 col-major, E = BoᵀBo − I (only new columns are read)
+ *      ybo    : (m) f64 Boᵀy;  Eybo : (m) f64 E·ybo
+ *      dsse   : (P) f64 [output]
+ *      fallback_counter (optional): incremented per explicit re-score.
+ *
+ *  Requires linear_cache_init() == true, context_set_target(),
+ *  context_set_residual(), context_sync_basis() up to m, and
+ *  context_sync_xcols() for every X column referenced. Basis columns may only
+ *  be appended between calls (B, Bo and the scaled X are assumed fixed).
+ *  Synchronous.
+ */
+void linear_cache_eval(Context *ctx, size_t m, size_t P,
+                       const int *src_xcol, const int *src_basis,
+                       const double *E, size_t ldE, const double *ybo, const double *Eybo,
+                       double *dsse, std::atomic<long> *fallback_counter = nullptr);
+
 } // namespace cuda
 } // namespace mars

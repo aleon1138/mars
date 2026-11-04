@@ -206,7 +206,65 @@ struct Context {
     // hinge sweep phases (host-side wall time around stream syncs)
     double ms_sweep_sort = 0, ms_sweep_pass1 = 0, ms_sweep_pass2 = 0, ms_sweep_misc = 0;
     long   n_sweeps = 0;
+
+    // linear_only T cache (cuda/linear_cache.cu). One slot per (X column c,
+    // parent k), slot = c*max_terms + k, holding that candidate's T column
+    // (ldT rows) and its closed-form scalars. Allocated by linear_cache_init.
+    int     lc_on    = 0;        // 0: not tried, 1: allocated, -1: unavailable
+    size_t  lc_slots = 0;        // p_x * max_terms
+    size_t  lc_rows  = 0;        // Bo rows every live slot's T is extended to
+    size_t  lc_mE    = 0;        // E columns resident in dLE
+    int     lc_sms   = 1;        // SM count (sizes the row-extension grid)
+    double *dLT    = nullptr;    // (ldT, lc_slots) col-major
+    double *dLnb   = nullptr;    // (lc_slots) ‖Bx‖²
+    double *dLby   = nullptr;    // (lc_slots) <Bx, y>
+    double *dLtt   = nullptr;    // (lc_slots) TᵀT
+    double *dLtet  = nullptr;    // (lc_slots) TᵀET
+    double *dLty   = nullptr;    // (lc_slots) Tᵀybo
+    double *dLE    = nullptr;    // (max_terms, max_terms) col-major E = BoᵀBo - I
+    double *dLybo  = nullptr;    // (max_terms)
+    double *dLEybo = nullptr;    // (max_terms) E·ybo
+    int    *dLlive = nullptr;    // (lc_slots) live slot ids, ascending
+    int    *dLreq  = nullptr;    // (lc_slots) slot of each scored candidate
+    double *dLout  = nullptr;    // (lc_slots) closed-form ΔSSE per scored candidate
+    int    *dLflag = nullptr;    // (lc_slots) 1: near-degenerate, take the f64 fallback
+    int    *dLidx  = nullptr;    // (p_cap) slots of a fresh / fallback piece
+    std::vector<char>   h_lstate;  // (lc_slots) 0 absent, 1 live, 2 dead (in span)
+    std::vector<int>    h_llive;   // live slots, ascending
+    bool                lc_live_dirty = false;  // h_llive changed since its upload
+    std::vector<int>    h_lreq, h_lflag, h_lpos;
+    std::vector<double> h_lout;
+    double ms_lc_ext = 0, ms_lc_fresh = 0, ms_lc_score = 0, ms_lc_fb = 0;
+    long   n_lc_calls = 0, n_lc_fresh = 0, n_lc_fb = 0, n_lc_dead = 0, n_lc_rows = 0;
 };
+
+// Where output column j's B·x came from, so an f64 re-projection can recompute
+// it: x_j = X + xcol[j]*n (xcol non-null, batched path) or X (per-eval path),
+// times B[:, basis[j]]. All device pointers.
+struct FillSrc {
+    const float *X;
+    const int   *xcol;
+    const int   *basis;
+};
+
+/*
+ *  Explicit f64 projection of w_total columns (the DGKS retry, and the T
+ *  cache's near-degenerate fallback). For compact column c, with each index
+ *  array mapping c -> idx[c] (or c itself when null):
+ *      T0  = Tsrc[:, tidx[c]]          (the first-pass, f64-accurate T)
+ *      r1  = (f64) B·x of source sidx[c] (src) - Bo·T0
+ *      r2  = r1 - Bo·(Boᵀ·r1)
+ *  then r2 is rounded to f32 into dBx_f32 column oidx[c], with ds = ‖r2_f32‖²
+ *  and ybx_raw = <r2_f32, ydot> written at that index. Runs in chunks of
+ *  retry_cols through dT_retry / dBx_f64. Asynchronous on ctx->stream.
+ */
+void f64_reproject(Context *ctx, size_t m, size_t w_total,
+                   const double *Tsrc, size_t ldTsrc, const int *tidx,
+                   const FillSrc &src, const int *sidx, const int *oidx,
+                   const float *ydot, int want_dot);
+
+// Free the T cache buffers (context_destroy, and linear_cache_init on failure).
+void linear_cache_free(Context *ctx);
 
 // Free the hinge-sweep buffers (context_destroy, and hinge_sweep.cu on regrow).
 void sweep_free(Context *ctx);

@@ -23,24 +23,26 @@ from the f64 `B·x`, landed 2026-11-04 -- CLAUDE.md note)
    at its f32 floor at small n and the f32-projection noise grows as √m). Add
    a duplicate-candidate case at m≈1000, small n to `test_cuda`.
 3. **f32 normalize scale** adds ±1.2e-7 relative per-candidate noise to
-   ΔSSE (both paths). Free fix: `ΔSSE = <r,y>²/(s+tol)` in f64.
-4. **`grid.y = P` can exceed 65535** in the batched GPU path: `p_cap =
-   8e9/(16n)` passes it for n < ~7600, so a large block fails to launch.
-   Clamp `p_cap` or loop over `grid.y`.
+   ΔSSE on the uncached explicit paths (CPU `MARS_LINEAR_CACHE_GB=0`, GPU
+   `orthonormalize_batch` / per-column `eval(cuda=True)`). Free fix:
+   `ΔSSE = <r,y>²/(s+tol)` in f64, as the cached paths' fallback already does.
 
 **Speed**
 
-- **C (GPU half). Device `T` cache + closed form for `eval_batch`.** The CPU
-  cache landed 2026-11-04 (CLAUDE.md; ~5–7× on a whole linear-only fit). On
-  the GPU, keep the per-(X column, parent) `T` columns and scalars resident
-  (m_max²·p_x f64, 128 MB at 400·400·100); per epoch compute the new rows for
-  all cached candidates and the new parents' columns as f64 GEMMs (two thin
-  (m×n)·(n×p_x)-shaped products -- cheap enough in f64, unlike a full `T`),
-  score in closed form in one kernel, mark in-span candidates dead, and send
-  near-degenerate ones through the existing f64 retry path. The blocked-f32
-  `T` cannot feed the closed form: `den` takes `T` errors at first order
-  (~eps_f32·L/√(3n) per coherent entry, ~2e-7·κ² on `den` at n=5e5).
-  Needs device runs to validate.
+- **`append()` now dominates GPU `linear_only` fits.** With the device T
+  cache (2026-11-04), eval is ~0.3 s of a 1.7 s fit at n=5e5, p=50, 53
+  terms; `append()` (single-threaded CPU: classical GS + DGKS, `gram_col`
+  for `E`, the `yres` update) is 12–20 ms per call there, ~0.84 s. Options:
+  thread its row passes (OpenMP over row blocks; all are reductions or
+  per-row updates), or run it on the device, which already holds `B`/`Bo`
+  (then `sync_basis`, 75 ms over that fit, goes away too).
+- **Dead-on-append.** The candidate (c, k) just appended as a linear term is
+  the new `B` column bit for bit, so its slot is in span by construction, yet
+  both caches prove it through the explicit fallback the next epoch. In the
+  fit above the GPU ran 79 fallbacks (106 ms of the 0.33 s eval), all of
+  which died: up to 52 are these, the rest products reached in two orders
+  (b_j·x_c then ·x_c' vs b_j·x_c' then ·x_c). Marking the appended slot dead
+  in `append('l', ...)` skips the former; keep the fallback for the rest.
 - **C (CPU follow-up).** A newly requested parent's Phase 1 column is a single
   column, so it takes the store-bound axpy loop; batching the fresh parents of
   several X columns into one tiled pass (they share `Bo`) would cut the

@@ -58,7 +58,8 @@ explicit BLAS-style strides (see the 2026-06-09 note). Key internal state (in
   `mars::gram_col`) and `E·ybo`: the first-order Gram correction of the
   closed-form linear ΔSSE (2026-11-04 performance note)
 - `lin` — the `linear_only` T cache, one `LinCache` per X column (2026-11-04
-  note); sized against `MARS_LINEAR_CACHE_GB`
+  note); sized against `MARS_LINEAR_CACHE_GB`, which also gates the device
+  copy `eval_batch()` keeps in the CUDA context (`cuda/linear_cache.cu`)
 
 Three methods drive the algorithm:
 - `eval()` — for each candidate `X` column, computes the delta-SSE improvement
@@ -439,7 +440,35 @@ the new parent's Phase 1 column (a single column takes the store-bound axpy
 loop) and the row extension. `MarsTest.LinearCacheMatchesUncached` drives
 both paths through 79 lagged, randomly masked epochs: max 3e-8 relative
 apart, final scores within median 4.5e-10 / max 2e-8 of the oracle. The GPU
-half (device cache, f64 new-row GEMMs) is TODO.md item 1.C.
+half is the next note.
+
+**Performance note (2026-11-04) — `linear_only` T cache (GPU,
+`cuda/linear_cache.cu`):** `eval_batch()` keeps the same cache on the device
+when `MARS_LINEAR_CACHE_GB` allows (one dense slot per (X column, parent):
+f64 `T` column of `max_terms` rows plus the five scalars; it falls back to
+`orthonormalize_batch()` if the allocation fails). Per call: one f64 kernel
+extends every live slot by the Bo rows appended since the last call (one
+thread per slot walking a row chunk, the f32 product formed as the fill forms
+it, f64 atomics across chunks; up to 4 rows per launch) and a warp per slot
+updates TᵀT / TᵀET / Tᵀybo row by row (only `E`'s upper triangle is read, so
+only its new columns are uploaded); newly requested slots get a fill + f64
+`cublasDgemm`; a warp per candidate scores the closed form; κ² >
+`LINEAR_KAPPA2_MAX` candidates go through `f64_reproject` (the DGKS retry's
+two f64 passes, factored out of `project_reduce` and shared) and score
+`<r,y_res>²/(s+tol)` in f64, dying when `s <= tol`. The blocked-f32 `T` is
+never used here: `den` takes `T` errors at first order. Whole
+`fit(linear_only=True, cuda=True)` on the sm_120 box, uncentered inputs:
+n=2e5, p=16, 72 terms: 1.91 → 0.90 s (eval 1.07 → 0.15 s); n=5e5, p=50, 53
+terms: 5.12 → 1.78 s (eval 3.66 → 0.33 s; extension 52 ms, fresh slots 74
+ms, scoring 2 ms, fallback 106 ms for 79 candidates, all dead). Identical
+models with and without the cache. The uncached path's cost was mostly the
+DGKS retry (2.8 of 3.6 s: it fires on ~2/3 of uncentered candidates). The
+fit is now bound by the CPU `append()` (~0.84 s of the 1.78 s; TODO.md 1).
+`CudaKernelsTest.LinearCacheMatchesCpuOverEpochs` drives the device cache
+against the CPU cache on one MarsAlgo over a 90-term fit with random masks,
+inactive X columns, lagged calls (multi-row extensions) and double appends:
+max 4.2e-8 relative apart over 6305 comparisons (931 candidates 0 on both),
+final scores median 7.1e-10 / max 1.9e-7 from the span(`Bo`) oracle. Same change: the batch capacity `p_cap` is clamped to 65535 (`grid.y`).
 
 **Performance note (2026-10-23) — `expand()` is a row-blocked C++ kernel:**
 `mars.expand()` used to build `B` column by column in numpy on one core (three

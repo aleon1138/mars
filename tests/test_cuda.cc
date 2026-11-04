@@ -12,6 +12,7 @@
 
 #include <Eigen/Dense>
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <atomic>
 #include <gtest/gtest.h>
 #include <numeric>
@@ -752,9 +753,18 @@ TEST(CudaKernelsTest, LinearDsseMatchesOracleCollinearLargeBasis)
     algo.eval_batch(batch.data(), hinge.data(), cut.data(),
                     (const bool *)mask.data(), (int)PX, (int)M);
 
-    const char *names[] = {"cpu", "gpu eval", "gpu eval_batch"};
-    const std::vector<double> *ests[] = {&cpu, &gpu, &batch};
-    for (int t = 0; t < 3; ++t) {
+    // The same basis without the T cache: eval_batch takes orthonormalize_batch.
+    setenv("MARS_LINEAR_CACHE_GB", "0", 1);
+    MarsAlgo plain(P.X.data(), P.y.data(), P.w.data(), N, PX, M + 2, N);
+    unsetenv("MARS_LINEAR_CACHE_GB");
+    linear_problem::grow(plain, P, M, 0xD6C7);
+    std::vector<double> batch_nc(PX * M);
+    plain.eval_batch(batch_nc.data(), hinge.data(), cut.data(),
+                     (const bool *)mask.data(), (int)PX, (int)M);
+
+    const char *names[] = {"cpu", "gpu eval", "gpu eval_batch", "gpu batch no cache"};
+    const std::vector<double> *ests[] = {&cpu, &gpu, &batch, &batch_nc};
+    for (int t = 0; t < 4; ++t) {
         SCOPED_TRACE(names[t]);
         const auto S = linear_problem::compare(*ests[t], ref, kappa, 1e-10, 1e4);
         std::printf("[ linear dsse ] n=%zu m=%zu %-15s: %d candidates, rel err median %.1e max %.1e\n",
@@ -763,4 +773,103 @@ TEST(CudaKernelsTest, LinearDsseMatchesOracleCollinearLargeBasis)
         EXPECT_LT(S.med_rel, 3e-7);
         EXPECT_LT(S.max_rel, 5e-4);
     }
+}
+
+/*
+ *  The device T cache (eval_batch) against the CPU cache (eval) on the same
+ *  MarsAlgo over a whole fit: random parent masks, X columns skipped (inactive
+ *  rows), GPU calls skipped at random so the device extends several rows at a
+ *  time, and sometimes two appends per epoch. Appending the argmax makes the
+ *  (c, new basis) pair exactly degenerate, so dead marking is exercised. The
+ *  two caches compute the same f64 quantities in a different summation order.
+ */
+TEST(CudaKernelsTest, LinearCacheMatchesCpuOverEpochs)
+{
+    if (!cuda_available()) {
+        GTEST_SKIP() << "no CUDA device available";
+    }
+    unsetenv("MARS_LINEAR_CACHE_GB");
+    const size_t N = 8000, PX = 10, M = 90;
+    linear_problem::Problem P = linear_problem::make(N, PX, 3.0f, 0xCAC5E);
+    MarsAlgo algo(P.X.data(), P.y.data(), P.w.data(), N, PX, M + 2, N);
+
+    std::mt19937 rng(0xCAC5F);
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    std::vector<double> cpu(PX * M), gpu(PX * M), hinge(PX * M), cut(PX * M), one(M);
+    double max_rel = 0.0;
+    int compared = 0, epochs = 0, gpu_calls = 0, zeros_both = 0;
+    while ((size_t)algo.nbasis() < M && epochs < 400) {
+        ++epochs;
+        const size_t m = algo.nbasis();
+        std::vector<char> mask(PX * m, 0);
+        for (size_t c = 0; c < PX; ++c) {
+            if (U(rng) < 0.3) {
+                continue;                       // inactive X column this epoch
+            }
+            for (size_t k = 0; k < m; ++k) {
+                mask[c * m + k] = U(rng) < 0.6;
+            }
+        }
+        std::fill(cpu.begin(), cpu.end(), 0.0);
+        for (size_t c = 0; c < PX; ++c) {
+            algo.eval(one.data(), hinge.data(), cut.data(), (int)c,
+                      (const bool *)mask.data() + c * m, 1, 0, /*linear_only=*/true);
+            for (size_t k = 0; k < m; ++k) {
+                cpu[c * m + k] = mask[c * m + k] ? one[k] : 0.0;
+            }
+        }
+        const bool run_gpu = U(rng) < 0.7 || m + 2 >= M;
+        if (run_gpu) {
+            ++gpu_calls;
+            algo.eval_batch(gpu.data(), hinge.data(), cut.data(),
+                            (const bool *)mask.data(), (int)PX, (int)m);
+            for (size_t j = 0; j < PX * m; ++j) {
+                SCOPED_TRACE("epoch " + std::to_string(epochs) + " c=" +
+                             std::to_string(j / m) + " k=" + std::to_string(j % m));
+                const double a = gpu[j], b = cpu[j];
+                if (!mask[j]) {
+                    EXPECT_EQ(a, 0.0);
+                    continue;
+                }
+                EXPECT_NEAR(a, b, 1e-6 * std::max(a, b) + 1e-13);
+                if (b > 1e-10) {
+                    max_rel = std::max(max_rel, std::abs(a - b) / b);
+                    ++compared;
+                }
+                else if (a == 0.0 && b == 0.0) {
+                    ++zeros_both;
+                }
+            }
+        }
+        // Append the best one, sometimes the best two (the device then extends
+        // by two or more rows at its next call).
+        std::vector<size_t> order(PX * m);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return cpu[a] > cpu[b];
+        });
+        const int nappend = U(rng) < 0.3 ? 2 : 1;
+        for (int t = 0; t < nappend && (size_t)algo.nbasis() < M; ++t) {
+            const size_t j = order[t];
+            if (cpu[j] <= 0.0) {
+                break;
+            }
+            algo.append('l', (int)(j / m), (int)(j % m), 0.0f);
+        }
+    }
+    ASSERT_EQ((size_t)algo.nbasis(), M);
+    ASSERT_GT(compared, 1000);
+    EXPECT_GT(zeros_both, 0);                   // degenerate (dead) candidates seen
+
+    std::vector<double> ref, kappa;
+    linear_problem::oracle(algo, P, ref, kappa);
+    std::vector<char> all(PX * M, 1);
+    algo.eval_batch(gpu.data(), hinge.data(), cut.data(),
+                    (const bool *)all.data(), (int)PX, (int)M);
+    const auto S = linear_problem::compare(gpu, ref, kappa, 1e-10, 1e4);
+    std::printf("[ linear cache ] %d epochs, %d gpu calls, %d comparisons: gpu vs cpu cache "
+                "max rel %.1e; %d zero on both; vs oracle: median %.1e max %.1e\n",
+                epochs, gpu_calls, compared, max_rel, zeros_both, S.med_rel, S.max_rel);
+    EXPECT_LT(S.med_rel, 2e-8);
+    EXPECT_LT(S.max_rel, 5e-6);
 }

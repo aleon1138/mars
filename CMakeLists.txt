@@ -121,7 +121,8 @@ if(MARS_CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-    add_library(mars_cuda STATIC cuda/orthonormalize.cu cuda/hinge_sweep.cu)
+    add_library(mars_cuda STATIC cuda/orthonormalize.cu cuda/hinge_sweep.cu
+                          cuda/linear_cache.cu)
     set_target_properties(mars_cuda PROPERTIES
         POSITION_INDEPENDENT_CODE ON)   # linked into a shared object (marslib.so)
     target_include_directories(mars_cuda PRIVATE "${CMAKE_SOURCE_DIR}")  # kernels.h

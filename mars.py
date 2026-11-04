@@ -119,10 +119,11 @@ def fit(X, y, w=None, **kwargs):
 
     linear_only : bool (default=False)
         Disable formation of any hinges. This will still find interactions
-        of inputs. On the CPU the candidate projections are cached across
-        forward steps (up to `max_terms`² doubles per input column); the
-        environment variable `MARS_LINEAR_CACHE_GB` caps that memory
-        (default 8, 0 disables the cache at some speed cost).
+        of inputs. The candidate projections are cached across forward
+        steps (up to `max_terms`² doubles per input column, in host memory,
+        or in device memory with `cuda=True`); the environment variable
+        `MARS_LINEAR_CACHE_GB` caps that memory (default 8, 0 disables the
+        cache at some speed cost).
 
     n_true : int (default=n), where X is (n x p)
         Allows for an adjustment in the number of truly independent samples

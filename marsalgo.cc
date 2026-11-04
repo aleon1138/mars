@@ -1220,6 +1220,32 @@ void MarsAlgo::eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge
     mars::cuda::context_sync_xcols(_cuda, _data->p, _data->X, _data->ldX,
                                    _data->s.data(), active.data(), active.size());
 
+    /*
+     *  The device T cache (the GPU half of eval_linear_cached; enabled under
+     *  the same MARS_LINEAR_CACHE_GB budget as the CPU one, see the
+     *  constructor): every candidate in one call, scored in closed form.
+     */
+    if (!_data->lin.empty() && mars::cuda::linear_cache_init(_cuda, _data->p)) {
+        std::vector<int> sx, sb;
+        for (int i : active) {
+            const bool *row = mask + (size_t)i * mask_row_stride;
+            for (size_t k = 0; k < m; ++k) {
+                if (row[k]) {
+                    sx.push_back(i);
+                    sb.push_back((int)k);
+                }
+            }
+        }
+        std::vector<double> d(sx.size());
+        mars::cuda::linear_cache_eval(_cuda, m, sx.size(), sx.data(), sb.data(),
+                                      _data->E.data(), _data->ldE, _data->ybo.data(),
+                                      _data->Eybo.data(), d.data());
+        for (size_t j = 0; j < sx.size(); ++j) {
+            linear_dsse[(size_t)sx[j] * m + (size_t)sb[j]] = d[j];
+        }
+        return;
+    }
+
     const size_t cap = mars::cuda::context_batch_capacity(_cuda);
     std::vector<int>    src_xcol(cap), src_basis(cap);
     std::vector<double> ybx(cap);
