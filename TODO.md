@@ -32,9 +32,10 @@ from the f64 `B·x`, landed 2026-11-04 -- CLAUDE.md note)
 - **GPU `context_sync_basis` gathers each new `Bo` column on one thread**
   (strided reads down the row-major host `Bo`, then a sync): ~2.5 ms per
   append at n=5e5, ~130 ms of a 0.92 s cached GPU fit (the largest piece of
-  its eval). `append()` already holds the column contiguously (`v`, before
-  `store_col` rounds it into `Bo`): keep an f32 copy for the upload, or
-  gather it with `row_blocks`.
+  its eval). Fix it inside the CUDA path (CPU and GPU paths stay separate;
+  the CPU `append()` must not carry GPU work): e.g. a pinned staging buffer
+  gathered by several host threads, or one `cudaMemcpy2DAsync` straight
+  from the strided host column.
 - **C (CPU follow-up).** A newly requested parent's Phase 1 column is a single
   column, so it takes the store-bound axpy loop; batching the fresh parents of
   several X columns into one tiled pass (they share `Bo`) would cut the

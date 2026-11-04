@@ -229,6 +229,10 @@ bool linear_cache_init(Context *ctx, size_t p_x);
  *
  *      E, ldE : (m, m) f64 col-major, E = BoᵀBo − I (only new columns are read)
  *      ybo    : (m) f64 Boᵀy;  Eybo : (m) f64 E·ybo
+ *      lin_x, lin_b : (m) int -- basis column r was appended as the linear
+ *               term X[:, lin_x[r]]·B[:, lin_b[r]] (-1 otherwise). That
+ *               candidate is the column itself, so its slot is marked dead
+ *               (scored 0, never filled) once the cache reaches row r.
  *      dsse   : (P) f64 [output]
  *      fallback_counter (optional): incremented per explicit re-score.
  *
@@ -241,14 +245,8 @@ bool linear_cache_init(Context *ctx, size_t p_x);
 void linear_cache_eval(Context *ctx, size_t m, size_t P,
                        const int *src_xcol, const int *src_basis,
                        const double *E, size_t ldE, const double *ybo, const double *Eybo,
+                       const int *lin_x, const int *lin_b,
                        double *dsse, std::atomic<long> *fallback_counter = nullptr);
-
-/*
- *  Mark slot (xcol, basis) dead: the caller knows that candidate is in
- *  span(Bo) (MarsAlgo::append() of that very linear term), so it scores 0
- *  from now on and is never filled or extended. No-op without the cache.
- */
-void linear_cache_mark_dead(Context *ctx, int xcol, int basis);
 
 } // namespace cuda
 } // namespace mars

@@ -322,7 +322,9 @@ struct MarsData {
         , Bo(n*max_terms, 0.0f)
         , ldE(max_terms)
         , E(max_terms*max_terms, 0.0)
-        , nnz(max_terms, 0) {}
+        , nnz(max_terms, 0)
+        , lin_x(max_terms, -1)
+        , lin_b(max_terms, -1) {}
 
     const size_t n;             // rows in X / length of y / rows of B, Bo
     const size_t p;             // columns in X (candidate regressors)
@@ -339,8 +341,15 @@ struct MarsData {
     std::vector<double> E;      // Bo^T Bo - I (f64, symmetric, col-major; leading _m x _m live)
     std::vector<double> Eybo;   // E * ybo (live _m entries)
     std::vector<float>  s;      // normalization constant for columns of 'X' (1/rms)
-    std::vector<LinCache> lin;  // (p) linear_only T cache per X column; empty = disabled
+    bool lin_cache = false;     // linear_only T caches enabled (MARS_LINEAR_CACHE_GB budget)
+    std::vector<LinCache> lin;  // (p) the CPU T cache per X column (when lin_cache)
     std::vector<int64_t> nnz;   // exact nonzero count of each stored B column (support size)
+    /*
+     *  Basis column r was appended as the linear term X[:, lin_x[r]] * B[:, lin_b[r]]
+     *  (-1 for the intercept and hinges). That candidate is the column itself, so
+     *  each T cache marks its slot dead when it catches up with row r.
+     */
+    std::vector<int> lin_x, lin_b;
 };
 
 /*
@@ -610,7 +619,8 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
     }
     const double cache_worst = (double)m * (double)p * (double)(p + 6) * sizeof(double);
     if (cache_gb > 0.0 && cache_worst <= cache_gb * 1e9) {
-        _data->lin.resize(m);
+        _data->lin_cache = true;
+        _data->lin.resize(m);   // empty per-column caches, filled on first use
     }
 }
 
@@ -678,6 +688,27 @@ void MarsAlgo::eval_linear_cached(double *linear_dsse, int xcol, const float *x,
     const double *E    = _data->E.data();
     const double *ybo  = _data->ybo.data();
     const double *Eybo = _data->Eybo.data();
+
+    /*
+     *  0. Dead-on-append: a basis column appended since the last eval as the
+     *     linear term (xcol, k) IS candidate k of this column, in span(Bo) by
+     *     construction. Mark it dead (scored 0, never filled or extended)
+     *     instead of letting the explicit fallback prove it.
+     */
+    for (size_t r = L.rows; r < m; ++r) {
+        if (_data->lin_x[r] != xcol) {
+            continue;
+        }
+        const size_t k = (size_t)_data->lin_b[r];
+        L.reserve(k + 1, ldT, _max_terms);
+        if (!L.dead[k]) {
+            L.dead[k] = 1;
+            if (L.have[k]) {
+                L.parents.erase(std::remove(L.parents.begin(), L.parents.end(), (int)k),
+                                L.parents.end());
+            }
+        }
+    }
 
     /*
      *  1. Extend the cached parents by the rows appended since the last eval,
@@ -860,7 +891,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
      *  near-degenerate columns. The hinge sweep needs the explicit normalized
      *  Bx, so it keeps orthonormalize() below.
      */
-    if (linear_only && !cuda && !_data->lin.empty()) {
+    if (linear_only && !cuda && _data->lin_cache) {
         eval_linear_cached(linear_dsse, xcol, x, bcols, p, S);
         return;
     }
@@ -1226,7 +1257,7 @@ void MarsAlgo::eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge
      *  the same MARS_LINEAR_CACHE_GB budget as the CPU one, see the
      *  constructor): every candidate in one call, scored in closed form.
      */
-    if (!_data->lin.empty() && mars::cuda::linear_cache_init(_cuda, _data->p)) {
+    if (_data->lin_cache && mars::cuda::linear_cache_init(_cuda, _data->p)) {
         std::vector<int> sx, sb;
         for (int i : active) {
             const bool *row = mask + (size_t)i * mask_row_stride;
@@ -1240,7 +1271,8 @@ void MarsAlgo::eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge
         std::vector<double> d(sx.size());
         mars::cuda::linear_cache_eval(_cuda, m, sx.size(), sx.data(), sb.data(),
                                       _data->E.data(), _data->ldE, _data->ybo.data(),
-                                      _data->Eybo.data(), d.data());
+                                      _data->Eybo.data(), _data->lin_x.data(),
+                                      _data->lin_b.data(), d.data());
         for (size_t j = 0; j < sx.size(); ++j) {
             linear_dsse[(size_t)sx[j] * m + (size_t)sb[j]] = d[j];
         }
@@ -1479,28 +1511,9 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h, int threads)
                 _data->Eybo[k] = acc;
             }
 
-            /*
-             *  Dead-on-append: the linear candidate (xcol, bcol) just appended
-             *  IS the new B column (formed bit for bit as eval() forms it), so
-             *  it is in span(Bo) by construction. Mark it dead in the T caches
-             *  instead of letting the next eval prove it via the explicit
-             *  fallback.
-             */
-            if (type == 'l' && !_data->lin.empty()) {
-                LinCache &L = _data->lin[xcol];
-                L.reserve((size_t)bcol + 1, _max_terms, _max_terms);
-                if (!L.dead[bcol]) {
-                    L.dead[bcol] = 1;
-                    if (L.have[bcol]) {
-                        L.parents.erase(std::remove(L.parents.begin(), L.parents.end(), bcol),
-                                        L.parents.end());
-                    }
-                }
-#ifdef MARS_USE_CUDA
-                if (_cuda) {
-                    mars::cuda::linear_cache_mark_dead(_cuda, xcol, bcol);
-                }
-#endif
+            if (type == 'l') {
+                _data->lin_x[_m - 1] = xcol;   // see MarsData::lin_x
+                _data->lin_b[_m - 1] = bcol;
             }
             return std::max(mse,0.0);
         }

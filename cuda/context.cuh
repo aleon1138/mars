@@ -214,6 +214,7 @@ struct Context {
     size_t  lc_slots = 0;        // p_x * max_terms
     size_t  lc_rows  = 0;        // Bo rows every live slot's T is extended to
     size_t  lc_mE    = 0;        // E columns resident in dLE
+    size_t  lc_terms = 0;        // basis rows whose dead-on-append mark is applied
     int     lc_sms   = 1;        // SM count (sizes the row-extension grid)
     double *dLT    = nullptr;    // (ldT, lc_slots) col-major
     double *dLnb   = nullptr;    // (lc_slots) ‖Bx‖²
@@ -236,7 +237,7 @@ struct Context {
     std::vector<double> h_lout;
     double ms_lc_ext = 0, ms_lc_fresh = 0, ms_lc_score = 0, ms_lc_fb = 0;
     long   n_lc_calls = 0, n_lc_fresh = 0, n_lc_fb = 0, n_lc_dead = 0, n_lc_rows = 0;
-    long   n_lc_dead_append = 0;   // slots marked dead by append() (linear_cache_mark_dead)
+    long   n_lc_dead_append = 0;   // slots marked dead on append (the lin_x / lin_b record)
 };
 
 // Where output column j's B·x came from, so an f64 re-projection can recompute

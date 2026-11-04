@@ -57,9 +57,11 @@ explicit BLAS-style strides (see the 2026-06-09 note). Key internal state (in
 - `E`, `Eybo` — `BoᵀBo − I` (m×m f64, one row/column per `append()` via
   `mars::gram_col`) and `E·ybo`: the first-order Gram correction of the
   closed-form linear ΔSSE (2026-11-04 performance note)
-- `lin` — the `linear_only` T cache, one `LinCache` per X column (2026-11-04
-  note); sized against `MARS_LINEAR_CACHE_GB`, which also gates the device
-  copy `eval_batch()` keeps in the CUDA context (`cuda/linear_cache.cu`)
+- `lin` — the CPU `linear_only` T cache, one `LinCache` per X column
+  (2026-11-04 note). `lin_cache` (the `MARS_LINEAR_CACHE_GB` budget check)
+  enables it and, independently, the device cache `eval_batch()` keeps in the
+  CUDA context (`cuda/linear_cache.cu`); `lin_x` / `lin_b` record which basis
+  columns are linear terms (both caches mark those candidates dead)
 
 Three methods drive the algorithm:
 - `eval()` — for each candidate `X` column, computes the delta-SSE improvement
@@ -70,6 +72,13 @@ Three methods drive the algorithm:
 - `append()` — commits a chosen basis (type `'l'`, `'+'`, or `'-'`), updates `Bo`, `ybo`,
   `y_res` and `E` (row passes threaded over fixed blocks; 2026-11-04 note).
 - `nbasis()` / `dsse()` / `yvar()` — read-only accessors.
+
+**CPU and GPU paths stay separate.** The library must build and run on
+machines without a GPU. GPU code lives in `cuda/` behind `MARS_USE_CUDA` and
+is reached only from the `cuda` branches of `eval()` and from `eval_batch()`;
+CPU routines (`append()`, the CPU eval and its caches) carry no GPU work or
+GPU-only state. Shared inputs live in `MarsData` (e.g. `lin_x` / `lin_b`), and
+each path consumes them on its own.
 
 **pybind11 bindings (`marslib.cc`)** — exposes `MarsAlgo` as `marslib.MarsAlgo`.
 The `eval()` binding parallelizes over `X` columns using OpenMP, releasing the
@@ -489,16 +498,21 @@ and 32-thread runs unpinned; pinned to 16 busy cores of the shared box it
 collapsed to 50 ms per call, so oversubscription hurts here as in `eval()`).
 Whole CPU fit, n=2e5, p=16, 72 terms, 16 threads: 1.37 → 0.6 s, identical
 model. **Dead-on-append:** the linear candidate (c, k) just appended is the
-new B column bit for bit, so `append('l', ...)` marks its slot dead in the
-CPU `LinCache` and (`linear_cache_mark_dead`) the device cache instead of
-letting the next eval prove it through the explicit fallback; dead slots are
-never filled. Candidates in span by other routes (b_j·x_c·x_c' reached in
+new B column bit for bit, so it is in span by construction. `append()` only
+records the term (`MarsData::lin_x` / `lin_b`, -1 for the intercept and
+hinges); each cache marks the slot dead itself when it catches up with that
+row (the CPU one per X column in `eval_linear_cached`, the device one in
+`linear_cache_eval`), instead of proving it through the explicit fallback;
+dead slots are never filled. `append()` holds no cache or GPU logic: the CPU
+and GPU paths share only `MarsData`, and `MarsData::lin_cache` (the
+`MARS_LINEAR_CACHE_GB` budget check) switches each cache on independently. Candidates in span by other routes (b_j·x_c·x_c' reached in
 both orders) still take the fallback. GPU `fit(linear_only=True,
 cuda=True)`, n=5e5, p=50, 53 terms: 1.78 → 0.92 s with the cache
 (orchestration 1.37 → 0.49 s; fallbacks 79 → 28, 106 → 44 ms; 52 slots dead
 on append), identical model. Of the 0.32 s eval, `context_sync_basis` is now
 the largest piece (~130 ms: a single-threaded strided gather of each new
-`Bo` column from the row-major host copy; TODO.md 1).
+`Bo` column from the row-major host copy; TODO.md 1). Keep that fix inside
+the CUDA path: the CPU path must not carry work for the GPU.
 
 **Performance note (2026-10-23) — `expand()` is a row-blocked C++ kernel:**
 `mars.expand()` used to build `B` column by column in numpy on one core (three

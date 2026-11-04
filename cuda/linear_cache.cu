@@ -224,6 +224,20 @@ inline void lc_phase(Context *ctx, clock_t_::time_point &t0, double &acc)
     t0 = t1;
 }
 
+// Mark slot (xcol, basis) dead: scored 0 from now on, never filled or extended.
+void mark_dead(Context *ctx, size_t sl)
+{
+    if (sl >= ctx->lc_slots || ctx->h_lstate[sl] == 2) {
+        return;
+    }
+    if (ctx->h_lstate[sl] == 1) {
+        auto &lv = ctx->h_llive;
+        lv.erase(std::lower_bound(lv.begin(), lv.end(), (int)sl));
+        ctx->lc_live_dirty = true;
+    }
+    ctx->h_lstate[sl] = 2;
+}
+
 }  // namespace
 
 void linear_cache_free(Context *ctx)
@@ -282,6 +296,7 @@ bool linear_cache_init(Context *ctx, size_t p_x)
     ctx->lc_slots = slots;
     ctx->lc_rows  = 0;
     ctx->lc_mE    = 0;
+    ctx->lc_terms = 0;
     ctx->h_lstate.assign(slots, 0);
     ctx->h_llive.clear();
     ctx->lc_live_dirty = false;
@@ -293,27 +308,10 @@ bool linear_cache_init(Context *ctx, size_t p_x)
     return true;
 }
 
-void linear_cache_mark_dead(Context *ctx, int xcol, int basis)
-{
-    if (ctx->lc_on <= 0) {
-        return;
-    }
-    const size_t sl = (size_t)xcol * ctx->max_terms + (size_t)basis;
-    if (sl >= ctx->lc_slots || ctx->h_lstate[sl] == 2) {
-        return;
-    }
-    if (ctx->h_lstate[sl] == 1) {
-        auto &lv = ctx->h_llive;
-        lv.erase(std::lower_bound(lv.begin(), lv.end(), (int)sl));
-        ctx->lc_live_dirty = true;
-    }
-    ctx->h_lstate[sl] = 2;
-    ctx->n_lc_dead_append++;
-}
-
 void linear_cache_eval(Context *ctx, size_t m, size_t P,
                        const int *src_xcol, const int *src_basis,
                        const double *E, size_t ldE, const double *ybo, const double *Eybo,
+                       const int *lin_x, const int *lin_b,
                        double *dsse, std::atomic<long> *fallback_counter)
 {
     if (ctx->lc_on <= 0) {
@@ -345,6 +343,17 @@ void linear_cache_eval(Context *ctx, size_t m, size_t P,
                                cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(ctx->dLEybo, Eybo, m * sizeof(double),
                                cudaMemcpyHostToDevice, s));
+
+    // 0. Dead-on-append: basis column r appended as the linear term
+    //    (lin_x[r], lin_b[r]) is that candidate itself, in span(Bo) by
+    //    construction. Mark its slot dead before the extension below.
+    for (size_t r = ctx->lc_terms; r < m; ++r) {
+        if (lin_x[r] >= 0) {
+            mark_dead(ctx, (size_t)lin_x[r] * mt + (size_t)lin_b[r]);
+            ctx->n_lc_dead_append++;
+        }
+    }
+    ctx->lc_terms = m;
 
     // 1. Extend the live slots by the rows [lc_rows, m).
     const size_t L = ctx->h_llive.size();
