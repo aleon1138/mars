@@ -7,7 +7,7 @@ Builds a random model of `m` nodes over `p` inputs, expands an F-ordered f32 X
 of `n` rows, and reports the numpy loop once and the kernel at several thread
 counts in both output orders. Each call allocates a fresh B, so the timings
 include first-touch page faults, as a real call does. The kernel is memory
-bound; run on an idle box and expect the usual cross-core noise (see
+bound. Run it on an idle box, and expect the usual cross-core noise (see
 CLAUDE.md's bench notes).
 """
 

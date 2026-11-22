@@ -30,9 +30,9 @@ inline double fma(double x, double y, double z)
 #endif
 
 /*
- *  Flush denormals to zero for the duration of eval(): the sweep accumulators
- *  never need them and they are slow. Restored on every exit path, including
- *  exceptions.
+ *  Flush denormals to zero for the duration of eval(). The sweep accumulators
+ *  never need them, and they are slow. The scope restores the MXCSR state on
+ *  every exit path, including exceptions.
  */
 struct FtzDazScope {
 #ifdef __SSE__
@@ -50,13 +50,14 @@ struct FtzDazScope {
 
 /*
  *  Return sort indexes in stable descending order (ties keep ascending row
- *  order), as a comparison sort on `v[i] > v[j]` would. Implemented as an LSD
- *  radix sort on the float bit pattern: three 11-bit passes over packed
- *  (key, index) words, O(n) with sequential access, versus an indirect
- *  std::stable_sort whose comparisons gather v at random. -0.0 is folded into
- *  +0.0 so the two compare equal as they do for floats. `v` must be free of
- *  NaN (the constructor verifies X is finite). Scratch is function-local and
- *  thread-local, so this is safe from the OpenMP eval() loop.
+ *  order), as a comparison sort on `v[i] > v[j]` would. This is an LSD radix
+ *  sort on the float bit pattern: three 11-bit passes over packed
+ *  (key, index) words. It is O(n) with sequential access, while an indirect
+ *  std::stable_sort gathers v at random in its comparisons. -0.0 is folded
+ *  into +0.0, so the two compare equal, as they do for floats. `v` must be
+ *  free of NaN (the constructor verifies that X is finite). The scratch is
+ *  function-local and thread-local, so this is safe from the OpenMP eval()
+ *  loop.
  */
 void argsort(int32_t *idx, const float *v, size_t n)
 {
@@ -115,14 +116,14 @@ size_t nonzero(int *out, const bool *mask, size_t n)
 }
 
 /*
- *  Software prefetch of one cache line into L1. Inline asm on x86 rather than
- *  __builtin_prefetch: GCC (13.3, every -O level) deletes a loop of
- *  __builtin_prefetch calls when it sits inside a lambda -- the loop has no
- *  other effect, so it is removed as dead code (a plain loop or a single call
- *  survives; clang keeps all forms). The hinge sweep's row prefetch compiled
- *  to nothing that way and the sweep ran ~2.8x slower than its memory system
- *  allows. Verify with `objdump -d marslib*.so | grep -c prefetcht0` after
- *  touching this code.
+ *  Software prefetch of one cache line into L1. On x86 this is inline asm, not
+ *  __builtin_prefetch. GCC (13.3, every -O level) deletes a loop of
+ *  __builtin_prefetch calls when the loop sits inside a lambda. The loop has
+ *  no other effect, so GCC removes it as dead code. A plain loop or a single
+ *  call survives, and clang keeps all forms. The row prefetch of the hinge
+ *  sweep compiled to nothing that way, and the sweep ran ~2.8x slower than
+ *  its memory system allows. After touching this code, verify with
+ *  `objdump -d marslib*.so | grep -c prefetcht0`.
  */
 inline void prefetch_line(const void *p)
 {
@@ -151,22 +152,23 @@ struct cov_t {
 };
 
 /*
- *  Incrementally updates running accumulators `f_` and `g_` and returns their
- *  inner products. Called once per sorted data point while sweeping through
- *  candidate hinge cut locations.
+ *  Incrementally updates the running accumulators `f` and `g` and returns
+ *  their inner products. The sweep calls it once per sorted data point while
+ *  it walks through the candidate hinge cut locations.
  *
- *  f_ : double(m+1) [in/out]
- *      running accumulator for the hinge projection; f[i] += k0*g[i]
+ *  f : double(m+1) [in/out]
+ *      running accumulator for the hinge projection: f[i] += k0*g[i]
  *
- *  g_ : double(m+1) [in/out]
- *      running accumulator for the basis-weighted ortho-basis; g[i] += k1*x[i]
+ *  g : double(m+1) [in/out]
+ *      running accumulator for the basis-weighted ortho-basis: g[i] += k1*x[i]
  *
  *  x : float(m)
  *      a row from the orthonormalized and pre-sorted existing basis matrix
  *      (referred to as `Bok` in the calling code).
  *
  *  y : double(m)
- *      the result of `dot(Bo.T, y)`, i.e. projection of existing basis onto target.
+ *      the result of `dot(Bo.T, y)`: the projection of the existing basis
+ *      onto the target.
  *
  *  xm : float
  *      the orthonormalized candidate basis value at this sorted position (index m).
@@ -186,9 +188,9 @@ cov_t covariates_impl(double *f, double *g, const float *x, const double *y,
                       double xm, double ym, double k0, float k1, size_t m)
 {
     /*
-     *  f/g/y use unaligned loads/stores below, so no alignment is required of
-     *  the caller. On Haswell+ loadu/storeu on aligned data is as fast as the
-     *  aligned forms, and dropping the requirement lets callers hand us plain
+     *  f/g/y use unaligned loads and stores below, so the caller needs no
+     *  alignment. On Haswell+, loadu/storeu on aligned data is as fast as the
+     *  aligned forms. Without the requirement, callers can pass plain
      *  (16-byte) std::vector storage instead of over-aligned buffers.
      */
     cov_t o = {0,0};
@@ -245,9 +247,9 @@ cov_t covariates_impl(double *f, double *g, const float *x, const double *y,
 
 /*
  *  Non-template, out-of-line wrapper for the unit tests. The sweep calls the
- *  template directly (and forces it inline: it runs once per sorted row and
- *  basis column, ~25 vector iterations at m=100, so the 9-argument call and
- *  struct return are a measurable share).
+ *  template directly and forces it inline. It runs once per sorted row and
+ *  basis column, for ~25 vector iterations at m=100, so the 9-argument call
+ *  and the struct return are a measurable share of its cost.
  */
 cov_t covariates(double *f, double *g, const float *x, const double *y,
                  double xm, double ym, double k0, float k1, size_t m)
@@ -258,12 +260,12 @@ cov_t covariates(double *f, double *g, const float *x, const double *y,
 /*
  *  Re-stride a row-major (n x old_stride) matrix in place to a larger row
  *  stride `new_stride`, within a buffer of capacity >= n*new_stride. All
- *  old_stride existing columns of each row are preserved; the widened tail is
- *  left for the caller. As the stride grows the rows spread apart, so repack
- *  back-to-front (high row first, high column first within a row). The `i-- > 0`
- *  idiom walks a size_t counter down to 0 without an unsigned-wrap landmine and
- *  without a cast. Cold path: with geometric stride growth this runs
- *  O(log max_terms) times across a fit, not once per append.
+ *  old_stride existing columns of each row are preserved. The widened tail is
+ *  left to the caller. As the stride grows, the rows spread apart, so repack
+ *  back to front (high row first, and high column first within a row). The
+ *  `i-- > 0` idiom walks a size_t counter down to 0 with no unsigned
+ *  wrap-around and no cast. This is a cold path: with geometric stride growth
+ *  it runs O(log max_terms) times in a fit, not once per append.
  */
 void restride_rows(float *X, size_t n, size_t old_stride, size_t new_stride)
 {
@@ -278,18 +280,21 @@ void restride_rows(float *X, size_t n, size_t old_stride, size_t new_stride)
 
 /*
  *  The linear_only T cache of one X column c (see the cached path in eval()).
- *  Column k of T is Bo^T fl(B[:,k] .* x_c) for parent k, complete through row
- *  `rows` (the basis count at the last eval of c); Bo, B and x_c never change,
- *  so cached entries stay valid and each eval only adds the rows of the basis
- *  columns appended since. The per-parent scalars are the pieces of the closed
- *  form (mars::linear_dsse) that do not involve E*ybo: ||Bx||^2, <Bx, y>, T'T,
- *  T'E T and T'ybo, each extended row by row. Parents enter only when the mask
- *  first requests them, so parents a column can never take (degree limits,
- *  self-interaction) cost nothing. A candidate the explicit path finds in
- *  span(Bo) (residual energy <= tol) stays there -- the span only grows -- so
- *  it is marked dead: scored 0 and no longer extended. Without that, every
- *  appended (c, k) pair was re-proven degenerate (a projection plus a DGKS
- *  retry) every later epoch, which dominated a cached fit.
+ *  Column k of T is Bo^T fl(B[:,k] .* x_c) for parent k. It is complete
+ *  through row `rows`, the basis count at the last eval of c. Bo, B and x_c
+ *  never change, so cached entries stay valid, and each eval only adds the
+ *  rows of the basis columns appended since then. The per-parent scalars are
+ *  the pieces of the closed form (mars::linear_dsse) that do not involve
+ *  E*ybo: ||Bx||^2, <Bx, y>, T'T, T'E T and T'ybo. Each one is extended row by
+ *  row.
+ *
+ *  Parents enter only when the mask first requests them, so parents that a
+ *  column can never take (degree limits, self-interaction) cost nothing. A
+ *  candidate that the explicit path finds in span(Bo) (residual energy <= tol)
+ *  stays in span, because the span only grows. So it is marked dead: it
+ *  scores 0 and is no longer extended. Without that, every appended (c, k)
+ *  pair was re-proven degenerate (a projection plus a DGKS retry) in every
+ *  later epoch, and that dominated a cached fit.
  */
 struct LinCache {
     size_t rows = 0;               // T rows complete for every cached parent
@@ -330,15 +335,15 @@ struct MarsData {
     const size_t p;             // columns in X (candidate regressors)
     const size_t ldX;           // X column stride (column j starts at X + j*ldX)
     const float *X;             // read-only column-major view of the regressors
-    size_t bo_stride = 1;       // Bo row stride (capacity >= live count _m); grows geometrically
-    std::vector<float>  y;      // target vector (f32 storage; dot products upcast to f64)
-    std::vector<float>  B;      // all basis (col-major, n x max_terms preallocated; col stride n)
-    std::vector<float>  Bo;     // orthonormalized basis (ROW-major; row stride == bo_stride)
+    size_t bo_stride = 1;       // Bo row stride (capacity >= live count _m), grows geometrically
+    std::vector<float>  y;      // target vector (f32 storage, dot products upcast to f64)
+    std::vector<float>  B;      // all basis (col-major, n x max_terms preallocated, col stride n)
+    std::vector<float>  Bo;     // orthonormalized basis (ROW-major, row stride == bo_stride)
     std::vector<double> ybo;    // dot product of basis Bo with Y target
     std::vector<double> yres_d; // residual target y - Bo*ybo (f64, updated per append)
     std::vector<float>  yres;   // f32 copy of yres_d: the linear delta-SSE dot target (see eval())
     const size_t ldE;           // E column stride (== max_terms)
-    std::vector<double> E;      // Bo^T Bo - I (f64, symmetric, col-major; leading _m x _m live)
+    std::vector<double> E;      // Bo^T Bo - I (f64, symmetric, col-major, leading _m x _m live)
     std::vector<double> Eybo;   // E * ybo (live _m entries)
     std::vector<float>  s;      // normalization constant for columns of 'X' (1/rms)
     bool lin_cache = false;     // linear_only T caches enabled (MARS_LINEAR_CACHE_GB budget)
@@ -370,25 +375,26 @@ inline double *align64(double *p)
 }
 
 /*
- *  Per-thread working memory, function-local and thread-local inside `eval()`,
- *  so each thread owns one for its lifetime and the ensure*() calls reallocate
- *  only when the problem grows. Basis-sized buffers grow geometrically, so a
- *  full forward pass triggers O(log m) reallocations per thread.
+ *  Per-thread working memory, function-local and thread-local inside
+ *  `eval()`. Each thread owns one for its lifetime, and the ensure*() calls
+ *  reallocate only when the problem grows. The basis-sized buffers grow
+ *  geometrically, so a full forward pass triggers O(log m) reallocations per
+ *  thread.
  *
- *  Two capacities: `cap` (>= live m) sizes the small per-basis buffers; `pcap`
- *  (>= active columns p, <= cap) sizes the n-row Bx workspace and the Bo^T*Bx
- *  intermediate. Keeping Bx at p rather than m matters under Fast-MARS, where
- *  p (the active parents) is a small fraction of m and Bx is by far the largest
- *  per-thread buffer (n * pcap floats). The hot loops slice leading sub-blocks,
- *  so the slack is invisible.
+ *  There are two capacities. `cap` (>= live m) sizes the small per-basis
+ *  buffers. `pcap` (>= active columns p, <= cap) sizes the n-row Bx workspace
+ *  and the Bo^T*Bx intermediate. Sizing Bx by p instead of m matters under
+ *  Fast-MARS. There p (the active parents) is a small fraction of m, and Bx
+ *  is by far the largest per-thread buffer (n * pcap floats). The hot loops
+ *  slice leading sub-blocks, so the slack is invisible.
  *
- *  Bx (and Bo, in MarsData) are stored as f32 but all Gram-Schmidt arithmetic
- *  in `orthonormalize()`/`append()` is f64:
- *    - DGKS retry (kernels.cc) and `append()`: orthogonality is bounded by
- *      eps(f32) (~1e-7) against Bo.
+ *  Bx (and Bo, in MarsData) are stored as f32, but all Gram-Schmidt
+ *  arithmetic in `orthonormalize()`/`append()` is f64:
+ *    - DGKS retry (kernels.cc) and `append()`: orthogonality against Bo is
+ *      bounded by eps(f32) (~1e-7).
  *    - linear_dsse: ybx = Bx^T * y_res accumulates in f64.
- *    - hinge sweep: bx_k = (double)Bx[k[i], j] upcasts at the load; Bo rows
- *      are gathered on the fly via Bo_data + k[i]*ldBo with a software
+ *    - hinge sweep: bx_k = (double)Bx[k[i], j] upcasts at the load. Bo rows
+ *      are gathered on the fly via Bo_data + k[i]*ldBo, with a software
  *      prefetch a few iterations ahead.
  */
 struct Scratch {
@@ -409,7 +415,7 @@ struct Scratch {
     std::vector<int>     hinge_idx;// (cap) best hinge sort position per j (leading p)
     std::vector<double>  hinge_sse;// (cap) best hinge delta-SSE per j (leading p)
     std::vector<double>  hinge_cut;// (cap) best hinge cut value per j (cuda sweep output)
-    std::vector<double>  BoTBx;    // (cap, pcap) column-major (col stride cap) -- Bo^T*Bx workspace
+    std::vector<double>  BoTBx;    // (cap, pcap) column-major (col stride cap), Bo^T*Bx workspace
     std::vector<double>  lin_work; // linear_dsse() workspace (3*pcap + cap)
     std::vector<double>  lin_dsse; // (pcap) linear_dsse() output
 
@@ -429,9 +435,10 @@ struct Scratch {
         if (m > cap) {
             cap = std::max(m, 2 * cap);
             /*
-             *  f/g rows are read and written as 256-bit vectors every sweep
-             *  step; keep each row 64-byte aligned so none of those accesses
-             *  straddle a cache line (~20% of the inner loop otherwise).
+             *  Every sweep step reads and writes the f/g rows as 256-bit
+             *  vectors. Keep each row 64-byte aligned, so that none of those
+             *  accesses straddles a cache line (that costs ~20% of the inner
+             *  loop otherwise).
              */
             fg_stride = (cap + 1 + 7) & ~size_t(7);
             f_buf.resize(JB * fg_stride + 8);
@@ -464,15 +471,16 @@ struct Scratch {
 };
 
 /*
- *  Degeneracy threshold on squared norms. Everything it gates -- the residual
- *  energy of a candidate column in orthonormalize()/append() and the
- *  hinge-sweep denominator -- is O(1) by construction (unit-norm basis,
+ *  Degeneracy threshold on squared norms. It gates the residual energy of a
+ *  candidate column in orthonormalize() and append(), and the denominator of
+ *  the hinge sweep. All three are O(1) by construction (unit-norm basis,
  *  unit-rms x, unit-norm y), so one absolute threshold serves all three. The
- *  n-scaled term covers f64 summation error; the floor covers f32 storage: an
- *  exactly degenerate candidate leaves a residual of pure f32 rounding noise,
- *  ~0.5*eps_f32^2 in energy, which must be zeroed rather than normalized into
- *  a unit "basis" of noise. Below n ~ 1000 the n-scaled term sits under that
- *  noise (a duplicate input scored ~1/n at n=300); above n ~ 25k it dominates.
+ *  n-scaled term covers the f64 summation error. The floor covers the f32
+ *  storage. An exactly degenerate candidate leaves a residual of pure f32
+ *  rounding noise, ~0.5*eps_f32^2 in energy. That residual must be zeroed,
+ *  not normalized into a unit "basis" of noise. Below n ~ 1000 the n-scaled
+ *  term sits under that noise (a duplicate input scored ~1/n at n=300).
+ *  Above n ~ 25k it dominates.
  */
 static double degeneracy_tol(size_t n)
 {
@@ -506,8 +514,8 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
 
     /*
      *  The reductions here (y_norm, w_norm, _yvar, the column norms in s) are
-     *  plain f64 sums; their row-order sensitivity is ~sqrt(n)*eps_f64 and not
-     *  a source of fit variation. The row-order dependence that
+     *  plain f64 sums. Their row-order sensitivity is ~sqrt(n)*eps_f64, which
+     *  is not a source of fit variation. The row-order dependence that
      *  tests/repro_shuffle.py measures comes from the hinge sweep: ties in x
      *  are broken by row index (stable sort), which moves candidate cuts.
      */
@@ -527,8 +535,8 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
 
     /*
      *  Store the normalized target as f32. This halves the footprint of the
-     *  random y[k[i]] gather in the eval() hinge sweep; every dot product
-     *  against it upcasts on the load so the accumulation stays f64.
+     *  random y[k[i]] gather in the eval() hinge sweep. Every dot product
+     *  against it upcasts on the load, so the accumulation stays f64.
      */
     _data->y.resize(n);
     float *yp = _data->y.data();
@@ -540,9 +548,9 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
      *  Initialize the first basis column (the intercept) with sqrt(w), in both
      *  B and its ortho-normalized copy Bo (both n x 1 here, so each column is
      *  contiguous). ybo is the f64 dot of the *stored* f32 intercept with the
-     *  *stored* f32 target, deliberately not of the f64 originals: dsse() and
-     *  the linear delta-SSE in eval() are built from the stored values, so ybo
-     *  has to be too or the two would disagree at the f32 floor.
+     *  *stored* f32 target, and deliberately not of the f64 originals. dsse()
+     *  and the linear delta-SSE in eval() are built from the stored values.
+     *  So ybo must be too, or the two would disagree at the f32 floor.
      */
     float *b0  = _data->B.data();   // col 0 of col-major B is the base
     float *bo0 = _data->Bo.data();  // col 0 of Bo is contiguous at bo_stride==1
@@ -554,13 +562,13 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
 
     /*
      *  Residual target y_res = y - Bo*ybo, kept in f64 and extended by one
-     *  column per append(); the f32 copy is what eval() scores against. See the
-     *  linear delta-SSE in eval() for why the residual and not y.
+     *  column per append(). eval() scores against the f32 copy. See the linear
+     *  delta-SSE in eval() for why it uses the residual and not y.
      */
     /*
      *  E = BoᵀBo - I, extended per append() (see the closed-form linear
-     *  delta-SSE, mars::linear_dsse). Not 0 even here: the intercept's f32
-     *  rounding is coherent, so ||bo0||^2 - 1 is ~eps_f32.
+     *  delta-SSE, mars::linear_dsse). E is not 0 even here. The f32 rounding
+     *  of the intercept is coherent, so ||bo0||^2 - 1 is ~eps_f32.
      */
     double g00 = 0.0;
     for (size_t i = 0; i < n; ++i) {
@@ -592,9 +600,9 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
     _yvar = vsum / n;
 
     /*
-     *  Per-column scale: 1/rms(X[:,j]), or 1 for a zero/constant column. The
-     *  sum of squares is accumulated in f64 then narrowed to f32. Each X
-     *  column is contiguous, so x + j*ldX walks it directly.
+     *  Per-column scale: 1/rms(X[:,j]), or 1 for an all-zero column. The sum
+     *  of squares accumulates in f64, and the scale is narrowed to f32. Each
+     *  X column is contiguous, so x + j*ldX walks it directly.
      */
     _data->s.resize(m);
     for (size_t j = 0; j < m; ++j) {
@@ -611,7 +619,8 @@ MarsAlgo::MarsAlgo(const float *x, const float *y, const float *w, size_t n, siz
     /*
      *  The linear_only T cache (eval()) holds up to max_terms x max_terms f64
      *  per X column. Enable it when that worst case fits MARS_LINEAR_CACHE_GB
-     *  (default 8; 0 disables it); otherwise linear_only recomputes T per eval.
+     *  (default 8, and 0 disables it). Otherwise linear_only recomputes T per
+     *  eval.
      */
     double cache_gb = 8.0;
     if (const char *e = std::getenv("MARS_LINEAR_CACHE_GB")) {
@@ -664,15 +673,15 @@ const float *MarsAlgo::ortho_basis(size_t *ld_bo) const
 }
 
 /*
- *  linear_only on the CPU with the T cache of X column xcol (LinCache): bring
+ *  linear_only on the CPU with the T cache of X column xcol (LinCache). Bring
  *  the cache up to the current basis, then score each requested parent in
- *  closed form from its cached pieces -- O(m) per candidate instead of a Phase
- *  1 pass. The work per eval is one pass over the cached parents' B columns
- *  per basis column appended since the last eval of xcol (mars::cross_rows),
- *  plus one Phase 1 column per newly requested parent. Near-degenerate
- *  candidates take the explicit path as in mars::linear_dsse. Not
- *  thread-safe for the same xcol (the binding gives each X column to one
- *  thread).
+ *  closed form from its cached pieces. That is O(m) per candidate instead of
+ *  a Phase 1 pass. The work per eval is one pass over the cached parents' B
+ *  columns for each basis column appended since the last eval of xcol
+ *  (mars::cross_rows), plus one Phase 1 column per newly requested parent.
+ *  Near-degenerate candidates take the explicit path, as in
+ *  mars::linear_dsse. This is not thread-safe for the same xcol (the binding
+ *  gives each X column to one thread).
  */
 void MarsAlgo::eval_linear_cached(double *linear_dsse, int xcol, const float *x,
                                   const int *bcols, size_t p, Scratch &S)
@@ -844,7 +853,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
                     int xcol, const bool *bmask, int min_span, int end_span,
                     bool linear_only, bool cuda)
 {
-    // xcol is a signed caller-supplied index; the >= 0 guard makes the
+    // xcol is a signed caller-supplied index. The >= 0 guard makes the
     // (size_t) compare against the column count well-defined.
     verify(xcol >= 0 && (size_t)xcol < _data->p, "invalid X column index");
     verify(min_span >= 1, "min_span must be >= 1");
@@ -886,10 +895,10 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
 
     /*
      *  CPU linear_only: the closed form (mars::linear_dsse) needs only
-     *  T = Boᵀ·Bx -- no projection, DGKS retry or normalize -- and is more
-     *  accurate than the explicit path, which it falls back to only for
-     *  near-degenerate columns. The hinge sweep needs the explicit normalized
-     *  Bx, so it keeps orthonormalize() below.
+     *  T = Boᵀ·Bx, with no projection, DGKS retry or normalize. It is more
+     *  accurate than the explicit path, and it falls back to that path only
+     *  for near-degenerate columns. The hinge sweep needs the explicit
+     *  normalized Bx, so it keeps orthonormalize() below.
      */
     if (linear_only && !cuda && _data->lin_cache) {
         eval_linear_cached(linear_dsse, xcol, x, bcols, p, S);
@@ -920,14 +929,14 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
 
     /*
      *  `S.ybx` is reused as the per-column squared-norm scratch for
-     *  orthonormalize(); it is overwritten immediately below with Bxᵀ * y.
+     *  orthonormalize(). It is overwritten right below with Bxᵀ * y.
      */
     double *ybx = S.ybx.data();
     /*
-     *  Under cuda the hinge sweep runs on the GPU too (cuda/hinge_sweep.cu),
-     *  reading the normalized Bx in place on the device; MARS_CUDA_SWEEP=0
-     *  keeps the GPU orthonormalize but downloads Bx and sweeps on the CPU
-     *  (the A/B reference for the GPU sweep).
+     *  Under cuda, the hinge sweep runs on the GPU too (cuda/hinge_sweep.cu)
+     *  and reads the normalized Bx in place on the device. MARS_CUDA_SWEEP=0
+     *  keeps the GPU orthonormalize, but it downloads Bx and sweeps on the
+     *  CPU. That is the A/B reference for the GPU sweep.
      */
     bool gpu_sweep = false;
     if (cuda) {
@@ -936,11 +945,12 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         const bool  sweep_off = sweep_env && std::atoi(sweep_env) == 0;
         gpu_sweep = !linear_only && !sweep_off;
         /*
-         *  GPU orthonormalize. The resident context is created lazily (so
-         *  CPU-only fits never touch the GPU) and synced by column count -- B/Bo
-         *  are append-only, so this uploads only columns added since the last
-         *  cuda eval. T and the per-column norms stay on the device; only Bx is
-         *  copied back, and the linear ΔSSE below runs on the CPU as usual.
+         *  GPU orthonormalize. The resident context is created lazily, so
+         *  CPU-only fits never touch the GPU. It is synced by column count:
+         *  B/Bo are append-only, so this uploads only the columns added since
+         *  the last cuda eval. T and the per-column norms stay on the device.
+         *  ybx comes back, and so does Bx when the CPU runs the sweep (see
+         *  below). The linear ΔSSE below is formed on the CPU as usual.
          */
         if (!_cuda) {
             _cuda = mars::cuda::context_create(n, _max_terms, _tol);
@@ -951,9 +961,10 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
                                        _data->B.data(),  _data->n,
                                        _data->Bo.data(), _data->bo_stride);
         /*
-         *  ybx = Bxᵀ*y_res is computed on the GPU (only p doubles come back). Bx
-         *  itself is downloaded only when the hinge sweep needs it (i.e. not
-         *  linear_only) -- in linear_only the n×p matrix never leaves the device.
+         *  ybx = Bxᵀ*y_res is computed on the GPU, so only p doubles come
+         *  back. Bx itself is downloaded only when the CPU hinge sweep needs
+         *  it. In linear_only, or with the GPU sweep, the n×p matrix never
+         *  leaves the device.
          */
         float *Bx_out = (linear_only || gpu_sweep) ? nullptr : Bx;
         mars::cuda::orthonormalize(_cuda, _m, p, x, bcols, Bx_out, n, ybx,
@@ -976,20 +987,20 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
     }
 
     /*
-     *  Calculate the linear delta SSE and map to the output buffer: the squared
-     *  dot of the unit candidate q = Bx.col(j) with the RESIDUAL target
-     *  y_res = y - Bo*ybo rather than with y. The two agree in exact arithmetic
-     *  (q is orthogonal to Bo), but Bo is f32 storage, so BoᵀBo = I + E, and a
-     *  single projection pass leaves q with an in-span error of O(E·T). Against
-     *  y, whose in-span part Bo*ybo is O(1), that error enters ybx at first
-     *  order -- dominated by the intercept, whose constant column rounds
-     *  coherently (‖bo₀‖² - 1 ~ eps_f32, not damped by √n): ΔSSE was off by
-     *  ~1e-6 median, 1.5e-3 max relative on uncentered data. y_res has an
-     *  in-span part of only O(E·ybo), so the error becomes second order (~6e-8
-     *  median). Bx.col(j) and y_res are contiguous f32; mars::dot_widen upcasts
-     *  each at the load and accumulates in f64. The hinge sweep uses ybx as
-     *  q's coefficient in the projection of y, which the same argument makes
-     *  more accurate there too.
+     *  Calculate the linear delta SSE and map it to the output buffer. It is
+     *  the squared dot of the unit candidate q = Bx.col(j) with the RESIDUAL
+     *  target y_res = y - Bo*ybo, not with y. The two agree in exact
+     *  arithmetic (q is orthogonal to Bo). But Bo is f32 storage, so
+     *  BoᵀBo = I + E, and a single projection pass leaves q with an in-span
+     *  error of O(E·T). Against y, whose in-span part Bo*ybo is O(1), that
+     *  error enters ybx at first order. The intercept dominates it, because
+     *  its constant column rounds coherently (‖bo₀‖² - 1 ~ eps_f32, not damped
+     *  by √n). On uncentered data, ΔSSE was off by ~1e-6 median and 1.5e-3 max
+     *  relative. y_res has an in-span part of only O(E·ybo), so the error
+     *  becomes second order (~6e-8 median). Bx.col(j) and y_res are contiguous
+     *  f32. mars::dot_widen upcasts each at the load and accumulates in f64.
+     *  The hinge sweep uses ybx as q's coefficient in the projection of y, so
+     *  by the same argument it is more accurate there too.
      */
     for (size_t j = 0; j < p; ++j) {
         if (!cuda) {
@@ -1035,7 +1046,7 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         /*
          *  Take the deltas of `x` (into scratch).
          */
-        float *d = S.d.data(); // d[0] unused; valid indices are 1..n-1
+        float *d = S.d.data(); // d[0] unused, valid indices are 1..n-1
         for (size_t i = 1; i < n; ++i) {
             d[i] = x[k[i-1]] - x[k[i]];
         }
@@ -1043,16 +1054,17 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
         const size_t head = end_span;
         const size_t tail = n-end_span;
         const float *B = _data->B.data(); // col-major, col stride n
-        const float *y = _data->y.data(); // f32 storage; each y[k[i]] upcasts into double y_k below
+        const float *y = _data->y.data(); // f32 storage, each y[k[i]] upcasts into double y_k below
 
         /*
          *  The sweep walks the rows in sorted order, so Bo.row(k[i]), b[k[i]],
-         *  bx[k[i]] and y[k[i]] are all random gathers the HW prefetcher cannot
-         *  predict; each is software-prefetched PREFETCH_DIST rows ahead (see
-         *  prefetch_line for why this is inline asm). One gathered Bo row (and
-         *  y, d) serves a block of JB basis columns, dividing the random Bo
-         *  traffic by JB. With the prefetches in place the loop runs at its
-         *  compute floor; without the gather prefetch it is ~2.5x slower.
+         *  bx[k[i]] and y[k[i]] are all random gathers that the HW prefetcher
+         *  cannot predict. Each one is software-prefetched PREFETCH_DIST rows
+         *  ahead (see prefetch_line for why this is inline asm). One gathered
+         *  Bo row (and y, d) serves a block of JB basis columns, which divides
+         *  the random Bo traffic by JB. With the prefetches in place, the loop
+         *  runs at its compute floor. Without the gather prefetch, it is ~2.5x
+         *  slower.
          */
         const float *Bo_data = _data->Bo.data();
         const size_t ldBo    = _data->bo_stride;
@@ -1099,26 +1111,26 @@ void MarsAlgo::eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
          *    uw  = h_plusᵀ * proj_{Bo,Bx}(y) - h_plusᵀ * y  = -(h_plus_perpᵀ * y_perp)
          *    sse = uw^2 / den  (extra gain from the hinge beyond the linear candidate)
          *
-         *  The final hinge_dsse = linear_dsse + hinge_sse captures the combined
-         *  gain from the full hinge pair (h_plus and h_minus together): h_minus
-         *  = h_plus - b*(x-h) lies in span(Bo, Bx[:,j], h_plus), so the pair
-         *  adds exactly the linear candidate plus h_plus.
+         *  The final hinge_dsse = linear_dsse + hinge_sse is the combined gain
+         *  of the full hinge pair (h_plus and h_minus together). h_minus =
+         *  h_plus - b*(x-h) lies in span(Bo, Bx[:,j], h_plus), so the pair adds
+         *  exactly the linear candidate plus h_plus.
          *
          *  Cuts are evaluated on a grid spaced by `min_span` along the sorted
          *  index, anchored at `head+1` (the first eligible position). The
-         *  accumulators are running sums over every sample, so they update
-         *  every iteration regardless of the grid; only the SSE reduction
-         *  (o.ff, o.fy) is gated, since it is only consumed at on-grid
-         *  positions. `next_grid` walks the grid points so the per-sample test
-         *  is an equality, not a modulo.
+         *  accumulators are running sums over every sample, so they update in
+         *  every iteration, on the grid or off it. Only the SSE reduction
+         *  (o.ff, o.fy) is gated, because only the on-grid positions consume
+         *  it. `next_grid` walks the grid points, so the per-sample test is an
+         *  equality, not a modulo.
          */
         /*
          *  Support tracking: once every nonzero row of the parent b lies above
          *  the cut, every later hinge equals b*x - h*b on the support and zero
-         *  off it -- exactly in span(Bo, Bx[:,j]) -- so den is 0 in exact
-         *  arithmetic and the remaining cuts are all degenerate. Stop sweeping
-         *  that column there (`done`): it is both the exact answer and, for
-         *  hinge parents with small support, most of the work.
+         *  off it. That is exactly in span(Bo, Bx[:,j]), so den is 0 in exact
+         *  arithmetic, and the remaining cuts are all degenerate. Stop sweeping
+         *  that column there (`done`). That is the exact answer, and for hinge
+         *  parents with small support it also skips most of the work.
          */
         for (size_t j0 = 0; j0 < p; j0 += JB) {
             const size_t jn = std::min(JB, p - j0);
@@ -1218,7 +1230,7 @@ void MarsAlgo::eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge
 {
     const size_t m = _m;
 
-    // Outputs are (n_xcols, m) row-major contiguous; zero / NaN them.
+    // Outputs are (n_xcols, m) row-major contiguous. Zero / NaN them.
     const size_t total = (size_t)n_xcols * m;
     std::fill_n(linear_dsse, total, 0.0);
     std::fill_n(hinge_dsse,  total, 0.0);
@@ -1236,8 +1248,8 @@ void MarsAlgo::eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge
                                    _data->Bo.data(), _data->bo_stride);
 
     // The active X-columns this epoch (rows with >=1 candidate). Make their
-    // scaled candidates resident -- uploaded once over the whole fit, not per
-    // epoch.
+    // scaled candidates resident. They are uploaded once over the whole fit,
+    // not per epoch.
     std::vector<int> active;
     active.reserve(n_xcols);
     for (int i = 0; i < n_xcols; ++i) {
@@ -1253,9 +1265,9 @@ void MarsAlgo::eval_batch(double *linear_dsse, double *hinge_dsse, double *hinge
                                    _data->s.data(), active.data(), active.size());
 
     /*
-     *  The device T cache (the GPU half of eval_linear_cached; enabled under
-     *  the same MARS_LINEAR_CACHE_GB budget as the CPU one, see the
-     *  constructor): every candidate in one call, scored in closed form.
+     *  The device T cache, the GPU half of eval_linear_cached. The same
+     *  MARS_LINEAR_CACHE_GB budget as the CPU cache enables it (see the
+     *  constructor). It scores every candidate in one call, in closed form.
      */
     if (_data->lin_cache && mars::cuda::linear_cache_init(_cuda, _data->p)) {
         std::vector<int> sx, sb;
@@ -1342,7 +1354,7 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h, int threads)
     if (_m >= _max_terms) {
         throw std::runtime_error("basis matrix is full");
     }
-    // bcol is a signed caller-supplied index; the >= 0 guard makes the
+    // bcol is a signed caller-supplied index. The >= 0 guard makes the
     // (size_t) compare against the live basis count well-defined.
     if (bcol < 0 || (size_t)bcol >= _m) {
         char msg[80];
@@ -1352,14 +1364,14 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h, int threads)
 
     /*
      *  Ensure `Bo` has room for the new column _m. The `eval()` hinge sweep
-     *  gathers `Bo` rows by the row stride, so we keep the stride near the live
-     *  basis count (a fixed max_terms stride would spread the random gather over
-     *  more pages). Rather than repack on every append (O(n*m) each, O(n*m^2)
-     *  over a fit), grow the stride geometrically -- doubling, capped at
-     *  max_terms -- so the in-place repack runs only O(log max_terms) times
-     *  (O(n*m) total), at the cost of a stride up to 2x the live count. `B` is
-     *  column-major (col stride n) and preallocated to max_terms, so it needs no
-     *  resize.
+     *  gathers `Bo` rows by the row stride, so we keep the stride near the
+     *  live basis count. A fixed max_terms stride would spread the random
+     *  gather over more pages. A repack on every append would cost O(n*m)
+     *  each, O(n*m^2) over a fit. Instead, grow the stride geometrically
+     *  (doubling, capped at max_terms). Then the in-place repack runs only
+     *  O(log max_terms) times (O(n*m) total), at the cost of a stride up to 2x
+     *  the live count. `B` is column-major (col stride n) and preallocated to
+     *  max_terms, so it needs no resize.
      */
     if (_data->bo_stride < _m + 1) {
         const size_t new_stride =
@@ -1389,7 +1401,7 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h, int threads)
     /*
      *  Form the raw column in f32 with the same operation order eval() uses
      *  (scale x first, then multiply by the parent), so the appended linear
-     *  column is bit-identical to the candidate that was scored; widen it into
+     *  column is bit-identical to the candidate that was scored. Widen it into
      *  the f64 residual v and take its squared norm.
      */
     std::vector<double> v(n);
@@ -1420,11 +1432,11 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h, int threads)
     /*
      *  Gram-Schmidt with a DGKS retry (mars::orthonormalize_col). The eval()
      *  side assumes Bo^T Bo = I, so any orthogonality drift accumulates across
-     *  the whole fit. Bo is f32 storage; the residual v and the dot products
-     *  stay f64. The stored f32 B column is separately normalized by its own
-     *  pre-projection norm. A column with no energy at all (e.g. a hinge whose
-     *  cut lies outside the parent's support) is rejected before it can be
-     *  divided by zero.
+     *  the whole fit. Bo is f32 storage, but the residual v and the dot
+     *  products stay f64. The stored f32 B column is normalized separately,
+     *  by its own pre-projection norm. A column with no energy at all (for
+     *  example, a hinge whose cut lies outside the parent's support) is
+     *  rejected before it can be divided by zero.
      */
     if (!(v_raw_norm2 > _tol)) {
         return -1.;
@@ -1443,11 +1455,11 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h, int threads)
     if (w*w > _tol) {
         /*
          *  orthonormalize_col left v as the unit residual. One sweep stores it
-         *  (f32) into Bo's new column _m (row-major, stride bo_stride) and,
-         *  from the stored values, reduces the new column of BoᵀBo (for E) and
-         *  the new ybo entry: the f64 dot of the *stored* f32 Bo column with
-         *  the *stored* f32 target, for the same reason as ybo[0] in the
-         *  constructor.
+         *  (f32) into Bo's new column _m (row-major, stride bo_stride). From
+         *  the stored values, the same sweep reduces the new column of BoᵀBo
+         *  (for E) and the new ybo entry. That entry is the f64 dot of the
+         *  *stored* f32 Bo column with the *stored* f32 target, for the same
+         *  reason as ybo[0] in the constructor.
          */
         float       *Bo   = _data->Bo.data();
         const size_t ldBo = _data->bo_stride;
@@ -1458,8 +1470,9 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h, int threads)
                         threads);
 
         /*
-         *  Extend the cached ybo with one new entry; relies on ||y|| == 1 so
-         *  mse = (||y||^2 - ||ybo||^2) / n collapses to (1 - ||ybo||^2) / n.
+         *  Extend the cached ybo with one new entry. This relies on
+         *  ||y|| == 1, so mse = (||y||^2 - ||ybo||^2) / n collapses to
+         *  (1 - ||ybo||^2) / n.
          */
         double ybo_sq = ybo_m * ybo_m;
         for (double e : _data->ybo) {
@@ -1469,9 +1482,9 @@ double MarsAlgo::append(char type, int xcol, int bcol, float h, int threads)
         if (mse >= -_tol) { // gracefully handle values close to zero
             /*
              *  Extend the residual target: y_res -= bo_m * ybo_m, with the
-             *  stored f32 bo_m, in f64 (no rounding drift accumulates across
-             *  appends); the f32 copy is re-rounded from it. Count the new
-             *  column's support in the same pass.
+             *  stored f32 bo_m, in f64, so no rounding drift accumulates
+             *  across appends. The f32 copy is re-rounded from it. Count the
+             *  new column's support in the same pass.
              */
             double *yres_d = _data->yres_d.data();
             float  *yres   = _data->yres.data();

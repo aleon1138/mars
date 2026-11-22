@@ -1,7 +1,7 @@
 /*
  *  BLAS-style kernels for the MARS forward pass. See kernels.h for layout
- *  contracts. Inner strides are unconditionally 1; the only parameters are
- *  outer (leading) strides that genuinely vary between callers.
+ *  contracts. Inner strides are always 1. The only stride parameters are the
+ *  outer (leading) strides, which really vary between callers.
  */
 #include "kernels.h"
 #include <algorithm>  // fill_n
@@ -30,9 +30,10 @@ inline __m256d loadu_ps_pd(const float *p)
 #endif
 
 /*
- *  Inner kernels along the basis dimension k. AVX2 unrolls 4-wide; the
- *  scalar tail covers the leftover. Hot on every column of orthonormalize().
- *  Bo is f32 storage; values are upcast to f64 on the load (cvtps_pd).
+ *  Inner kernels along the basis dimension k. AVX2 unrolls 4-wide, and the
+ *  scalar tail covers the leftover. They are hot on every column of
+ *  orthonormalize(). Bo is f32 storage, and values are upcast to f64 on the
+ *  load (cvtps_pd).
  */
 
 // tc[k] += scalar * (double)bo_row[k] for k in 0..m.
@@ -147,9 +148,10 @@ inline double dot_m(const double *a, const double *b, size_t m)
 }
 
 /*
- *  Column selector for the batched phases below: with Indexed the c-th active
- *  column is cols[c] (the DGKS retry's compacted flagged set), otherwise c
- *  itself (the main pass, compiled exactly as the plain loops it replaced).
+ *  Column selector for the batched phases below. With Indexed, the c-th
+ *  active column is cols[c] (the DGKS retry's compacted flagged set).
+ *  Otherwise it is c itself (the main pass, which compiles exactly like the
+ *  plain loops it replaced).
  */
 template <bool Indexed>
 inline size_t sel_col(const int *cols, size_t c)
@@ -165,27 +167,28 @@ inline size_t sel_col(const int *cols, size_t c)
 
 /*
  *  Phase 1, register-tiled (CLAUDE.md, 2026-11-04 note). The rows are walked
- *  in panels of P1_ROWS. Per panel, the Bo rows are packed as f64 in k-tile order (P1_KT
- *  consecutive T rows per tile, the panel's rows contiguous within a tile) and
- *  the selected Bx columns are widened to f64. A P1_KT x P1_JT block of T is
- *  then accumulated in registers across the whole panel and added to T once,
- *  so each T load/store serves P1_ROWS FMAs instead of one (the unblocked loop
- *  stored a T element on every FMA and was store-port-bound, ~2.6x off the FMA
- *  peak). Products are exact in f64 (f32 x f32); the sums become two-level
- *  (within the panel, then across panels), which is slightly more accurate
- *  than the old row-sequential order but not bit-identical to it.
+ *  in panels of P1_ROWS. For each panel, the Bo rows are packed as f64 in
+ *  k-tile order (P1_KT consecutive T rows per tile, with the panel's rows
+ *  contiguous within a tile), and the selected Bx columns are widened to f64.
+ *  A P1_KT x P1_JT block of T then accumulates in registers across the whole
+ *  panel and is added to T once. So each T load/store serves P1_ROWS FMAs
+ *  instead of one. The unblocked loop stored a T element on every FMA and was
+ *  store-port-bound, ~2.6x off the FMA peak. Products are exact in f64
+ *  (f32 x f32). The sums become two-level (within the panel, then across
+ *  panels). That is slightly more accurate than the old row-sequential order,
+ *  but not bit-identical to it.
  */
 constexpr size_t P1_ROWS = 128;   // rows per panel: packed Bo panel m*128*8 B (100 KB at m=100)
 constexpr size_t P1_KT   = 12;    // T rows per register tile (three 4-wide f64 vectors)
 constexpr size_t P1_JT   = 4;     // T columns per register tile
 
 /*
- *  T[k0 : k0+kn, j] += sum_r bo[r, :] * bx[c][r] for the P1_JT columns tcol[c]
- *  (the f64 AVX2 tile; an AVX-512 16x4 variant measured 15-30% slower on the
- *  EPYC box, in line with the 2026-05-16 AVX-512 note).
- *  bo: the packed tile, P1_KT doubles per row; bx: P1_JT widened columns, each
- *  `ldbx` doubles apart. kn < P1_KT only on the last tile (the packed tail is
- *  zero, so only the store needs the bound).
+ *  T[k0 : k0+kn, j] += sum_r bo[r, :] * bx[c][r] for the P1_JT columns
+ *  tcol[c]. This is the f64 AVX2 tile. An AVX-512 16x4 variant measured
+ *  15-30% slower on the EPYC box, in line with the 2026-05-16 AVX-512 note.
+ *  bo: the packed tile, P1_KT doubles per row. bx: P1_JT widened columns,
+ *  each `ldbx` doubles apart. kn < P1_KT only on the last tile. The packed
+ *  tail is zero, so only the store needs the bound.
  */
 inline void p1_tile(size_t r, const double *bo, const double *bx, size_t ldbx,
                     double *const tcol[P1_JT], size_t kn)
@@ -236,12 +239,13 @@ inline void p1_tile(size_t r, const double *bo, const double *bx, size_t ldbx,
 }
 
 /*
- *  Phase 1 over a column set: T[:, j] = Bo^T * Bx[:, j] for each selected j,
- *  an f32-in / f64-accumulate GEMM no BLAS offers (sgemm accumulates in f32,
- *  dgemm needs f64 inputs). Register-tiled over row panels (see p1_tile);
- *  fewer than P1_JT columns (e.g. a small DGKS retry) take the plain loop,
- *  where packing would not pay for itself: with i outermost it loads bo_row
- *  once per row and stores a T element on every FMA.
+ *  Phase 1 over a column set: T[:, j] = Bo^T * Bx[:, j] for each selected j.
+ *  This is an f32-in / f64-accumulate GEMM that no BLAS offers (sgemm
+ *  accumulates in f32, and dgemm needs f64 inputs). It is register-tiled over
+ *  row panels (see p1_tile). Fewer than P1_JT columns (for example, a small
+ *  DGKS retry) take the plain loop, where packing would not pay for itself.
+ *  With i outermost, that loop loads bo_row once per row and stores a T
+ *  element on every FMA.
  */
 template <bool Indexed>
 inline void bo_t_bx(size_t n, size_t m, const int *cols, size_t nc,
@@ -323,11 +327,12 @@ inline void bo_t_bx(size_t n, size_t m, const int *cols, size_t nc,
 
 /*
  *  Phase 2a over a column set: Bx[:, j] -= Bo * T[:, j] and s_buf[j] =
- *  ||Bx[:, j]||^2 for each selected j, fused into a single sweep over Bo: each
+ *  ||Bx[:, j]||^2 for each selected j, fused into a single sweep over Bo. Each
  *  row of Bo is loaded once and reused across all nc columns, so the Bo DRAM
- *  traffic is n*m rather than nc*n*m. The subtract is done in f64, the result
- *  rounded back to f32 on store; s_buf accumulates the *stored* squared values
- *  so the downstream normalization sees the same magnitude that's in memory.
+ *  traffic is n*m instead of nc*n*m. The subtract runs in f64, and the result
+ *  is rounded back to f32 on the store. s_buf accumulates the *stored* squared
+ *  values, so the downstream normalization sees the same magnitude that is in
+ *  memory.
  */
 template <bool Indexed>
 inline void project_out(size_t n, size_t m, const int *cols, size_t nc,
@@ -379,9 +384,10 @@ inline void project_out(size_t n, size_t m, const int *cols, size_t nc,
  *  One classical Gram-Schmidt pass of the f64 column v against the m
  *  orthonormal columns of Bo: c = Bo^T v, then v -= Bo c. Both halves walk Bo
  *  row by row (row-major, stride ldBo), so the whole pass is two streaming
- *  sweeps over Bo regardless of m -- a per-column walk would touch one cache
+ *  sweeps over Bo regardless of m. A per-column walk would touch one cache
  *  line per row per column (m times the traffic). Returns the projected energy
- *  sum_j c_j^2 (feeds the DGKS gate) and the residual energy ||v||^2 in v_norm2.
+ *  sum_j c_j^2 (which feeds the DGKS gate), and the residual energy ||v||^2 in
+ *  v_norm2.
  *  `c` is an m-length workspace.
  */
 inline double cgs_project_col(
@@ -428,9 +434,9 @@ inline double cgs_project_col(
 }
 
 /*
- *  bx[i] = b[i] * x[i] (f32 multiply, stored f32 -- the same rounding as the
- *  fill in orthonormalize()), and, from the stored values, nb = ||bx||^2 and
- *  by = <bx, y> accumulated in f64.
+ *  bx[i] = b[i] * x[i] (f32 multiply, stored f32, with the same rounding as
+ *  the fill in orthonormalize()). From the stored values, nb = ||bx||^2 and
+ *  by = <bx, y> accumulate in f64.
  */
 inline void fill_col_stats(const float *b, const float *x, const float *y,
                            float *bx, size_t n, double &nb, double &by)
@@ -471,7 +477,7 @@ double dot_widen(const float *a, const float *b, size_t n)
     size_t i = 0;
 #if defined(__AVX__)
     /*
-     *  Two accumulators so the two FMAs per iteration are independent; the
+     *  Two accumulators, so the two FMAs per iteration are independent. The
      *  f32->f64 widening (cvtps_pd) keeps the sum at the eps_f32 input floor.
      */
     __m256d acc0 = _mm256_setzero_pd();
@@ -538,7 +544,7 @@ void orthonormalize(
     std::atomic<long> *dgks_counter)
 {
     /*
-     *  Bx[i, j] = B[i, mask[j]] * x[i]  -- f32 * f32 stored as f32
+     *  Bx[i, j] = B[i, mask[j]] * x[i]: f32 * f32, stored as f32
      */
     for (size_t j = 0; j < p; ++j) {
         const float *b  = B  + mask[j] * ldB;
@@ -573,9 +579,9 @@ void orthonormalize(
      *  anyway. See DGKS_GATE_RATIO_SQ in kernels.h.
      *
      *  The flagged columns are re-run through the same batched Phase 1/2a,
-     *  compacted to an index list: two sweeps over Bo in total rather than two
-     *  per flagged column. The retry is not rare -- on uncentered inputs most
-     *  candidates are dominated by their in-span part (x = mean + noise, and
+     *  compacted to an index list. That is two sweeps over Bo in total, not
+     *  two per flagged column. The retry is not rare. On uncentered inputs,
+     *  the in-span part dominates most candidates (x = mean + noise, and
      *  b * mean is in span), and the per-column retry doubled eval(linear).
      */
     thread_local std::vector<int> flagged;
@@ -597,8 +603,8 @@ void orthonormalize(
     }
 
     /*
-     *  Phase 2c: normalize. f32 multiply; the scale stays f64 only until the
-     *  store cast, since the column is already f32-bounded.
+     *  Phase 2c: normalize with an f32 multiply. The scale stays f64 only
+     *  until the store cast, because the column is already f32-bounded.
      */
     for (size_t j = 0; j < p; ++j) {
         float       *bx    = Bx + j * ldBx;

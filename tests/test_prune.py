@@ -46,7 +46,7 @@ def test_gram_precision():
     expected = n * 0.25
     out = gram(A)
     np.testing.assert_allclose(out[0, 0], expected, rtol=1e-14)
-    # Naive f32 reduction loses precision at this n; f64 accumulation preserves it
+    # Naive f32 reduction loses precision at this n, but f64 accumulation preserves it
     naive = float((A.T @ A)[0, 0])
     assert abs(out[0, 0] - expected) <= abs(naive - expected)
 

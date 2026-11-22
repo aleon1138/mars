@@ -1,10 +1,11 @@
 /*
- *  Tests for the CUDA orthonormalize path (cuda/orthonormalize.cu). Validates
- *  the GPU result against the same Eigen oracle the CPU kernel is checked
- *  against (tests/test_kernels.cc) and against the CPU kernel itself. Host C++
- *  -- calls only the mars::cuda::* host API.
+ *  Tests for the CUDA orthonormalize path (cuda/orthonormalize.cu), and further
+ *  down for the GPU hinge sweep and the device T cache. They validate the GPU
+ *  result against the same Eigen oracle that the CPU kernel is checked against
+ *  (tests/test_kernels.cc), and against the CPU kernel itself. This is host
+ *  C++, and it calls only the mars::cuda::* host API.
  *
- *  All checks run at the f32 storage floor (~1e-5): Bo and Bx are f32, the
+ *  All checks run at the f32 storage floor (~1e-5): Bo and Bx are f32, and the
  *  projection arithmetic is f64.
  */
 #include "kernels.h"
@@ -38,8 +39,8 @@ double invnorm(VectorXd x)
 }
 
 // Build a strictly orthonormal Bo (row-major f32) via modified Gram-Schmidt in
-// f64, then cast to f32 -- matches what MarsData holds after append(). Mirrors
-// the helper in tests/test_kernels.cc.
+// f64, then cast to f32. This matches what MarsData holds after append(). It
+// mirrors the helper in tests/test_kernels.cc.
 MatrixXfC make_orthonormal_basis(int n, int m, int bad_col, std::mt19937 &rng)
 {
     MatrixXf B = MatrixXf::Random(n, m);
@@ -246,7 +247,7 @@ TEST(CudaKernelsTest, YbxMatchesBxTransposeY)
     // Reference: f64 dot of the returned (normalized) Bx columns with y. ybx is
     // computed as scale·Σ(unnormalized Bx)·y (the scale is folded in f64 instead
     // of applied per-element in f32), so it matches this reference only to the
-    // f32 storage floor -- it is in fact marginally *more* accurate than the
+    // f32 storage floor. It is in fact marginally *more* accurate than the
     // per-element-normalized dot. ‖y‖~√n, so the absolute floor is ~ε_f32·√n.
     MatrixXd Bxd = Bx.cast<double>();
     VectorXd yd  = y.cast<double>();
@@ -259,7 +260,7 @@ TEST(CudaKernelsTest, YbxMatchesBxTransposeY)
 
 /*
  *  CPU vs CUDA parity at a larger size with strides > logical sizes and a mix of
- *  well-conditioned, near-collinear and degenerate columns -- the two paths
+ *  well-conditioned, near-collinear and degenerate columns. The two paths
  *  must agree within the f32 floor. (n=8192, m=128, p=32 matches the CPU
  *  precision-stress baseline.)
  */
@@ -318,9 +319,9 @@ TEST(CudaKernelsTest, MatchesCpuKernel)
  *  Batched orthonormalize (many X-columns stacked into one set of GEMMs) must
  *  produce the same ybx as the per-column orthonormalize for each (X-column,
  *  basis) pair. Both fold the scale and accumulate in f64, so they agree to the
- *  f64 GEMM-order floor. P (= n_x·m) stays within the default batch capacity --
- *  the host-side blocking across multiple calls is exercised by the Python
- *  end-to-end test (eval_batch), which owns the blocking.
+ *  f64 GEMM-order floor. P (= n_x·m) stays within the default batch capacity.
+ *  The Python end-to-end test (eval_batch), which owns the blocking, exercises
+ *  the host-side blocking across multiple calls.
  */
 TEST(CudaKernelsTest, BatchMatchesPerColumn)
 {
@@ -414,7 +415,7 @@ TEST(CudaKernelsTest, BatchDgksRetryMatchesPerColumn)
     MatrixXd  Bod = Bo.cast<double>();
 
     // Even basis columns are near-dependent on Bo (98%/2% energy split -> DGKS
-    // fires); odd ones are well-conditioned random (no fire). x is constant per
+    // fires). Odd ones are well-conditioned random columns (no fire). x is constant per
     // X-column, so the candidate B[:,k]*x preserves that span relationship and
     // firing is deterministic and interleaved across the P stacked columns.
     MatrixXf B(n, m);
@@ -490,8 +491,8 @@ TEST(CudaKernelsTest, BatchDgksRetryMatchesPerColumn)
 // ---------------------------------------------------------------------------
 // GPU hinge sweep vs the CPU MarsAlgo::eval() (the oracle). The basis is grown
 // the way fit() grows it (see tests/bench_sweep.cc) so it is as well
-// conditioned as a real fit's; MARS_CUDA_KCHUNK=0 selects the native-f64
-// orthonormalize so the comparison isolates the sweep.
+// conditioned as a real fit's. MARS_CUDA_KCHUNK=0 selects the native-f64
+// orthonormalize, so the comparison isolates the sweep.
 // ---------------------------------------------------------------------------
 #include "marsalgo.h"
 #include <cstdlib>
@@ -505,7 +506,7 @@ struct SweepProblem {
 };
 
 // Random inputs with planted hinge structure. Column 0 is quantized (ties in
-// the sort); column 1 is exactly zero on a block of rows (a zero-support tail).
+// the sort). Column 1 is exactly zero on a block of rows (a zero-support tail).
 SweepProblem make_sweep_problem(size_t n, size_t px, unsigned seed)
 {
     SweepProblem P;
@@ -535,7 +536,7 @@ SweepProblem make_sweep_problem(size_t n, size_t px, unsigned seed)
 }
 
 // Grow the basis to m columns like fit(): degree <= 3, no input repeated in a
-// term, alternating linear terms and mirrored hinge pairs; a rejected
+// term, alternating linear terms and mirrored hinge pairs. A rejected
 // (collinear) append is skipped.
 void grow_basis(MarsAlgo &algo, size_t px, size_t m, std::mt19937 &rng)
 {
@@ -573,8 +574,8 @@ void grow_basis(MarsAlgo &algo, size_t px, size_t m, std::mt19937 &rng)
 // hyb and gpu sweep the SAME device Bx, so they must agree to f64
 // reassociation error (tight). gpu vs ref additionally carries the GPU
 // orthonormalize's f32 projection (Bx differs by ~1 f32 ulp), which the score
-// amplifies by h2/den near the HINGE_DEN_REL gate -- so that comparison is
-// loose and reported, not the correctness gate for the sweep.
+// amplifies by h2/den near the HINGE_DEN_REL gate. So that comparison is
+// loose and only reported. It is not the correctness gate for the sweep.
 void check_sweep(size_t n, size_t px, size_t m, unsigned seed, const char *block)
 {
     setenv("MARS_CUDA_KCHUNK", "0", 1);
@@ -629,7 +630,7 @@ void check_sweep(size_t n, size_t px, size_t m, unsigned seed, const char *block
                     // term agrees to ULPs, not bit-exactly.
                     EXPECT_NEAR(lin_g[j], lin_h[j], 1e-15 + 1e-12 * std::abs(lin_h[j]));
                     // The sweep itself: f64 reassociation, amplified by h2/den
-                    // near the gate (observed <= 7e-9 at m=260; a logic bug shows
+                    // near the gate (observed <= 7e-9 at m=260, while a logic bug shows
                     // as >= 1e-4).
                     const double rel_hg = std::abs(hin_g[j] - hin_h[j]) /
                                           std::max(1e-300, std::abs(hin_h[j]));
@@ -718,11 +719,12 @@ TEST(CudaSweepTest, MatchesCpuEvalSmallN)
 // ---------------------------------------------------------------------------
 // Linear delta-SSE of the GPU paths against the f64 oracle, in the regime where
 // the DGKS retry fires on most candidates (uncentered, correlated inputs, a
-// large basis; tests/linear_problem.h). The f32 projection of the first pass
+// large basis, see tests/linear_problem.h). The f32 projection of the first pass
 // leaves out-of-span noise ~eps_f32·sqrt(m)·||T|| on a cancelling column, so a
 // retry that restarted from that residual was off by up to tens of percent at
-// m=400 (numpy model); the retry now restarts from the f64 B·x. Runs with the
-// default blocked-f32 T GEMM (MARS_CUDA_KCHUNK unset) -- the production path.
+// m=400 (numpy model). The retry now restarts from the f64 B·x. The test runs
+// with the default blocked-f32 T GEMM (MARS_CUDA_KCHUNK unset), which is the
+// production path.
 // ---------------------------------------------------------------------------
 #include "linear_problem.h"
 

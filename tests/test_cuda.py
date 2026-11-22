@@ -2,9 +2,9 @@
 
 Skipped unless marslib was built with CUDA and a device is present. The GPU
 fit uses blocked-f32 GEMMs for the orthonormalize and a chunked f64 recurrence
-for the hinge sweep, so it is not bit-identical to the CPU fit: on a problem
-with well-separated planted terms the two must still select the same basis
-(type, parent, input) with hinge cuts that agree to f32 resolution, and reach
+for the hinge sweep, so it is not bit-identical to the CPU fit. On a problem
+with well-separated planted terms, the two must still select the same basis
+(type, parent, input), with hinge cuts that agree to f32 resolution, and reach
 the same R² to ~1e-4.
 """
 

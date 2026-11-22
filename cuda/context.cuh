@@ -4,7 +4,7 @@
  *  Internal, CUDA-side definitions shared by the .cu translation units of the
  *  mars_cuda static library: the error-check macros, the warp/block reduction
  *  helpers and the full definition of the opaque mars::cuda::Context declared
- *  in mars_cuda.h. Never included by host-compiled code.
+ *  in mars_cuda.h. Host-compiled code never includes it.
  */
 
 #include "mars_cuda.h"
@@ -113,9 +113,9 @@ struct Context {
 
     // resident basis + target
     float  *dB      = nullptr;  // (n, max_terms) col-major, ld n
-    float  *dBo_f32 = nullptr;  // (n, max_terms) col-major, ld n -- f32 Bo (blocked GEMM + widen src)
-    double *dBo_f64 = nullptr;  // (n, max_terms) col-major, ld n -- widened from dBo_f32
-    float  *dBo_rm  = nullptr;  // (n, max_terms) ROW-major, ld max_terms -- the hinge sweep's row gather
+    float  *dBo_f32 = nullptr;  // (n, max_terms) col-major, ld n: f32 Bo (blocked GEMM + widen src)
+    double *dBo_f64 = nullptr;  // (n, max_terms) col-major, ld n: widened from dBo_f32
+    float  *dBo_rm  = nullptr;  // (n, max_terms) ROW-major, ld max_terms: the hinge sweep's row gather
     float  *dy      = nullptr;  // (n) normalized target
     const float *target_ptr = nullptr;  // host y pointer last uploaded to dy
     float  *dyres   = nullptr;  // (n) residual target y - Bo·ybo (ybx dot target once set)
@@ -123,13 +123,13 @@ struct Context {
     size_t  yres_tag = (size_t)-1;      // caller's basis count at that upload
 
     // blocked-f32 T = Boᵀ·Bx: split K=n into chunks, cublasSgemm each in f32,
-    // accumulate the chunk results into the f64 dT. Default 2048 (on);
+    // accumulate the chunk results into the f64 dT. Default 2048 (on).
     // MARS_CUDA_KCHUNK=0 selects the native-f64 T GEMM.
     size_t  kchunk   = 2048;
     float  *dTc_f32  = nullptr;  // (max_terms, p_cap) per-chunk f32 T, then the f32 cast of dT
 
-    // per-call scratch (sized for the worst case p == p_cap; the per-eval path
-    // uses the leading <= max_terms columns, the batched path up to p_cap)
+    // per-call scratch, sized for the worst case p == p_cap. The per-eval path
+    // uses the leading <= max_terms columns, and the batched path up to p_cap.
     float  *dBx_f32 = nullptr;  // (n, p_cap) col-major, ld n
     double *dBx_f64 = nullptr;  // (n, p_cap) col-major, ld n
     double *dT      = nullptr;  // (max_terms, p_cap) col-major, ld max_terms
@@ -138,7 +138,7 @@ struct Context {
     double *ds       = nullptr;  // (p_cap)
     double *dtnorm2  = nullptr;  // (p_cap)
     double *dybx_raw = nullptr;  // (p_cap) Σ Bx·y on the un-normalized column
-    double *dybx     = nullptr;  // (p_cap) scale·ybx_raw -- the ΔSSE input
+    double *dybx     = nullptr;  // (p_cap) scale·ybx_raw: the ΔSSE input
     float  *dscale   = nullptr;  // (p_cap)
     int    *didx    = nullptr;  // (p_cap) compact global indices of DGKS-flagged cols
     double *dT_retry = nullptr; // (max_terms, retry_cols) compact T of the flagged cols
@@ -146,8 +146,8 @@ struct Context {
 
     // batched path: resident scaled candidates (x_c = X[:,c]·s[c]) and the
     // per-output-column source maps. dXscaled is allocated (n, p_x) on the first
-    // context_sync_xcols call; columns are uploaded+scaled lazily, once each.
-    float  *dXscaled  = nullptr;  // (n, p_x) col-major -- resident scaled candidates
+    // context_sync_xcols call. Columns are uploaded+scaled lazily, once each.
+    float  *dXscaled  = nullptr;  // (n, p_x) col-major: resident scaled candidates
     size_t  p_x       = 0;        // X-column count (dXscaled width)
     std::vector<char> x_resident; // (p_x) which columns are uploaded+scaled
     int    *dsrc_xcol = nullptr;  // (p_cap) output col -> global X column
@@ -155,16 +155,16 @@ struct Context {
 
     // hinge sweep (cuda/hinge_sweep.cu): the sort of the raw X column, the
     // sorted scaled candidate and its deltas, the per-chunk carries of the
-    // two-pass recurrence and the per-(chunk, column) best cuts. Allocated on
-    // the first sweep (sized by n / max_terms); the chunk-sized buffers grow
-    // on demand.
+    // two-pass recurrence and the per-(chunk, column) best cuts. They are
+    // allocated on the first sweep (sized by n / max_terms). The chunk-sized
+    // buffers grow on demand.
     float  *dxraw      = nullptr;  // (n) raw X column (the cut values)
     float  *dkeys      = nullptr;  // (n) sort keys: raw X with -0.0 folded to +0.0
     float  *dkeys_out  = nullptr;  // (n) sorted keys (unused output of the sort)
     int    *dseq       = nullptr;  // (n) 0..n-1 (sort values in)
     int    *dk         = nullptr;  // (n) sort permutation (descending, stable)
     int    *dpos       = nullptr;  // (n) inverse permutation: sorted position of each row
-    float  *dxs        = nullptr;  // (n) x[k[t]] -- the scaled candidate in sorted order
+    float  *dxs        = nullptr;  // (n) x[k[t]]: the scaled candidate in sorted order
     float  *dd         = nullptr;  // (n) d[t] = xs[t-1] - xs[t] (f32), d[0] = 0
     double *dybo       = nullptr;  // (max_terms) Boᵀ·y
     int    *di_last    = nullptr;  // (p_cap) last sorted position with a nonzero parent entry
@@ -183,7 +183,7 @@ struct Context {
     size_t  chunkp_cap = 0;        // entries in dcarry_h2 / dbest_sse / dbest_idx
     size_t  chunk_cap  = 0;        // entries in ddsum
     size_t  sweep_chunk = 0;       // MARS_CUDA_SWEEP_CHUNK: fixed chunk length (0 = auto)
-    int     sweep_block = 0;       // MARS_CUDA_SWEEP_BLOCK: fixed block size (0 = auto; tests)
+    int     sweep_block = 0;       // MARS_CUDA_SWEEP_BLOCK: fixed block size (0 = auto, set by tests)
     int     sweep_tile  = 0;       // MARS_CUDA_SWEEP_TILE: rows staged per tile (0 = auto)
     int     sweep_jb    = 4;       // MARS_CUDA_SWEEP_JB: columns per block, 4 or 8
     int     sweep_batch = 0;       // MARS_CUDA_SWEEP_BATCH: grid slots per reduction batch (0 = 1)

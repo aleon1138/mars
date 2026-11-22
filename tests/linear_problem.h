@@ -3,16 +3,16 @@
  *  A fit-like linear_only problem for the linear delta-SSE accuracy tests
  *  (tests/unittest.cc, tests/test_cuda.cc), with an f64 oracle.
  *
- *  The inputs are correlated and uncentered (mean/std = `mu`), so most
- *  candidates b_k * x_c are dominated by their in-span part b_k * mean: the
- *  regime where the f32 storage of Bo shows up in the linear delta-SSE (see
- *  MarsAlgo::eval()) and where the DGKS retry fires on most columns.
+ *  The inputs are correlated and uncentered (mean/std = `mu`), so the in-span
+ *  part b_k * mean dominates most candidates b_k * x_c. That is the regime
+ *  where the f32 storage of Bo shows up in the linear delta-SSE (see
+ *  MarsAlgo::eval()), and where the DGKS retry fires on most columns.
  *
- *  The oracle projects onto span(Bo) -- the f32 orthonormal basis the
- *  algorithm actually holds, read through MarsAlgo::ortho_basis() -- with an
- *  exact f64 QR of it, so it does not assume BoᵀBo = I. (Projecting onto
- *  span(B) instead differs from span(Bo) by Bo's f32 rounding, ~eps_f32·κ
- *  relative on the residual, which swamps the effect under test.)
+ *  The oracle projects onto span(Bo), the f32 orthonormal basis that the
+ *  algorithm actually holds, read through MarsAlgo::ortho_basis(). It uses an
+ *  exact f64 QR of Bo, so it does not assume BoᵀBo = I. Projecting onto
+ *  span(B) instead would differ from span(Bo) by Bo's f32 rounding,
+ *  ~eps_f32·κ relative on the residual, which swamps the effect under test.
  */
 #include "../marsalgo.h"
 #include <Eigen/Dense>

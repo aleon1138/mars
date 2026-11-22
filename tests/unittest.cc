@@ -11,12 +11,13 @@
 #include <numeric>
 
 /*
- *  Hinge-sweep delta-SSE goes through covariates_impl(). With AVX the f/g
- *  reduction accumulates 4-wide via FMA; without it (e.g. arm64) the scalar
- *  fallback sums in a different order, drifting the ill-conditioned
- *  (small-denominator) cuts by a few e-6 on dsse/N -- reduction order, not a
- *  real accuracy loss. Hold the AVX path to the tight f32-storage floor; relax
- *  only the scalar path. Gated on the same macro covariates_impl() selects on.
+ *  The hinge-sweep delta-SSE goes through covariates_impl(). With AVX, the f/g
+ *  reduction accumulates 4-wide via FMA. Without it (for example, on arm64),
+ *  the scalar fallback sums in a different order. That moves the
+ *  ill-conditioned (small-denominator) cuts by a few e-6 on dsse/N, an effect
+ *  of reduction order and not a real accuracy loss. Hold the AVX path to the
+ *  tight f32-storage floor, and relax only the scalar path. This is gated on
+ *  the same macro that covariates_impl() selects on.
  */
 #if defined(__AVX__)
 constexpr double HINGE_DSSE_TOL = 1e-6;
@@ -70,7 +71,7 @@ double slow_mse(MatrixXd X, VectorXd y)
     return mse / y.squaredNorm();
 }
 
-/* Closed-form WLS: minimizes sum(w * (y - X b)²); returns sum(w*e²)/n / sum(w*y²). */
+/* Closed-form WLS: minimizes sum(w * (y - X b)²), returns sum(w*e²)/n / sum(w*y²). */
 double slow_mse_w(MatrixXd X, VectorXd y, VectorXd w)
 {
     ArrayXd  sw = w.array().sqrt();
@@ -350,7 +351,7 @@ TEST(MarsTest, DeltaSSE)
         dsse2 = slow_dsse(ALL_B.leftCols(b_cols+2), y);
         /*
          *  Tolerances relaxed from 1e-7..1e-8 to 1e-6 after narrowing Bx to f32
-         *  storage; hinge SSE noise floor is dominated by the per-step f32
+         *  storage. The hinge SSE noise floor is dominated by the per-step f32
          *  round in the inner sweep accumulators (sqrt(N)*eps_f32 on dsse/N).
          *  HINGE_DSSE_TOL relaxes further on the non-AVX scalar path (see top).
          */
@@ -438,13 +439,13 @@ TEST(MarsTest, DeltaSSE)
 
 /*
  *  Degenerate candidates must score exactly zero, at small n too. Once a linear
- *  term x_j is in the model, the candidate (x_j, intercept) -- and any exact
- *  multiple of x_j -- lies in span(Bo) up to f32 rounding noise. The
- *  orthonormalize tolerance must zero that noise rather than normalize it into
- *  a unit "basis"; and append() of the same term must be rejected. At n=300 the
- *  n-scaled part of the tolerance alone (~1e-15) sits below the f32 noise floor
- *  (observed: ~1/n ~ 4e-3 of spurious delta-SSE), which is what the f32 floor in
- *  degeneracy_tol() guards.
+ *  term x_j is in the model, the candidate (x_j, intercept), and any exact
+ *  multiple of x_j, lies in span(Bo) up to f32 rounding noise. The
+ *  orthonormalize tolerance must zero that noise, not normalize it into a unit
+ *  "basis". And append() of the same term must be rejected. At n=300, the
+ *  n-scaled part of the tolerance alone (~1e-15) sits below the f32 noise
+ *  floor (observed: ~1/n ~ 4e-3 of spurious delta-SSE). The f32 floor in
+ *  degeneracy_tol() guards against that.
  */
 TEST(MarsTest, DegenerateCandidateIsZeroAtSmallN)
 {
@@ -480,12 +481,13 @@ TEST(MarsTest, DegenerateCandidateIsZeroAtSmallN)
 /*
  *  Linear delta-SSE against an f64 oracle on uncentered, correlated inputs
  *  (tests/linear_problem.h). linear_only on the CPU scores in closed form
- *  (mars::linear_dsse); the history below is about the explicit path, which
- *  the hinge eval and the closed form's fallback still use. Bo is f32, so BoᵀBo = I + E with a coherent
- *  ~eps_f32 defect on the constant intercept; scoring the unit candidate
- *  against y let that defect into ybx at first order whenever the DGKS retry
- *  did not fire (observed: max 1.5e-3 relative). Scoring against the residual
- *  target y - Bo*ybo makes it second order.
+ *  (mars::linear_dsse). The history below is about the explicit path, which
+ *  the hinge eval and the closed form's fallback still use. Bo is f32, so
+ *  BoᵀBo = I + E, with a coherent ~eps_f32 defect on the constant intercept.
+ *  Scoring the unit candidate against y let that defect into ybx at first
+ *  order whenever the DGKS retry did not fire (observed: max 1.5e-3
+ *  relative). Scoring against the residual target y - Bo*ybo makes it second
+ *  order.
  */
 TEST(MarsTest, LinearDsseMatchesOracleOnUncenteredInputs)
 {
@@ -512,7 +514,7 @@ TEST(MarsTest, LinearDsseMatchesOracleOnUncenteredInputs)
                     N, M, mu, S.count, S.med_rel, S.max_rel);
         ASSERT_GT(S.count, (int)(PX * M / 2));
         // Closed form (mars::linear_dsse): observed median 4.5e-9 / 1.1e-12, max
-        // 8.5e-7 / 1.5e-10 for mu = 3 / 0; the explicit path it replaced was
+        // 8.5e-7 / 1.5e-10 for mu = 3 / 0. The explicit path it replaced had
         // median ~7e-8, max ~1.1e-5.
         EXPECT_LT(S.med_rel, 2e-8);
         EXPECT_LT(S.max_rel, 5e-6);
@@ -606,7 +608,7 @@ TEST(MarsTest, LinearCacheMatchesUncached)
  *  append() runs its row passes over fixed row blocks with the partials
  *  combined in block order, so B, Bo, the returned MSE and every score
  *  derived from them must be bit-identical for any thread count. n spans
- *  several blocks plus a partial one; hinges and linear terms both appear.
+ *  several blocks plus a partial one. Hinges and linear terms both appear.
  */
 TEST(MarsTest, AppendIsThreadCountIndependent)
 {
@@ -701,8 +703,8 @@ TEST(MarsTest, WeightedLS)
  *  at every S-th sorted position. The f/g/k0/k1/w/b2/vb/bd accumulators must
  *  still update every iteration, so the hinge_dsse at any position evaluated
  *  with min_span=S must equal what the same position would yield with
- *  min_span=1 (i.e., min_span only restricts which cuts are *considered*, not
- *  the math at the considered cuts).
+ *  min_span=1 (min_span only restricts which cuts are *considered*, not the
+ *  math at the considered cuts).
  */
 TEST(MarsTest, MinSpan)
 {
@@ -735,7 +737,7 @@ TEST(MarsTest, MinSpan)
     EXPECT_GE(r1.hinge_dsse[0], r2 .hinge_dsse[0]);
     EXPECT_GE(r2.hinge_dsse[0], r10.hinge_dsse[0]);
 
-    /* linear_dsse is independent of cut placement; min_span must not affect it. */
+    /* linear_dsse is independent of cut placement, so min_span must not affect it. */
     ASSERT_NEAR(r1.linear_dsse[0], r2 .linear_dsse[0], 1e-12);
     ASSERT_NEAR(r1.linear_dsse[0], r10.linear_dsse[0], 1e-12);
 
@@ -750,14 +752,14 @@ TEST(MarsTest, MinSpan)
 }
 
 /*
- *  eval() is called concurrently over X columns from the OpenMP region in the
- *  bindings; production never exercised that path from the test suite. This
- *  grows the basis through append() (so Bo is the geometrically-restrided matrix),
- *  then checks that splitting the per-column eval() across std::threads -- which
- *  forces the function-local thread_local scratch to be constructed on non-main
- *  threads and has many readers hit the shared Bo at once -- reproduces the
- *  single-threaded result bit-for-bit. std::thread keeps this independent of the
- *  OpenMP runtime.
+ *  The bindings call eval() concurrently over X columns from the OpenMP
+ *  region, and the test suite did not exercise that production path before.
+ *  This test grows the basis through append() (so Bo is the geometrically
+ *  restrided matrix). Then it splits the per-column eval() across std::threads
+ *  and checks that the result matches the single-threaded one bit for bit.
+ *  That forces the function-local thread_local scratch to be constructed on
+ *  non-main threads, and has many readers hit the shared Bo at once.
+ *  std::thread keeps this independent of the OpenMP runtime.
  */
 TEST(MarsTest, ConcurrentEval)
 {

@@ -7,30 +7,31 @@
 namespace mars {
 
 /*
- *  DGKS re-orthogonalization gate. Trigger when residual energy is less
- *  than 1/9 of projection energy (eta^2 = 0.1, eta ~= 0.316). Stricter
- *  than the textbook eta = 1/sqrt(2) (which corresponds to ratio = 1.0):
- *  Bx is per-call scratch and we don't need bit-perfect orthogonality of
- *  it, only protection against catastrophic cancellation. The looser
- *  gate fires on numerically-benign cases and perturbs results within
- *  the f32->f64 noise floor for no real accuracy gain.
+ *  DGKS re-orthogonalization gate. It triggers when the residual energy is
+ *  less than 1/9 of the projection energy (eta^2 = 0.1, eta ~= 0.316). That
+ *  is stricter than the textbook eta = 1/sqrt(2), which corresponds to
+ *  ratio = 1.0. Bx is per-call scratch, and we don't need bit-perfect
+ *  orthogonality of it, only protection against catastrophic cancellation.
+ *  The looser textbook gate fires on numerically benign cases and perturbs
+ *  results within the f32->f64 noise floor, for no real accuracy gain.
  */
 constexpr double DGKS_GATE_RATIO_SQ = 9.0;
 
 /*
  *  Relative floor on the hinge-sweep denominator den = ||h+||^2 - ||proj h+||^2,
  *  the energy of the candidate hinge outside span(Bo, Bx). For a hinge inside
- *  the span, den is the difference of two O(||h+||^2) sums and comes out as
+ *  the span, den is the difference of two O(||h+||^2) sums. It comes out as
  *  noise of either sign at ~eps_f32/sqrt(n) of ||h+||^2 (the orthonormality
- *  defect of the f32 Bo); the numerator uw is noise of the same origin, so
- *  uw^2/den can score anywhere up to ||y_perp||^2 -- observed: in-span cuts at
- *  den/||h+||^2 ~ 1e-11 scoring 1e-2, above every legitimate cut. The absolute
- *  _tol (which grows with n while this floor shrinks) cannot catch it, so
- *  require that at least this fraction of the hinge's energy be new. 8*eps_f32
- *  ~ 1e-6 sits ~4 decades above the floor and well below any cut min_span
- *  admits; below it the term would be a near-duplicate with an O(1/sqrt(den))
- *  coefficient whose gain f32 cannot resolve anyway. Shared by the CPU sweep
- *  (marsalgo.cc) and the CUDA sweep (cuda/hinge_sweep.cu).
+ *  defect of the f32 Bo). The numerator uw is noise of the same origin, so
+ *  uw^2/den can score anywhere up to ||y_perp||^2. We observed in-span cuts at
+ *  den/||h+||^2 ~ 1e-11 scoring 1e-2, above every legitimate cut. The
+ *  absolute _tol grows with n while this floor shrinks, so _tol cannot catch
+ *  it. Instead, require that at least this fraction of the hinge's energy be
+ *  new. 8*eps_f32 ~ 1e-6 sits ~4 decades above the floor and well below any
+ *  cut that min_span admits. Below it, the term would be a near-duplicate
+ *  with an O(1/sqrt(den)) coefficient, whose gain f32 cannot resolve anyway.
+ *  The CPU sweep (marsalgo.cc) and the CUDA sweep (cuda/hinge_sweep.cu) share
+ *  it.
  */
 constexpr double HINGE_DEN_REL = 8.0 * 1.1920928955078125e-07;  // 8 * FLT_EPSILON
 
@@ -43,11 +44,11 @@ constexpr double HINGE_DEN_REL = 8.0 * 1.1920928955078125e-07;  // 8 * FLT_EPSIL
  *      s        = ||Bx[:,j]||^2                            // f64 accumulator over post-store f32
  *      Bx[:,j] *= (s > tol) ? 1/sqrt(s + tol) : 0          // normalize, zero degenerate
  *
- *  Bo and Bx are both stored as f32 to halve the largest buffers; all
- *  arithmetic (projection, dot products, norms) stays in f64 -- Bo and Bx
- *  entries are upcast at the load. The cancellation in (Bx -= Bo*Bo^T*Bx)
- *  is bounded by the DGKS retry, so the rounded f32 storage keeps
- *  O(eps_f32) orthogonality against Bo -- see DGKS_GATE_RATIO_SQ above.
+ *  Bo and Bx are both stored as f32, to halve the largest buffers. All
+ *  arithmetic (projection, dot products, norms) stays in f64, because Bo and
+ *  Bx entries are upcast at the load. The DGKS retry bounds the cancellation
+ *  in (Bx -= Bo*Bo^T*Bx), so the rounded f32 storage keeps O(eps_f32)
+ *  orthogonality against Bo (see DGKS_GATE_RATIO_SQ above).
  *
  *  Layouts (caller's responsibility):
  *      B     : (n, *) col-major float;  col stride ldB.   Only columns mask[j] are read.
@@ -57,13 +58,13 @@ constexpr double HINGE_DEN_REL = 8.0 * 1.1920928955078125e-07;  // 8 * FLT_EPSIL
  *      Bx    : (n, p) col-major float;  col stride ldBx       [output]
  *      T     : (m, p) col-major double; col stride ldT        [workspace; overwritten]
  *      s_buf : (p)    double                                  [workspace; overwritten]
- *      tol   : tolerance for treating a column as degenerate;
+ *      tol   : tolerance for treating a column as degenerate,
  *              should be ~O(n * eps_f32^2) for the f32 storage floor.
  *
- *  Uses AVX2 + FMA in the inner loops when available, scalar fallback otherwise.
- *  The DGKS retry re-runs the flagged columns as one batch (two more sweeps
- *  over Bo, not two per column); its index list is the only heap allocation,
- *  thread-local and grown on demand.
+ *  Uses AVX2 + FMA in the inner loops when available, with a scalar fallback
+ *  otherwise. The DGKS retry re-runs the flagged columns as one batch: two
+ *  more sweeps over Bo, not two per column. Its index list is the only heap
+ *  allocation, thread-local and grown on demand.
  *
  *  dgks_counter (optional): if non-null, atomically incremented each time the
  *  DGKS re-orthogonalization branch fires for a column. Lets callers measure
@@ -84,29 +85,29 @@ void orthonormalize(
 /*
  *  Single-column Gram-Schmidt: orthonormalize one new basis column against the
  *  m orthonormal columns of `Bo`, in place. This is the per-append counterpart
- *  of orthonormalize() (which batches p candidate columns for eval()) and uses
- *  the same scheme: one classical Gram-Schmidt pass (c = Bo^T v, v -= Bo c)
+ *  of orthonormalize(), which batches p candidate columns for eval(). It uses
+ *  the same scheme: one classical Gram-Schmidt pass (c = Bo^T v, v -= Bo c),
  *  plus one DGKS retry when the residual energy is small relative to what was
  *  projected out (see DGKS_GATE_RATIO_SQ). With Bo orthonormal to f32 storage
- *  precision, classical and modified GS agree to that same floor; classical GS
- *  is chosen because both halves stream Bo row by row (two sequential sweeps),
- *  whereas modified GS walks Bo column by column -- a strided access that costs
- *  one cache line per row per column, m times the traffic. On return:
+ *  precision, classical and modified GS agree to that same floor. Classical
+ *  GS wins because both of its halves stream Bo row by row (two sequential
+ *  sweeps). Modified GS walks Bo column by column, a strided access that
+ *  costs one cache line per row per column: m times the traffic. On return:
  *      v        <- v_perp / ||v_perp||   if ||v_perp||^2 > tol  (unit residual)
  *               <- v_perp (unchanged)    otherwise              (degenerate)
- *      returns     ||v_perp||            (pre-normalization; caller accepts the
+ *      returns     ||v_perp||            (pre-normalization, caller accepts the
  *                                         column iff w*w > tol and stores v)
  *
- *  All arithmetic is f64; Bo is f32 storage, upcast on the load. Allocates an
+ *  All arithmetic is f64. Bo is f32 storage, upcast on the load. Allocates an
  *  m-length f64 workspace (cold path: once per accepted basis).
  *
  *  Layouts:
- *      v    : (n)    double, in/out -- the raw new column; residual on return
+ *      v    : (n)    double, in/out: the raw new column, the residual on return
  *      Bo   : (n, m) row-major float; row stride ldBo
  *      tol  : degeneracy threshold (same scale as orthonormalize()'s tol)
  *
  *  dgks_counter (optional): atomically incremented if the DGKS retry fires.
- *  threads: OpenMP threads for the row passes (see row_blocks()); the result
+ *  threads: OpenMP threads for the row passes (see row_blocks()). The result
  *  does not depend on it.
  */
 double orthonormalize_col(
@@ -121,31 +122,31 @@ double orthonormalize_col(
  *  Fallback threshold of the closed-form linear delta-SSE (linear_dsse()): a
  *  candidate whose residual carries less than 1/LINEAR_KAPPA2_MAX of its energy
  *  (kappa^2 = ||Bx||^2 / den above this) is scored by explicit projection
- *  instead. The closed form subtracts O(||Bx||^2) f64 sums to get den, so its
+ *  instead. The closed form subtracts O(||Bx||^2) f64 sums to get den. So its
  *  relative error grows as ~eps_f64*sqrt(n)*kappa^2 (the sequential T and
- *  ||Bx||^2 sums); 1e6 keeps that under ~1e-7 at n=5e5. Exactly in-span
+ *  ||Bx||^2 sums). 1e6 keeps that under ~1e-7 at n=5e5. Exactly in-span
  *  candidates (kappa = inf) always take the explicit path, which zeroes them.
  */
 constexpr double LINEAR_KAPPA2_MAX = 1e6;
 
 /*
  *  Linear delta-SSE of p candidate columns, in closed form. For each j, with
- *  Bx_j = B[:, mask[j]] .* x (f32 product, stored f32 -- the same column
+ *  Bx_j = B[:, mask[j]] .* x (f32 product, stored f32: the same column that
  *  orthonormalize() forms and append() would store) and T_j = Bo^T Bx_j:
  *
  *      den = ||Bx_j||^2 - T_j'T_j + T_j'E T_j          (residual energy)
  *      u   = <Bx_j, y>  - T_j'ybo + T_j'E ybo          (residual . y)
  *      dsse[j] = (den > tol) ? u^2 / (den + tol) : 0
  *
- *  This is the projection onto the complement of span(Bo) with the exact Gram
- *  BoᵀBo = I + E taken to first order in E (E ~ eps_f32, so the dropped
- *  term is ~||E||^2*kappa^2, ~5e-9 at the fallback gate): it needs only
- *  Phase 1 (T), not the
- *  projection, the DGKS retry or the normalize, and never rounds the residual
- *  to f32. Columns whose kappa^2 = ||Bx_j||^2 / den exceeds LINEAR_KAPPA2_MAX
- *  fall back to the explicit path: Bx_j -= Bo T_j, a DGKS retry when gated
- *  (see orthonormalize()), then dsse[j] = <r, yres>^2 / (s + tol), with f64
- *  throughout and no f32 normalize scale.
+ *  This is the projection onto the complement of span(Bo), with the exact
+ *  Gram BoᵀBo = I + E taken to first order in E. E ~ eps_f32, so the dropped
+ *  term is ~||E||^2*kappa^2, ~5e-9 at the fallback gate. It needs only
+ *  Phase 1 (T), not the projection, the DGKS retry or the normalize, and it
+ *  never rounds the residual to f32. Columns whose kappa^2 = ||Bx_j||^2 / den
+ *  exceeds LINEAR_KAPPA2_MAX fall back to the explicit path: Bx_j -= Bo T_j,
+ *  a DGKS retry when gated (see orthonormalize()), then
+ *  dsse[j] = <r, yres>^2 / (s + tol). That path is f64 throughout, with no
+ *  f32 normalize scale.
  *
  *  Layouts (caller's responsibility):
  *      B, x, mask, Bo   : as in orthonormalize()
@@ -183,9 +184,9 @@ void linear_dsse(
  *  already computed: Bx_j -= Bo T_j, a DGKS retry where gated (see
  *  orthonormalize()), then dsse[j] = <r, yres>^2 / (s + tol) in f64, with
  *  s = ||r||^2 over the stored f32 residual (0 if s <= tol). Column j is
- *  cols[c] (or c when cols is null); it indexes T, Bx, sb and dsse alike.
- *  linear_dsse()'s fallback for near-degenerate columns. T is overwritten for
- *  retried columns.
+ *  cols[c] (or c when cols is null), and it indexes T, Bx, sb and dsse alike.
+ *  This is linear_dsse()'s fallback for near-degenerate columns. T is
+ *  overwritten for retried columns.
  */
 void explicit_dsse(size_t n, size_t m, const int *cols, size_t nc,
                    const float *Bo, size_t ldBo, double *T, size_t ldT,
@@ -194,16 +195,16 @@ void explicit_dsse(size_t n, size_t m, const int *cols, size_t nc,
 
 /*
  *  Phase 1 alone: T[:, j] = Bo^T * Bx[:, j] for j < nc (f32 in, f64
- *  accumulate; the register-tiled kernel orthonormalize() and linear_dsse()
- *  use). Layouts as in orthonormalize().
+ *  accumulate). This is the register-tiled kernel that orthonormalize() and
+ *  linear_dsse() use. Layouts as in orthonormalize().
  */
 void phase1(size_t n, size_t m, size_t nc, const float *Bo, size_t ldBo,
             const float *Bx, size_t ldBx, double *T, size_t ldT);
 
 /*
- *  bx = b .* x (f32 multiply, stored f32 -- the fill of orthonormalize() and
- *  linear_dsse()) with nb = ||bx||^2 and by = <bx, y> accumulated in f64 from
- *  the stored values.
+ *  bx = b .* x (f32 multiply, stored f32, as in the fill of orthonormalize()
+ *  and linear_dsse()), with nb = ||bx||^2 and by = <bx, y> accumulated in f64
+ *  from the stored values.
  */
 void fill_stats(const float *b, const float *x, const float *y, float *bx, size_t n,
                 double &nb, double &by);
@@ -212,10 +213,11 @@ void fill_stats(const float *b, const float *x, const float *y, float *bx, size_
  *  New rows of cached Phase 1 columns: for each parent k = parents[c],
  *  T[r, k] += sum_i Bo[i, r] * fl(B[i, k] * x[i]) for r in [r0, r1) (T column
  *  k at T + k*ldT). The product is the f32 one the fill forms, so the result
- *  equals those rows of a full Phase 1 up to f64 summation order. One
- *  streaming pass over the parents' B columns; the new Bo columns are gathered
- *  per 256-row panel. The linear_only T cache (MarsAlgo::eval) extends every
- *  cached candidate by the basis columns appended since its last eval.
+ *  equals those rows of a full Phase 1 up to f64 summation order. It makes
+ *  one streaming pass over the parents' B columns, and gathers the new Bo
+ *  columns per 256-row panel. The linear_only T cache (MarsAlgo::eval) uses
+ *  it to extend every cached candidate by the basis columns appended since
+ *  its last eval.
  */
 void cross_rows(size_t n, const float *B, size_t ldB, const int *parents, size_t np,
                 const float *x, const float *Bo, size_t ldBo, size_t r0, size_t r1,
@@ -229,8 +231,8 @@ void cross_rows(size_t n, const float *B, size_t ldB, const int *parents, size_t
  *      g[k]       = sum_i Bo[i,k] * Bo[i,col]    k <= col  (a column of BoᵀBo)
  *      yb         = sum_i Bo[i,col] * y[i]
  *
- *  f64-accumulated. g extends E = BoᵀBo - I; yb is the new ybo entry.
- *  threads as in orthonormalize_col().
+ *  The sums accumulate in f64. g extends E = BoᵀBo - I, and yb is the new
+ *  ybo entry. `threads` is as in orthonormalize_col().
  */
 void store_col(size_t n, size_t col, const double *v, float *Bo, size_t ldBo,
                const float *y, double *g, double &yb, int threads = 1);
@@ -272,11 +274,12 @@ inline void row_blocks(size_t n, int threads, F &&f)
  *
  *      returns  sum_{i<n} (double)a[i] * (double)b[i]
  *
- *  Both inputs are upcast at the load (cvtps_pd) and summed in f64, so the
- *  result carries only the ~eps_f32 floor of the f32 inputs -- the summation
- *  adds nothing on top, unlike an f32 accumulation which grows ~sqrt(n)*eps_f32.
- *  Two accumulators break the FMA dependency chain (one chain would cap at
- *  ~1/4 of FMA throughput). AVX2+FMA when available, scalar fallback otherwise.
+ *  Both inputs are upcast at the load (cvtps_pd) and summed in f64. So the
+ *  result carries only the ~eps_f32 floor of the f32 inputs, and the
+ *  summation adds nothing on top. An f32 accumulation would add an error that
+ *  grows as ~sqrt(n)*eps_f32. Two accumulators break the FMA dependency chain
+ *  (one chain would cap at ~1/4 of FMA throughput). Uses AVX2+FMA when
+ *  available, with a scalar fallback otherwise.
  *
  *      a, b : (n) contiguous float
  */

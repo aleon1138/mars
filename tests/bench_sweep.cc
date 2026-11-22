@@ -1,9 +1,10 @@
 /*
  *  Standalone CPU microbench for the forward-pass eval() at a pre-grown basis,
- *  isolated from the Python fit() loop: time append() while growing the basis
- *  with random hinges, then eval() on one X column with every basis active --
- *  once linear_only (orthonormalize + linear ΔSSE) and once with the hinge sweep.
- *  Single-threaded; the difference between the two eval() timings is the sweep.
+ *  isolated from the Python fit() loop. It times append() while growing the
+ *  basis with random hinges. Then it times eval() on one X column with every
+ *  basis active: once linear_only (orthonormalize + linear ΔSSE) and once with
+ *  the hinge sweep. It is single-threaded, and the difference between the two
+ *  eval() timings is the sweep.
  *
  *  Usage:  bench_sweep [n] [m] [px] [min_span] [repeat] [dump] [cuda]
  *    n        rows                       (default 500000)
@@ -11,14 +12,14 @@
  *    px       X columns                  (default 20)
  *    min_span hinge-cut grid spacing     (default 7, ~Friedman's at n=5e5)
  *    repeat   timed eval() repeats       (default 2)
- *    dump     optional path; writes the final linear/hinge/cut arrays as raw
+ *    dump     optional path, writes the final linear/hinge/cut arrays as raw
  *             f64 for a bit-exact A/B comparison between builds ("-" = none)
- *    cuda     1 to time eval(cuda=true) (GPU orthonormalize + GPU hinge sweep;
+ *    cuda     1 to time eval(cuda=true) (GPU orthonormalize + GPU hinge sweep,
  *             CUDA build only) and print its max deviation from the CPU eval
  *
- *  The basis is grown the way fit() grows it -- degree <= 3, no input repeated
- *  within a term, alternating linear terms and hinge pairs -- so it is as well
- *  conditioned as a real fit's. (Random hinges on random parents build a nearly
+ *  The basis is grown the way fit() grows it: degree <= 3, no input repeated
+ *  within a term, and alternating linear terms and hinge pairs. So it is as
+ *  well conditioned as a real fit's. (Random hinges on random parents build a nearly
  *  collinear basis whose orthonormalized directions are noise-dominated, which
  *  makes the delta-SSEs hypersensitive and useless for A/B checks.)
  */
@@ -156,7 +157,7 @@ int main(int argc, char **argv)
         std::printf("gpu vs cpu: max |dlinear| %.3e, max |dhinge| %.3e, %zu/%zu cuts differ\n",
                     max_lin, max_hin, n_cut_diff, m);
     }
-    // Keep the outputs observable; optionally dump them for an A/B diff.
+    // Keep the outputs observable. Optionally dump them for an A/B diff.
     double chk = 0.0;
     for (size_t j = 0; j < m; ++j) {
         chk += lin[j] + hin[j];

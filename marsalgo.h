@@ -10,9 +10,9 @@ inline void verify(bool check, const char *msg)
     }
 }
 
-// Opaque GPU context (see cuda/mars_cuda.h). Forward-declared unconditionally so
-// this header stays identical whether or not MARS_USE_CUDA is defined; the
-// pointer is null and never dereferenced in a non-CUDA build.
+// Opaque GPU context (see cuda/mars_cuda.h). It is forward-declared
+// unconditionally, so this header stays identical whether or not MARS_USE_CUDA
+// is defined. In a non-CUDA build the pointer is null and never dereferenced.
 namespace mars {
 namespace cuda {
 struct Context;
@@ -24,7 +24,7 @@ struct Scratch;
 class MarsAlgo {
     struct MarsData *_data = nullptr;
     mars::cuda::Context *_cuda = nullptr;  // lazily created on first cuda eval
-    size_t  _m         = 1;  // number of basis found
+    size_t  _m         = 1;  // number of basis functions found
     size_t  _max_terms = 0;  // capacity cap: B/Bo grow up to this many columns
     double  _yvar      = 0;  // variance of 'y'
     double  _tol       = 0;  // numerical error tolerance
@@ -52,7 +52,7 @@ public:
 
     /*
      *  Read-only views of the stored basis, for tests and diagnostics. B is
-     *  column-major (nrows(), nbasis()) with column stride nrows(); Bo is
+     *  column-major (nrows(), nbasis()) with column stride nrows(). Bo is
      *  row-major (nrows(), nbasis()) with row stride *ld_bo. Both pointers and
      *  the stride are invalidated by append().
      */
@@ -60,10 +60,10 @@ public:
     const float *ortho_basis(size_t *ld_bo) const;
 
     /*
-     *  Returns the delta SSE (sum of squared errors) given the existing basis
-     *  set and a candidate column of `X` to evaluate. Working memory is a
-     *  function-local thread_local sized on demand, so eval() is safe to call
-     *  concurrently from an OpenMP region with no caller-supplied scratch.
+     *  Computes the delta SSE (sum of squared errors) of a candidate column of
+     *  `X`, given the existing basis set. The working memory is a
+     *  function-local thread_local sized on demand. So eval() is safe to call
+     *  concurrently from an OpenMP region, and the caller supplies no scratch.
      *
      *  linear_dsse : double(m) [out]
      *      delta SSE from adding a linear term for each parent basis.
@@ -90,31 +90,34 @@ public:
      *      training data.
      *
      *  linear_only : bool
-     *      do not attempt to find any hinge cuts, only build a linear model.
-     *      This will ignore the output values of `hinge_dsse` and `hinge_cuts`.
+     *      do not look for any hinge cuts, only build a linear model. The
+     *      outputs `hinge_dsse` and `hinge_cuts` are then ignored.
      *
      *  cuda : bool
-     *      run the orthonormalize step and the hinge sweep on the GPU
-     *      (requires a CUDA build, i.e. USE_CUDA=ON; throws otherwise). The
-     *      linear delta-SSE and the output mapping stay on the CPU. The GPU
-     *      sweep matches the CPU one to f64 reassociation error (not
-     *      bit-exactly); MARS_CUDA_SWEEP=0 falls back to the CPU sweep after
-     *      the GPU orthonormalize. The GPU context is not thread-safe --
-     *      callers must drive the cuda path from a single thread.
+     *      run the orthonormalize step and the hinge sweep on the GPU. This
+     *      needs a CUDA build (detected at configure time, or USE_CUDA=ON),
+     *      and eval() throws otherwise. The linear delta-SSE and the output
+     *      mapping stay on the CPU. The GPU sweep matches the CPU one to f64
+     *      reassociation error, not bit-exactly. MARS_CUDA_SWEEP=0 falls back
+     *      to the CPU sweep after the GPU orthonormalize. The GPU context is
+     *      not thread-safe, so callers must drive the cuda path from a single
+     *      thread.
      */
     void eval(double *linear_dsse, double *hinge_dsse, double *hinge_cuts,
               int xcol, const bool *bmask, int min_span, int end_span,
               bool linear_only, bool cuda = false);
 
     /*
-     *  Batched GPU counterpart of eval() for the linear_only regime: evaluate
-     *  ALL `n_xcols` candidate X-columns at once instead of one per call. The
-     *  candidate columns (across the X-columns that share Bo this epoch) are
-     *  stacked and orthonormalized in blocked GEMMs on the GPU, amortizing the
-     *  per-eval launch/transfer/sync overhead. Fills the (n_xcols, _m) row-major
-     *  `linear_dsse` with the linear delta-SSE for each (X-column, basis) pair
-     *  selected by `mask`; zeros `hinge_dsse` and NaNs `hinge_cuts` (no hinges).
-     *  Requires a CUDA build (throws otherwise).
+     *  Batched GPU counterpart of eval() for the linear_only regime. It
+     *  evaluates ALL `n_xcols` candidate X-columns at once, instead of one per
+     *  call. The candidate columns of the X-columns that share Bo this epoch
+     *  are stacked and orthonormalized in blocked GEMMs on the GPU. That
+     *  amortizes the launch, transfer and sync overhead of each eval. When
+     *  MARS_LINEAR_CACHE_GB allows, the scores come from the device T cache
+     *  (cuda/linear_cache.cu) instead. Fills the (n_xcols, _m) row-major
+     *  `linear_dsse` with the linear delta-SSE of each (X-column, basis) pair
+     *  that `mask` selects. Zeros `hinge_dsse` and sets `hinge_cuts` to NaN
+     *  (no hinges). Requires a CUDA build (throws otherwise).
      *
      *      mask            : (n_xcols, _m) bool; row stride `mask_row_stride`.
      *      linear/hinge/cut: (n_xcols, _m) row-major, contiguous (stride _m).
