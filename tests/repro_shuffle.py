@@ -31,8 +31,9 @@ def make_data(n=200000, p=12, noise=0.3, seed=0, ties=True):
     Z[:, 1] = 0.7 * Z[:, 0] + 0.3 * Z[:, 1]
     Z[:, 5] = 0.5 * Z[:, 2] + 0.5 * Z[:, 5]
     if ties:
-        # Bin a few features to create ties — this exercises the unstable sort
-        # and also concentrates floating-point mass at repeated values.
+        # Bin a few features to create ties. This exercises the sort's
+        # tie-breaking (by row index), and it also concentrates floating-point
+        # mass at repeated values.
         Z[:, 6] = np.round(Z[:, 6] * 4) / 4
         Z[:, 7] = np.round(Z[:, 7] * 2) / 2
         Z[:, 8] = (Z[:, 8] > 0).astype("f")

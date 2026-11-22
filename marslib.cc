@@ -92,9 +92,9 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
     }
 
     /*
-     * `mask` is a (r,c) boolean matrix where `r` is the number of columns of
-     * the design matrix `X` and `c` is the number of basis already chosen by
-     * the algorithm.
+     * `mask` is a (r,c) boolean matrix, where `r` is the number of columns of
+     * the design matrix `X` and `c` is the number of basis functions that the
+     * algorithm has already chosen.
      */
     std::atomic<bool> ok{true};
     std::string err;  // first C++ error message, if any (guarded by `critical`)
@@ -112,9 +112,10 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
 
             /*
              *  eval() uses a function-local thread_local scratch, grown on
-             *  demand and reused across calls -- no caller-supplied buffer.
-             *  C++ exceptions (e.g. a CUDA error) must not escape the OpenMP
-             *  region, so catch them here and surface via `ok`/`err`.
+             *  demand and reused across calls, so the caller supplies no
+             *  buffer. C++ exceptions (for example, a CUDA error) must not
+             *  escape the OpenMP region. So catch them here and report them
+             *  through `ok`/`err`.
              */
             #pragma omp for schedule(static)
             for (int i = 0; i < mask_rows; ++i) {
@@ -132,7 +133,7 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
 
                 if (i % 32 == 0) {
                     py::gil_scoped_acquire gil_a;
-                    if (PyErr_CheckSignals() != 0) { // check for CRTL-C
+                    if (PyErr_CheckSignals() != 0) { // check for CTRL-C
                         ok.store(false, std::memory_order_relaxed);
                     }
                 }
@@ -154,11 +155,12 @@ py::tuple eval(MarsAlgo &algo, py::array_t<bool> mask_array,
 
 /*
  *  One basis column over one row block: out = par * f(x), where f is the
- *  node's factor (identity, or one of the two hinges). `so` is the row stride
- *  of B and `sx` that of X, in elements. When both are 1 (column-major B and
- *  X) the loop is contiguous and vectorizes; otherwise it is a strided scalar
- *  loop (a C-ordered X; a C-ordered B is formed in a column-major tile and
- *  transposed out, see transpose_tile()).
+ *  node's factor (the identity, or one of the two hinges). `so` is the row
+ *  stride of B and `sx` the row stride of X, in elements. When both are 1
+ *  (column-major B and X), the loop is contiguous and vectorizes. Otherwise
+ *  it is a strided scalar loop, which a C-ordered X takes. A C-ordered B does
+ *  not: it is formed in a column-major tile and transposed out (see
+ *  transpose_tile()).
  */
 template <typename T, typename F>
 static inline void expand_col(T *__restrict__ out, const T *__restrict__ par,
@@ -179,9 +181,9 @@ static inline void expand_col(T *__restrict__ out, const T *__restrict__ par,
 
 /*
  *  Scatter a column-major (nb, m) tile (column stride ldt) into rows of a
- *  row-major B (row stride ldb). Done in 16x16 sub-blocks so the 16 source
- *  and 16 destination lines stay in L1 while each destination line is
- *  written in full; the inner loop stores contiguously.
+ *  row-major B (row stride ldb). The copy runs in 16x16 sub-blocks, so the 16
+ *  source and 16 destination lines stay in L1 while each destination line is
+ *  written in full. The inner loop stores contiguously.
  */
 template <typename T>
 static inline void transpose_tile(T *__restrict__ B, py::ssize_t ldb,
@@ -212,25 +214,26 @@ static inline void transpose_tile(T *__restrict__ B, py::ssize_t ldb,
  *      '-'  B[:,i] = B[:,basis[i]] * max(hinge[i] - X[:,input[i]], 0)
  *
  *  with basis[i] < i, so one pass over the nodes in index order resolves every
- *  dependency. The work is split over ROW BLOCKS, not columns: a block walks
- *  all m nodes while the block of every parent column is still in L2, so a
- *  parent is never re-read from memory and the DRAM traffic is one read of the
- *  X columns the model uses plus one write of B. Blocks are independent, which
- *  is what the OpenMP loop parallelizes -- the interactions need no second
- *  pass and no synchronization. The block is sized so all m columns of it stay
- *  around 256 KB.
+ *  dependency. The work is split over ROW BLOCKS, not columns. A block walks
+ *  all m nodes while the block of every parent column is still in L2. So a
+ *  parent is never re-read from memory, and the DRAM traffic is one read of
+ *  the X columns that the model uses plus one write of B. The blocks are
+ *  independent, and the OpenMP loop runs them in parallel. The interactions
+ *  need no second pass and no synchronization. The block is sized so that all
+ *  m of its columns fit in about 256 KB.
  *
- *  Strides are arbitrary (element units), so X may be C- or F-ordered and B is
+ *  Strides are arbitrary (in elements), so X may be C- or F-ordered, and B is
  *  written in whichever order the caller allocated it. A column-major B is
- *  filled in place, a contiguous (vectorized) column segment at a time. A
+ *  filled in place, one contiguous (vectorized) column segment at a time. A
  *  row-major B is computed the same way into a per-thread column-major tile
- *  and then transposed out (transpose_tile): computing straight into the
- *  strided rows was measured ~3x slower per thread, whether walked by column
- *  (a cache-line fill per element for the parent load and the store) or by
- *  row (scalar, ~4 cycles per element). The arithmetic is in the storage type
- *  T with the cut rounded to T first -- the same f32 operations append() uses
- *  to form the column that fit() scored (there the column is also scaled,
- *  which does not change the shape of the term).
+ *  and then transposed out (transpose_tile). Computing straight into the
+ *  strided rows measured ~3x slower per thread. That held whether the loop
+ *  walked by column (a cache-line fill per element for the parent load and
+ *  the store) or by row (scalar, ~4 cycles per element). The arithmetic is in
+ *  the storage type T, with the cut rounded to T first. These are the same
+ *  f32 operations that append() uses to form the column that fit() scored.
+ *  append() also scales the column, which does not change the shape of the
+ *  term.
  */
 template <typename T>
 static void expand_impl(const py::buffer_info &X, const py::buffer_info &B,
@@ -279,7 +282,7 @@ static void expand_impl(const py::buffer_info &X, const py::buffer_info &B,
 #endif
             /*
              *  Row-major B is computed into this column-major (NB, m) tile
-             *  and transposed out per block; column-major B is computed in
+             *  and transposed out per block. Column-major B is computed in
              *  place. `so`/`s1` are the row/column strides of the target.
              */
             const bool via_tile = (bs1 == 1);
@@ -325,9 +328,9 @@ static void expand_impl(const py::buffer_info &X, const py::buffer_info &B,
                     transpose_tile(Bp + r0*bs0, bs0, tile.data(), NB, nb, m);
                 }
                 /*
-                 *  Ctrl-C: only the main thread runs Python signal handlers,
-                 *  and under the static schedule it owns the leading blocks,
-                 *  so poll from there every 256 blocks.
+                 *  Ctrl-C: only the main thread runs Python signal handlers.
+                 *  Under the static schedule it owns the leading blocks, so
+                 *  poll from there every 256 blocks.
                  */
                 if (omp_get_thread_num() == 0 && (blk & 255) == 0) {
                     py::gil_scoped_acquire gil_a;
@@ -344,9 +347,9 @@ static void expand_impl(const py::buffer_info &X, const py::buffer_info &B,
 }
 
 /*
- *  Python entry point: B[:] = basis functions of the model over X. B is
- *  allocated by the caller in the desired order (C or F) and X's dtype (f32 or
- *  f64); type/basis/input/hinge are the model columns. See expand_impl().
+ *  Python entry point: B[:] = basis functions of the model over X. The caller
+ *  allocates B in the desired order (C or F) and in X's dtype (f32 or f64).
+ *  type/basis/input/hinge are the model columns. See expand_impl().
  */
 void expand(py::array X_array, py::array B_array,
             py::array_t<uint8_t, py::array::c_style | py::array::forcecast> type,

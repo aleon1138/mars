@@ -11,10 +11,10 @@
  *  with E = BoᵀBo − I. Per call this file:
  *    1. extends every live slot by the Bo rows appended since the last call
  *       (an f64 kernel forming the same f32 product as the fill), and updates
- *       its TᵀT / TᵀET / Tᵀybo row by row;
+ *       its TᵀT / TᵀET / Tᵀybo row by row.
  *    2. computes a full T column for each newly requested slot (fill +
- *       cublasDgemm in f64);
- *    3. scores every requested candidate in closed form (one warp each);
+ *       cublasDgemm in f64).
+ *    3. scores every requested candidate in closed form (one warp each).
  *    4. sends the near-degenerate ones (κ² > LINEAR_KAPPA2_MAX) through the
  *       explicit f64 projection (f64_reproject, shared with the DGKS retry)
  *       and marks those found in span(Bo) dead: the span only grows, so they
@@ -43,8 +43,8 @@ constexpr int LC_RMAX = 4;   // new Bo rows per extension launch
 
 // T[slot, r0 + r] += Σ_{i in chunk} bo_{r0+r}[i] · (double)fl(b_k[i] · x_c[i]),
 // r < R, for every live slot. One thread per slot (consecutive slots share c,
-// so x is a warp broadcast, as is bo), blockIdx.y = row chunk; the chunk
-// partials meet in f64 atomics on rows the fresh store zeroed. The f32 product
+// so x is a warp broadcast, as is bo), and blockIdx.y = row chunk. The chunk
+// partials meet in f64 atomics on rows that the fresh store zeroed. The f32 product
 // is formed exactly as the fill forms it, so T stays the T of the column that
 // nb / by describe (an unrounded product would perturb den at first order).
 template <int R>
@@ -87,9 +87,10 @@ __global__ void lc_cross_rows_kernel(const float *B, const float *X, const doubl
 // The closed-form scalars of slots[w] from T rows [r0, m), one warp per slot:
 //     tt += Σ t_r²,   ty += Σ t_r·ybo_r,
 //     tet += Σ_r (2 t_r Σ_{l<r} E[l,r] t_l + E[r,r] t_r²)
-// which is TᵀET grown one row at a time (E symmetric; only its upper triangle,
-// column r rows l <= r, is read, so only E's new columns need uploading). With
-// r0 == 0 the three are set rather than incremented (a fresh slot).
+// This is TᵀET grown one row at a time. E is symmetric, and only its upper
+// triangle (column r, rows l <= r) is read, so only E's new columns need
+// uploading. With r0 == 0, the three are set instead of incremented (a fresh
+// slot).
 __global__ void lc_scalars_kernel(const int *slots, size_t cnt, const double *T, size_t ldT,
                                   const double *E, size_t ldE, const double *ybo,
                                   size_t r0, size_t m, double *tt, double *tet, double *ty)
@@ -131,8 +132,8 @@ __global__ void lc_scalars_kernel(const int *slots, size_t cnt, const double *T,
 }
 
 // Fresh slots: bx64[:,j] = (double)fl(B[:, basis[j]] · X[:, xcol[j]]) for the
-// Dgemm, and nb[j] = Σ v², by[j] = Σ v·y (f64; atomics over the row tiles, so
-// the caller zeroes nb / by first). blockIdx.y = j.
+// Dgemm, and nb[j] = Σ v², by[j] = Σ v·y (f64, with atomics over the row
+// tiles, so the caller zeroes nb / by first). blockIdx.y = j.
 __global__ void lc_fill_stats_kernel(const float *B, const float *X, const float *y,
                                      size_t n, const int *xcol, const int *basis,
                                      double *bx64, double *nb, double *by)
@@ -330,7 +331,7 @@ void linear_cache_eval(Context *ctx, size_t m, size_t P,
     auto t0 = clock_t_::now();
     ctx->n_lc_calls++;
 
-    // E's new columns (rows 0..m; only the upper triangle is read), and the
+    // E's new columns (rows 0..m, only the upper triangle is read), and the
     // current ybo / E·ybo (E·ybo changes in every entry per append).
     if (ctx->lc_mE < m) {
         CUDA_CHECK(cudaMemcpy2DAsync(ctx->dLE + ctx->lc_mE * mt, mt * sizeof(double),
@@ -514,7 +515,8 @@ void linear_cache_eval(Context *ctx, size_t m, size_t P,
 
     // 5. Near-degenerate candidates: explicit f64 projection from the cached T,
     //    ΔSSE = <r, y_res>² / (‖r‖² + tol) on the f32-rounded residual r (as
-    //    mars::explicit_dsse); ‖r‖² <= tol means in span(Bo): dead for good.
+    //    mars::explicit_dsse). ‖r‖² <= tol means in span(Bo), so the slot is
+    //    dead for good.
     if (!fb.empty()) {
         std::vector<int> fx, fk, fs;
         std::vector<double> h_s, h_u;

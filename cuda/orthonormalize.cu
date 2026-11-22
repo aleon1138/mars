@@ -1,25 +1,26 @@
 /*
- *  CUDA implementation of mars::orthonormalize() for the linear_only forward
- *  pass. See cuda/mars_cuda.h for the host-facing contract and kernels.cc for
- *  the CPU oracle this must match (within the ~1e-5 f32 storage floor).
+ *  CUDA implementation of mars::orthonormalize() for the forward pass. See
+ *  cuda/mars_cuda.h for the host-facing contract, and kernels.cc for the CPU
+ *  oracle that this must match (within the ~1e-5 f32 storage floor).
  *
  *  Precision contract (load-bearing): the near-zero entries of T = Boᵀ·Bx
- *  cancel, so T must be accumulated in f64 -- a single f32 GEMM over K=n gives
- *  1e-2…4.6e-1 relative error (see CLAUDE.md). The default path therefore
- *  splits K into chunks of MARS_CUDA_KCHUNK rows, runs each chunk as an f32
- *  cublasSgemm, and sums the chunk results into the f64 T; only the
+ *  cancel, so T must accumulate in f64. A single f32 GEMM over K=n gives
+ *  1e-2…4.6e-1 relative error (see CLAUDE.md). So the default path splits K
+ *  into chunks of MARS_CUDA_KCHUNK rows, runs each chunk as an f32
+ *  cublasSgemm, and sums the chunk results into the f64 T. Only the
  *  within-chunk f32 error (~sqrt(kchunk)·eps_f32) remains. MARS_CUDA_KCHUNK=0
  *  selects the native-f64 cublasDgemm reference, bit-reproducible against the
- *  CPU kernel. The projection Bx -= Bo·T runs as an f32 sgemm whose result is
- *  subtracted from the f64 B·x inside the fused round/reduce pass. The DGKS
- *  retry (cancelling columns) runs entirely in f64 and restarts each flagged
- *  column from its f64 B·x: on such a column the f32 projection leaves
- *  out-of-span noise ~eps_f32·√m·‖T‖, i.e. eps_f32·√m·κ relative to the
- *  residual, which a second projection cannot remove (ΔSSE was off by up to
- *  tens of percent at m=400, κ>30, in a numpy model of this path). The per-element f32
- *  rounding points match the CPU kernel: the B·x product is rounded to f32
- *  before the GEMM, the residual is rounded to f32 before its squared norm
- *  accumulates, and the normalize scale is 1/sqrt(s+tol) in f64.
+ *  CPU kernel. The projection Bx -= Bo·T runs as an f32 sgemm, and its result
+ *  is subtracted from the f64 B·x inside the fused round/reduce pass.
+ *
+ *  The DGKS retry (for cancelling columns) runs entirely in f64 and restarts
+ *  each flagged column from its f64 B·x. On such a column, the f32 projection
+ *  leaves out-of-span noise ~eps_f32·√m·‖T‖, that is, eps_f32·√m·κ relative
+ *  to the residual. A second projection cannot remove it (in a numpy model of
+ *  this path, ΔSSE was off by up to tens of percent at m=400, κ>30). The
+ *  per-element f32 rounding points match the CPU kernel: the B·x product is
+ *  rounded to f32 before the GEMM, the residual is rounded to f32 before its
+ *  squared norm accumulates, and the normalize scale is 1/sqrt(s+tol) in f64.
  */
 
 #include "../kernels.h"   // mars::DGKS_GATE_RATIO_SQ
@@ -60,10 +61,11 @@ __global__ void fill_kernel(const float *B, size_t n, const float *x,
     bx64[idx] = (double)v;
 }
 
-// Scale one resident candidate column in place: col[:] *= s. A distinct f32
-// pass (not folded into fill_batch) so the candidate is rounded to f32 before
-// multiplying by B -- matching the CPU's x = X·s then B·x ordering. Run once per
-// column when it first becomes resident (context_sync_xcols).
+// Scale one resident candidate column in place: col[:] *= s. This is a
+// separate f32 pass (not folded into fill_batch), so the candidate is rounded
+// to f32 before the multiply by B. That matches the CPU's order: x = X·s, then
+// B·x. It runs once per column, when the column first becomes resident
+// (context_sync_xcols).
 __global__ void scale_col_kernel(float *col, size_t n, float s)
 {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -97,13 +99,14 @@ __global__ void fill_batch_kernel(const float *B, size_t n, const float *Xcand,
 //
 // For each column j (= blockIdx.y), tiles of rows are split across blockIdx.x
 // blocks (grid-stride), so the whole GPU is filled instead of one block/column.
-// Each block: rounds the f64 residual to f32 and stores it, then block-reduces
-// two partials -- Σ(round)² and (if want_dot) Σ(round)·y -- and atomic-adds them
-// to ds[j] / ybx_raw[j] (which the caller must zero first). f64 throughout, so
-// the f32-store-rounding semantics match the CPU kernel exactly.
+// Each block rounds the f64 residual to f32 and stores it. Then it
+// block-reduces two partials, Σ(round)² and (if want_dot) Σ(round)·y, and
+// atomic-adds them to ds[j] / ybx_raw[j] (which the caller must zero first).
+// The math is f64 throughout, so the f32-store-rounding semantics match the
+// CPU kernel exactly.
 // `proj` (optional, n×P, ld n): when non-null, the f32 projection to subtract
-// in f64 first (residual = in - (double)proj) -- fuses the f32-projection
-// subtract into this pass so it isn't a separate n×P read-modify-write.
+// in f64 first (residual = in - (double)proj). This fuses the f32-projection
+// subtract into this pass, so it is not a separate n×P read-modify-write.
 __global__ void round_reduce_kernel(const double *in, float *out,
                                     const float *y, size_t n,
                                     double *ds, double *ybx_raw, int want_dot,
@@ -143,11 +146,12 @@ __device__ __forceinline__ size_t sel_idx(const int *idx, size_t base, size_t c)
 }
 
 // DGKS retry, refill half: recompute the f64 B·x of each flagged column into a
-// COMPACT buffer -- dst[:,c] = (double)(B[:, basis[j]] * x_j), j = sel_idx(c),
+// COMPACT buffer: dst[:,c] = (double)(B[:, basis[j]] * x_j), j = sel_idx(c),
 // with x_j = X + xcol[j]*n (batched path) or X itself (per-eval path, xcol null).
-// The same f32 multiply as fill_kernel / fill_batch_kernel, so bit-identical to
-// the minuend the main pass used. The retry then runs at width `fired`, so its
-// cost scales with the cancelling columns, not the batch. blockIdx.y = compact c.
+// It uses the same f32 multiply as fill_kernel / fill_batch_kernel, so it is
+// bit-identical to the minuend that the main pass used. The retry then runs at
+// width `fired`, so its cost scales with the cancelling columns, not the batch.
+// blockIdx.y = compact c.
 __global__ void refill_widen_kernel(const float *B, size_t n, const float *X,
                                     const int *xcol, const int *basis,
                                     const int *idx, size_t base, double *dst)
@@ -179,9 +183,9 @@ __global__ void gather_cols_f64_kernel(const double *src, size_t ld_src, size_t 
 
 // DGKS retry, scatter half: round each compact retry column c to f32, SCATTER it
 // back to its global column sel_idx(c) in `out`, and recompute ds/ybx_raw there.
-// One block per compact column (direct write, no atomics). Mirrors the
-// f32-rounding semantics of round_reduce_kernel exactly; only flagged globals
-// are touched.
+// One block per compact column (direct write, no atomics). It mirrors the
+// f32-rounding semantics of round_reduce_kernel exactly, and it touches only
+// the flagged globals.
 __global__ void round_reduce_scatter_kernel(const double *cin, size_t n,
         const int *idx, size_t base, float *out, const float *y,
         double *ds, double *ybx_raw, int want_dot)
@@ -244,8 +248,8 @@ __global__ void widen_kernel(const float *in, double *out, size_t total)
     }
 }
 
-// dst[k,j] += (double)src[k,j] over a (rows x cols) block; src is compact
-// (ld = rows), dst has column stride ld_dst. Accumulates each per-K-chunk f32 T
+// dst[k,j] += (double)src[k,j] over a (rows x cols) block. src is compact
+// (ld = rows), and dst has column stride ld_dst. Accumulates each per-K-chunk f32 T
 // into the f64 T for the blocked GEMM.
 __global__ void accum_f32_to_f64_kernel(const float *src, double *dst,
                                         size_t rows, size_t ld_dst, size_t cols)
@@ -275,8 +279,9 @@ __global__ void cast_f64_to_f32_kernel(const double *src, size_t ld_src,
 
 
 
-// scale[j] = (ds[j] > tol) ? (float)(1/sqrt(ds[j]+tol)) : 0  -- f64 reciprocal
-// sqrt then a single cast, matching the CPU normalize step. When want_ybx, also
+// scale[j] = (ds[j] > tol) ? (float)(1/sqrt(ds[j]+tol)) : 0. That is an f64
+// reciprocal sqrt, then a single cast, matching the CPU normalize step. When
+// want_ybx, also
 // fold the scale into the linear ΔSSE input: ybx[j] = scale[j]·(Σ Bx·y). This
 // is the normalized-column dot product without a separate normalize pass:
 // ‖Bx‖·scale applied once to the reduced dot instead of per element.
@@ -309,7 +314,7 @@ __global__ void normalize_kernel(float *bx32, const float *scale, size_t n)
 }  // namespace
 
 // --- profiling helpers ------------------------------------------------------
-// Record a stream marker; read the GPU ms between two markers (valid only after
+// Record a stream marker. Read the GPU ms between two markers (valid only after
 // a stream sync, so callers accumulate after their end-of-call synchronize).
 static inline void prof_mark(Context *ctx, int i)
 {
@@ -375,8 +380,8 @@ Context *context_create(size_t n, size_t max_terms, double tol)
         ctx->p_cap = p_cap;
 
         // Blocked-f32 T GEMM: MARS_CUDA_KCHUNK = K-chunk size (rows per cublasSgemm,
-        // accumulated in f64 across chunks). ON by default (2048) -- ~2x at m=400
-        // with fit quality preserved; set MARS_CUDA_KCHUNK=0 for the native-f64
+        // accumulated in f64 across chunks). ON by default (2048): ~2x at m=400,
+        // with fit quality preserved. Set MARS_CUDA_KCHUNK=0 for the native-f64
         // reference path (bit-reproducible vs CPU).
         ctx->kchunk = 2048;
         if (const char *kc = std::getenv("MARS_CUDA_KCHUNK")) {
@@ -395,7 +400,7 @@ Context *context_create(size_t n, size_t max_terms, double tol)
             }
         }
         // MARS_CUDA_SWEEP_BLOCK pins the sweep's block size (a multiple of 32,
-        // <= 256); the tests use it to force several lanes per thread.
+        // <= 256). The tests use it to force several lanes per thread.
         if (const char *sb = std::getenv("MARS_CUDA_SWEEP_BLOCK")) {
             const long v = std::atol(sb);
             if (v >= 32 && v <= 256 && v % 32 == 0) {
@@ -403,8 +408,8 @@ Context *context_create(size_t n, size_t max_terms, double tol)
             }
         }
         // MARS_CUDA_SWEEP_TILE pins the rows staged per shared-memory tile
-        // (a multiple of 4 in [4, 128]); the tile bounds the per-block shared
-        // memory and hence the blocks resident per SM.
+        // (a multiple of 4 in [4, 128]). The tile bounds the per-block shared
+        // memory, and so the number of blocks resident per SM.
         if (const char *st = std::getenv("MARS_CUDA_SWEEP_TILE")) {
             const long v = std::atol(st);
             if (v >= 4 && v <= 128 && v % 4 == 0) {
@@ -574,8 +579,9 @@ void context_sync_basis(Context *ctx, size_t m,
     const size_t start = ctx->m_synced;
     const size_t cnt   = m - start;
 
-    // B: columns [start, m) -> dB columns [start, m). Both col-major; cudaMemcpy2D
-    // tolerates ldB != n (it is n in practice -> a single contiguous block).
+    // B: columns [start, m) -> dB columns [start, m). Both are col-major.
+    // cudaMemcpy2D tolerates ldB != n (it is n in practice, so this is a single
+    // contiguous block).
     CUDA_CHECK(cudaMemcpy2DAsync(
                    ctx->dB + start * n, n * sizeof(float),
                    B + start * ldB,     ldB * sizeof(float),
@@ -583,9 +589,10 @@ void context_sync_basis(Context *ctx, size_t m,
                    cudaMemcpyHostToDevice, ctx->stream));
 
     // Bo: host is row-major (stride ldBo). Gather each new column straight into
-    // the resident f32 dBo_f32, then widen in place to dBo_f64. One column at a
-    // time with a stream sync so the reusable host stage buffer is safe to
-    // overwrite. Rare (≈ one column per epoch), so the per-column cost amortizes.
+    // the resident f32 dBo_f32, then widen in place to dBo_f64. Go one column
+    // at a time, with a stream sync, so that the reusable host stage buffer is
+    // safe to overwrite. This is rare (≈ one column per epoch), so the
+    // per-column cost amortizes.
     const dim3 grid_col((n + BLOCK - 1) / BLOCK);
     for (size_t c = start; c < m; ++c) {
         float *stage = ctx->h_stage.data();
@@ -620,7 +627,7 @@ size_t context_batch_capacity(Context *ctx)
 void context_set_target(Context *ctx, const float *y)
 {
     if (ctx->target_ptr == y) {
-        return;  // y is fixed for a fit -- upload once
+        return;  // y is fixed for a fit: upload once
     }
     CUDA_CHECK(cudaMemcpyAsync(ctx->dy, y, ctx->n * sizeof(float),
                                cudaMemcpyHostToDevice, ctx->stream));
@@ -658,7 +665,7 @@ void context_sync_xcols(Context *ctx, size_t p_x,
     for (size_t t = 0; t < ncols; ++t) {
         const int c = cols[t];
         if (ctx->x_resident[c]) {
-            continue;  // x_c = X[:,c]·s[c] is fixed for the fit -- upload once
+            continue;  // x_c = X[:,c]·s[c] is fixed for the fit: upload once
         }
         CUDA_CHECK(cudaMemcpyAsync(ctx->dXscaled + (size_t)c * n,
                                    X + (size_t)c * ldX, n * sizeof(float),
@@ -715,9 +722,9 @@ void f64_reproject(Context *ctx, size_t m, size_t w_total,
 // Shared post-fill pipeline for P candidate columns already laid out in
 // dBx_f32 (rounded) / dBx_f64 (widened): T = Boᵀ·Bx, project out Bo, fused
 // round + norm + (optional) Σ Bx·t with t the residual target (else y), DGKS
-// retry on cancelling columns, and scale-fold. On return ctx->ds /
-// ctx->dscale / ctx->dybx (if want_dot) hold the per-column results; the caller
-// owns any downloads and the final sync.
+// retry on cancelling columns, and scale-fold. On return, ctx->ds /
+// ctx->dscale / ctx->dybx (if want_dot) hold the per-column results. The
+// caller owns any downloads and the final sync.
 static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
                            const FillSrc &src, std::atomic<long> *dgks_counter)
 {
@@ -740,7 +747,7 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     else {
         // Blocked f32: split K=n into chunks, cublasSgemm each in f32 (fast on
         // weak-f64 GPUs), accumulate the chunk results into the f64 dT. The
-        // cross-chunk f64 sum handles the global cancellation exactly; only the
+        // cross-chunk f64 sum handles the global cancellation exactly. Only the
         // within-chunk f32 error (~sqrt(kchunk)*eps_f32) remains.
         const float one_f = 1.0f, zero_f = 0.0f;
         CUDA_CHECK(cudaMemsetAsync(ctx->dT, 0, ldT * P * sizeof(double), s));
@@ -758,12 +765,13 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
         }
     }
 
-    // Phase 2a: project out Bo. proj = Bo·T as an f32 sgemm (K=m) into dBx_f32,
-    // whose phase-0 contents (the f32 B·x) are no longer needed; the subtract
-    // residual = (f64 B·x) - proj is fused into the round/reduce pass below, so
-    // there is no separate n×P read-modify-write. That pass rounds the residual
-    // to f32, stores it, and reduces ‖Bx[:,j]‖² (ds) and Σ Bx·y (ybx_raw), split
-    // over rows AND columns (atomic f64 partials) so the whole GPU is used.
+    // Phase 2a: project out Bo. proj = Bo·T runs as an f32 sgemm (K=m) into
+    // dBx_f32, whose phase-0 contents (the f32 B·x) are no longer needed. The
+    // subtract residual = (f64 B·x) - proj is fused into the round/reduce pass
+    // below, so there is no separate n×P read-modify-write. That pass rounds
+    // the residual to f32, stores it, and reduces ‖Bx[:,j]‖² (ds) and Σ Bx·y
+    // (ybx_raw). The reduction is split over rows AND columns (atomic f64
+    // partials), so the whole GPU is used.
     prof_mark(ctx, 1);
     const float one_f = 1.0f, zero_f = 0.0f;
     const size_t nmp = m * P;
@@ -795,8 +803,8 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     prof_mark(ctx, 3);
 
     // Phase 2b: DGKS gate. s[j] > tol && s[j]*9 < ‖T[:,j]‖² -> retry. Build the
-    // compact list of flagged columns on the host so the (rare) retry runs only
-    // over those, not the whole P-wide block.
+    // compact list of flagged columns on the host, so the retry runs only over
+    // those, not over the whole P-wide block.
     colsumsq_f64_kernel<<<(unsigned)P, block, 0, s>>>(ctx->dT, ldT, m, ctx->dtnorm2);
     check_launch();
     CUDA_CHECK(cudaMemcpyAsync(ctx->h_ds.data(), ctx->ds, P * sizeof(double),
@@ -815,16 +823,17 @@ static void project_reduce(Context *ctx, size_t m, size_t P, int want_dot,
     }
 
     if (fired > 0) {
-        // Surgical retry, entirely in f64 and at width `fired` (the f64 GEMMs
+        // Surgical retry, entirely in f64 and at width `fired`. The f64 GEMMs
         // are the weak path on this card, so their cost must scale with the
-        // cancelling columns, not the batch). Each flagged column restarts from
-        // its f64 B·x -- recomputed into dBx_f64, dead after round_reduce --
-        // NOT from the rounded residual in dBx_f32: the f32 projection left
-        // out-of-span noise ~eps_f32·√m·‖T‖ there that re-projecting cannot
-        // remove. Two f64 passes then follow, r1 = Bx - Bo·T with the
-        // first-pass (f64-accumulated) T, and r2 = r1 - Bo·(Boᵀ·r1); each
-        // refined column is rounded and scattered back to its global slot with
-        // fresh ds/ybx_raw. Chunked by retry_cols to bound the compact T.
+        // cancelling columns, not the batch. Each flagged column restarts from
+        // its f64 B·x, recomputed into dBx_f64 (dead after round_reduce). It
+        // does NOT restart from the rounded residual in dBx_f32: the f32
+        // projection left out-of-span noise ~eps_f32·√m·‖T‖ there, which
+        // re-projecting cannot remove. Two f64 passes follow: r1 = Bx - Bo·T
+        // with the first-pass (f64-accumulated) T, and r2 = r1 - Bo·(Boᵀ·r1).
+        // Each refined column is rounded and scattered back to its global
+        // slot, with fresh ds/ybx_raw. The work is chunked by retry_cols to
+        // bound the compact T.
         CUDA_CHECK(cudaMemcpyAsync(ctx->didx, ctx->h_idx.data(),
                                    (size_t)fired * sizeof(int),
                                    cudaMemcpyHostToDevice, s));
@@ -918,7 +927,7 @@ void orthonormalize_batch(Context *ctx, size_t m, size_t P,
 
     // Upload the per-output-column source maps and fill the stacked Bx (n×P) from
     // the RESIDENT scaled candidates (dXscaled, indexed by global X column) and
-    // resident B -- no per-block X upload.
+    // resident B. There is no per-block X upload.
     CUDA_CHECK(cudaMemcpyAsync(ctx->dsrc_xcol, src_xcol, P * sizeof(int),
                                cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(ctx->dsrc_basis, src_basis, P * sizeof(int),

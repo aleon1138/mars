@@ -23,11 +23,11 @@ double invnorm(VectorXd x)
 /*
  *  Build a strictly orthonormal Bo from a random matrix using modified
  *  Gram-Schmidt. Column `bad_col` is forced to be collinear with the
- *  previous column so it gets zeroed out -- exercises the degenerate path.
+ *  previous column, so it gets zeroed out. That exercises the degenerate path.
  *
- *  Internally builds in f64 for clean orthonormality, then casts to f32 --
- *  matching what MarsData does after `append()` Gram-Schmidt (f64 arith,
- *  f32 store).
+ *  It builds in f64 for clean orthonormality, then casts to f32. That matches
+ *  what MarsData does after the `append()` Gram-Schmidt (f64 arith, f32
+ *  store).
  */
 MatrixXfC make_orthonormal_basis(int n, int m, int bad_col, std::mt19937 &rng)
 {
@@ -58,9 +58,9 @@ ArrayXi random_mask(int m, int p, std::mt19937 &rng)
 }
 
 /*
- *  Eigen reference of what mars::orthonormalize computes -- used as ground
- *  truth in the test. Bo is f32 (matches the kernel input); the reference
- *  matmul casts to f64 lazily so the projection arithmetic is f64.
+ *  Eigen reference of what mars::orthonormalize computes, used as ground
+ *  truth in the test. Bo is f32 (it matches the kernel input). The reference
+ *  matmul casts to f64 lazily, so the projection arithmetic is f64.
  */
 MatrixXd eigen_reference(int n, int m, int p,
                          const MatrixXf  &B,
@@ -85,9 +85,9 @@ MatrixXd eigen_reference(int n, int m, int p,
  *  one classical Gram-Schmidt pass against the f32 Bo (upcast to f64), a single
  *  DGKS retry on the same gate, then v/||v|| (no +tol) when above the degeneracy
  *  floor. Reports the pre-normalization length in w_out. `modified` selects a
- *  modified-GS pass instead (each projection updates v before the next): with
- *  Bo orthonormal to f32 precision the two agree to that floor, which the test
- *  below checks.
+ *  modified-GS pass instead (each projection updates v before the next). With
+ *  Bo orthonormal to f32 precision, the two agree to that floor, and the test
+ *  below checks that.
  */
 VectorXd orthonormalize_col_reference(VectorXd v, const MatrixXfC &Bo, int m,
                                       double tol, double &w_out,
@@ -187,16 +187,16 @@ TEST(KernelsTest, OrthonormalizeMatchesEigen)
 
 /*
  *  Stride-tolerance: ldBo / ldBx / ldT can be larger than the logical sizes
- *  (i.e. the matrices live inside larger backing storage). This mirrors what
- *  happens in MarsAlgo where scratch buffers are sized for max_terms but we
- *  only use the leading m×p block.
+ *  (the matrices live inside larger backing storage). This mirrors MarsAlgo,
+ *  where scratch buffers are sized for max_terms but only the leading m×p
+ *  block is used.
  */
 TEST(KernelsTest, OrthonormalizeRespectsLeadingDims)
 {
     const int n = 64;
     const int m = 8;
     const int p = 5;
-    const int max_terms = 16;  // > m, > p — exercises non-trivial strides
+    const int max_terms = 16;  // > m, > p: exercises non-trivial strides
     constexpr double TOL = 1e-14;
     constexpr double F32_TOL = 1e-5;
 
@@ -287,7 +287,7 @@ TEST(KernelsTest, OrthonormalizeFiresDgksOnSevereCancellation)
     }
     v_perp.normalize();
 
-    /* 95%/5% energy split -- well inside the DGKS trigger region. */
+    /* 95%/5% energy split: well inside the DGKS trigger region. */
     MatrixXf B(n, m);
     B.setZero();
     B.col(0) = (std::sqrt(0.95) * Bod.col(0) + std::sqrt(0.05) * v_perp).cast<float>();
@@ -392,14 +392,14 @@ TEST(KernelsTest, OrthonormalizePrecisionStressBaseline)
      *    orth   ~ 2e-16,   norm ~ 1e-15 typical / 3.4e-13 on DGKS col,
      *    vs-ref ~ 0 (bit-identical to one-pass CGS).
      *
-     *  After narrowing Bx -> f32 (arithmetic stays f64; only storage
+     *  After narrowing Bx -> f32 (arithmetic stays f64, and only the storage
      *  narrows), the floor is dominated by the f32 store-round at each
      *  row of Bx. For unit-norm columns:
      *    ||Bo^T * Bx_f32||_max ~ eps_f32 ~ 1.2e-7
      *    ||Bx_f32[:,j]||^2 - 1 ~ 2 * eps_f32 ~ 2.4e-7
      *    Bx_f32 - Bx_eigen_ref (one-pass CGS, f64 reference) ~ eps_f32
      *
-     *  The bounds below sit ~10x above those floors -- catch a 10x
+     *  The bounds below sit ~10x above those floors. They catch a 10x
      *  regression while tolerating per-column FMA noise.
      */
     constexpr double ORTH_TOL    = 1e-6;   // ||Bo^T * Bx||_max
@@ -514,7 +514,7 @@ TEST(KernelsTest, OrthonormalizePrecisionStressBaseline)
 
     /*
      *  (3) Degenerate column is exactly zero. This is the contract for columns
-     *      whose squared norm falls below tol — the kernel uses scale=0.
+     *      whose squared norm falls below tol: the kernel uses scale=0.
      */
     EXPECT_EQ(Bx.col(degen_j).squaredNorm(), 0.0f)
             << "degenerate column was not zeroed";
@@ -538,9 +538,10 @@ TEST(KernelsTest, OrthonormalizePrecisionStressBaseline)
 
 /*
  *  dot_widen: f32 inputs, f64 accumulation. The result must match an f64
- *  reference (the same f32 values promoted to double) to ~machine precision --
- *  far past the ~1e-3 relative error a naive f32 accumulation would hit on a
- *  long vector. This is the regression guard for the "dot products accumulate
+ *  reference (the same f32 values promoted to double) to ~machine precision.
+ *  That is far tighter than the ~1e-3 relative error that a naive f32
+ *  accumulation would hit on a long vector. This is the regression guard for
+ *  the "dot products accumulate
  *  in f64" contract that backs narrowing y / Bx / Bo to f32 storage. Sizes
  *  straddle the 8-wide AVX block to exercise the scalar tail and the n==0 edge.
  */
@@ -582,7 +583,7 @@ TEST(KernelsTest, DotWidenAccumulatesInF64)
 /*
  *  orthonormalize_col: the single-column GS used by append(). A well-conditioned
  *  column must match the Eigen classical-GS reference, be orthogonal to Bo and
- *  unit-norm, and must NOT trip the DGKS retry. v is f64; Bo is f32, so
+ *  unit-norm, and must NOT trip the DGKS retry. v is f64 and Bo is f32, so
  *  orthogonality is floored at ~eps_f32 while the vs-reference agreement is at
  *  the f64 floor. A modified-GS reference must agree to the f32 floor too.
  */
@@ -621,8 +622,8 @@ TEST(KernelsTest, OrthonormalizeColMatchesEigen)
 }
 
 /*
- *  DGKS retry: a column with 95% of its energy in span(Bo) trips the gate once;
- *  the result is still orthogonal to Bo and unit-norm.
+ *  DGKS retry: a column with 95% of its energy in span(Bo) trips the gate
+ *  once. The result is still orthogonal to Bo and unit-norm.
  */
 TEST(KernelsTest, OrthonormalizeColFiresDgksOnSevereCancellation)
 {
@@ -701,7 +702,7 @@ TEST(KernelsTest, LinearDsseMatchesExactProjection)
     std::vector<int> expect_fallback;
     for (int k = 0; k < nb; ++k) {
         const int kind = k % 5;
-        if (kind == 1 || kind == 2) {   // 1e-4 off span(Bo): closed form at high kappa;
+        if (kind == 1 || kind == 2) {   // 1e-4 off span(Bo): closed form at high kappa,
                                         // 1e-6 off: fallback with a real residual
             VectorXf v = Bo.col(k % m) + (kind == 1 ? 1e-4f : 1e-6f) * VectorXf::Random(n);
             B.col(k) = (v.array() / x).matrix();
@@ -720,7 +721,7 @@ TEST(KernelsTest, LinearDsseMatchesExactProjection)
     std::vector<int> mask(nb);
     std::iota(mask.begin(), mask.end(), 0);
 
-    // E = BoᵀBo - I, ybo, E*ybo, the residual target -- as MarsAlgo keeps them.
+    // E = BoᵀBo - I, ybo, E*ybo, the residual target, as MarsAlgo keeps them.
     const MatrixXd E    = Bod.transpose() * Bod - MatrixXd::Identity(m, m);
     const VectorXd yd   = y.cast<double>().matrix();
     const VectorXd ybo  = Bod.transpose() * yd;
@@ -757,7 +758,7 @@ TEST(KernelsTest, LinearDsseMatchesExactProjection)
         }
         else if (!fb) {
             // Closed form: the f64 cancellation in den costs ~eps_f64*sqrt(n)*
-            // kappa^2 relative -- observed ~3e-10 at kappa^2 ~ 7e4, n = 4096.
+            // kappa^2 relative. Observed: ~3e-10 at kappa^2 ~ 7e4, n = 4096.
             EXPECT_NEAR(dsse[k], ref, 1e-8 * ref + 1e-15);
         }
         else if (k % 5 == 2) {      // explicit fallback with a real residual

@@ -1,8 +1,8 @@
 /*
  *  Standalone microbench for the forward-pass orthonormalize, isolated from the
- *  full fit() search. No MarsAlgo, no epoch loop, no prune, no Python: just
- *  build a pre-populated m-wide (orthonormal-ish) Bo plus B / candidate X / y,
- *  and time the orthonormalize directly --
+ *  full fit() search. No MarsAlgo, no epoch loop, no prune and no Python. It
+ *  builds a pre-populated m-wide (orthonormal-ish) Bo plus B / candidate X / y,
+ *  and times the orthonormalize directly:
  *
  *    CPU: mars::orthonormalize() per X-column (OpenMP over columns, like the
  *         real eval binding), then the linear-ΔSSE dot.
@@ -10,21 +10,21 @@
  *         against a resident Bo (what eval(cuda=True) drives).
  *
  *  Bo columns are unit-norm random vectors: at n >> m they are mutually
- *  near-orthogonal (off-diagonal ~ 1/sqrt(n)), which is enough for a faithful
- *  timing -- the GEMM/reduce work is independent of exact orthonormality, and
+ *  near-orthogonal (off-diagonal ~ 1/sqrt(n)). That is enough for a faithful
+ *  timing: the GEMM/reduce work does not depend on exact orthonormality, and
  *  the DGKS gate stays quiet (as it does on a real orthonormal Bo).
  *
  *  Usage:  bench_ortho [n] [m] [p] [gpu_cols] [cpu_calls] [repeat]
  *    n         rows                          (default 300000)
  *    m         basis width (Bo columns)      (default 400)
  *    p         candidate X-columns           (default 1000)
- *    gpu_cols  candidate cols per GPU block  (default 8192, clamped to capacity;
- *              tune the cap with MARS_CUDA_BLOCK_GB)
- *    cpu_calls X-column orthonormalize calls (default 128; 0 = skip the CPU
- *              baseline). Each call is O(n*m^2) and the CPU side is single-pass
- *              (not repeated), so at large m it dominates the bench wall time --
- *              keep it small (~one wave per core) or 0 for GPU-only iteration.
- *    repeat    timed GPU repeats             (default 10; GPU only)
+ *    gpu_cols  candidate cols per GPU block  (default 8192, clamped to capacity.
+ *              Tune the cap with MARS_CUDA_BLOCK_GB.)
+ *    cpu_calls X-column orthonormalize calls (default 128, 0 = skip the CPU
+ *              baseline). Each call is O(n*m^2), and the CPU side is single-pass
+ *              (not repeated). So at large m it dominates the bench wall time.
+ *              Keep it small (~one wave per core), or 0 for GPU-only iteration.
+ *    repeat    timed GPU repeats             (default 10, GPU only)
  *
  *  GFLOP/s counts the two GEMMs (T = Boᵀ·Bx and the projection): 4·n·m per
  *  candidate column.
@@ -97,7 +97,7 @@ int main(int argc, char **argv)
         }
     }
 
-    // B: col-major (n, m); X: col-major (n, p); y: (n); s: ones.
+    // B: col-major (n, m), X: col-major (n, p), y: (n), s: ones.
     std::vector<float> B((size_t)n * m), X((size_t)n * p), y(n);
     for (auto &v : B) v = gauss(rng);
     for (auto &v : X) v = gauss(rng);
@@ -142,9 +142,9 @@ int main(int argc, char **argv)
                     gpu * 1e6 / gpu_cols);
 
         // ---- CPU (OpenMP over X-columns, like the eval binding) ----------------
-        // Each call is O(n*m^2) and there are `cpu_calls` of them (single pass, not
-        // repeated) -- at large m this is the slow part, so it's skippable (0) and
-        // kept small by default. cpu_calls=0 -> GPU-only.
+        // Each call is O(n*m^2), and there are `cpu_calls` of them (single pass,
+        // not repeated). At large m this is the slow part, so it can be skipped
+        // (0), and it is kept small by default. cpu_calls=0 -> GPU-only.
         if (cpu_calls == 0) {
             std::printf("# CPU baseline skipped (cpu_calls=0)\n");
             return 0;
@@ -177,7 +177,7 @@ int main(int argc, char **argv)
             }
         };
 
-        // Single timed pass (no warmup/repeat -- it's already O(n*m^2)*cpu_calls).
+        // Single timed pass (no warmup/repeat: it is already O(n*m^2)*cpu_calls).
         t0 = now_s();
         cpu_run();
         const double cpu = now_s() - t0;

@@ -1,51 +1,54 @@
 /*
- *  CUDA hinge sweep -- the linear_only=false half of MarsAlgo::eval(). See
- *  cuda/mars_cuda.h for the host contract and the sweep in marsalgo.cc for the
- *  CPU oracle this must match.
+ *  CUDA hinge sweep, the linear_only=false half of MarsAlgo::eval(). See
+ *  cuda/mars_cuda.h for the host contract, and the sweep in marsalgo.cc for
+ *  the CPU oracle that this must match.
  *
- *  The CPU sweep walks the rows in descending order of x and, per candidate
- *  column j, carries a recurrence over sorted position i:
+ *  The CPU sweep walks the rows in descending order of x. For each candidate
+ *  column j, it carries a recurrence over the sorted position i:
  *
- *      g[c] += b_i * Bo[k[i], c]                 (c < m; c == m uses Bx[k[i], j])
+ *      g[c] += b_i * Bo[k[i], c]                 (c < m, c == m uses Bx[k[i], j])
  *      f[c] += d_i * g[c]                        d_i = x[k[i-1]] - x[k[i]]
  *
- *  so that at cut i, f is the projection of the positive hinge h+ onto
- *  span(Bo, Bx[:,j]) and the score needs ||f||^2 and <f, [ybo; ybx_j]>, plus
- *  five scalars of the same shape (b2, vb as g-type sums over b*b and b*y;
- *  bd, w as the matching f-type sums; and ||h+||^2 driven by bd and b2). The
- *  recurrence is linear, so it chunks: for a chunk of sorted rows [a, b) run
- *  from a zero state, the true state at any i in the chunk is the local state
- *  plus the carry-in advanced by the same recurrence. The carry-in is the
+ *  At cut i, f is then the projection of the positive hinge h+ onto
+ *  span(Bo, Bx[:,j]). The score needs ||f||^2 and <f, [ybo; ybx_j]>, plus five
+ *  scalars of the same shape: b2 and vb as g-type sums over b*b and b*y, bd
+ *  and w as the matching f-type sums, and ||h+||^2, driven by bd and b2. The
+ *  recurrence is linear, so it chunks. Run a chunk of sorted rows [a, b) from
+ *  a zero state. Then the true state at any i in the chunk is the local state
+ *  plus the carry-in, advanced by the same recurrence. The carry-in is the
  *  state the CPU holds when it is about to process row a (f after step a-1,
- *  g = sum over rows t < a), and the carry-out is that same state at b:
+ *  g = sum over rows t < a). The carry-out is that same state at b:
  *
  *      g_b = g_a + g_loc,   f_b = f_a + D(a,b) * g_a + f_loc,
  *      h2_b = h2_a + D(a,b) * (2*bd_a + D(a,b) * b2_a) + h2_loc,
  *
- *  with D(a,b) = sum of the f32 deltas d over [a, b) -- the deltas the chunk's
- *  own steps apply, d_a included and d_b excluded (an off-by-one here applies
- *  d_a*g_a twice; it only shows on columns without ties). Using the summed f32
- *  deltas (not x_a - x_b) keeps every row's effective weight identical to the
- *  CPU's, so the two agree to f64 reassociation error.
+ *  with D(a,b) = the sum of the f32 deltas d over [a, b). These are the deltas
+ *  that the chunk's own steps apply, with d_a included and d_b excluded. An
+ *  off-by-one here applies d_a*g_a twice, and it only shows on columns without
+ *  ties. Using the summed f32 deltas (not x_a - x_b) keeps every row's
+ *  effective weight identical to the CPU's, so the two agree to f64
+ *  reassociation error.
  *
  *  Three device passes over the sorted rows do the work:
- *    pass 1   per (chunk, column): the local end state from zero (no scoring);
+ *    pass 1   per (chunk, column): the local end state from zero (no scoring).
  *    propagate  per (column, lane): a sequential walk over the chunks that
- *             turns the local states into carry-ins (C x (m+3) x p work);
+ *             turns the local states into carry-ins (C x (m+3) x p work).
  *    pass 2   per (chunk, column): rerun the recurrence from the carry-in and
  *             score every on-grid cut, keeping the chunk's best.
  *  A final kernel picks the best chunk per column (first on ties, as the CPU's
  *  strict `>` does).
  *
- *  Thread mapping: one block per (chunk, group of JB columns); thread tid owns
- *  lanes c = tid + q*blockDim: c < m is Bo column c, c == m the Bx column,
- *  c == m+1 the parent-b lane (b2/bd, plus ||h+||^2) and c == m+2 the y lane
- *  (vb/w). Each step the block reads one gathered Bo row (contiguous: Bo is
- *  kept row-major on the device for this) shared by its JB columns, as the
- *  CPU does. Rows are staged a tile at a time in shared memory so the gather
- *  latency is paid with many loads in flight, not once per sequential step.
- *  Everything accumulates in f64 (f/g in f32 are a rejected failure mode, see
- *  CLAUDE.md); on a weak-f64 GPU that FMA rate is the floor of this kernel.
+ *  Thread mapping: one block per (chunk, group of JB columns). Thread tid owns
+ *  the lanes c = tid + q*blockDim: c < m is Bo column c, c == m is the Bx
+ *  column, c == m+1+jj is the parent-b lane of column jj (b2/bd, plus
+ *  ||h+||^2), and c == m+1+JB+jj is the y lane of column jj (vb/w). In each
+ *  step, the block reads one gathered Bo row and shares it across its JB
+ *  columns, as the CPU does. The row is contiguous, because the device keeps
+ *  Bo row-major for this. Rows are staged a tile at a time in shared memory,
+ *  so the gather latency is paid with many loads in flight, not once per
+ *  sequential step. Everything accumulates in f64 (f/g in f32 are a rejected
+ *  failure mode, see CLAUDE.md). On a weak-f64 GPU, that FMA rate is the
+ *  floor of this kernel.
  *
  *  Support tracking: i_last[j] is the last sorted position whose parent entry
  *  is nonzero. Cuts past it are degenerate (the CPU stops there), so chunks
@@ -89,7 +92,7 @@ __global__ void sort_keys_kernel(const float *xraw, float *keys, int *seq, size_
     seq[i]  = (int)i;
 }
 
-// xs[t] = x[k[t]] (the scaled candidate in sorted order); pos = k^-1.
+// xs[t] = x[k[t]] (the scaled candidate in sorted order). pos = k^-1.
 __global__ void perm_kernel(const int *k, const float *x, float *xs, int *pos, size_t n)
 {
     const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -111,9 +114,9 @@ __global__ void delta_kernel(const float *xs, float *d, size_t n)
     d[t] = (t > 0) ? xs[t - 1] - xs[t] : 0.0f;
 }
 
-// dsum[ck] = sum of d over [a, a+L), a = ck*L -- the carry's D(a, b), the
-// deltas the chunk's own steps apply. Only chunks with a next chunk are
-// consumed; the rest are written as 0.
+// dsum[ck] = sum of d over [a, a+L), a = ck*L. This is the carry's D(a, b),
+// the deltas that the chunk's own steps apply. Only chunks with a next chunk
+// are consumed. The rest are written as 0.
 __global__ void dsum_kernel(const float *d, double *dsum, int L, int tail)
 {
     const int ck = blockIdx.x;
@@ -206,16 +209,16 @@ __device__ __forceinline__ T sel(const T (&arr)[N], int idx)
  *      c < m           Bo column c, all JB columns in slots f[q][jj], g[q][jj]
  *      c == m          Bx lane, all JB columns
  *      c == m+1+jj     parent-b lane of column jj, in slot 0 only (b2, bd and
- *                      the k0/k1 halves of ||h+||^2); the four lanes sit in
- *                      consecutive threads so their k0/k1 FMAs share two warp
+ *                      the k0/k1 halves of ||h+||^2). The four lanes sit in
+ *                      consecutive threads, so their k0/k1 FMAs share two warp
  *                      instructions instead of one thread issuing eight
  *      c == m+1+JB+jj  y lane of column jj, slot 0 only (vb, w)
  *  The carry record per column keeps the canonical LCAR = m+3 layout
  *  (Bo columns, Bx, b, y), independent of JB.
  *
- *  Slot 0 is gated by "any column active" (block-uniform) so the b/y lanes'
- *  own column is always advanced; the other slots by that column's own gate.
- *  Updates past a column's i_last are never read, so the over-gating is
+ *  Slot 0 is gated by "any column active" (block-uniform), so the b/y lanes'
+ *  own column always advances. Each other slot is gated by its column's own
+ *  gate. Updates past a column's i_last are never read, so the over-gating is
  *  harmless.
  *
  *  Dynamic shared memory (TS = rows per tile, Lpad = CPT*blockDim, PW = the
@@ -229,13 +232,15 @@ __device__ __forceinline__ T sel(const T (&arr)[N], int idx)
  *      float  s_bo[TS][Lpad]             gathered Bo rows (lanes c < m)
  *      int    s_k[TS]                    row index of each sorted position
  *  The block-uniform per-row values are staged as f64 (f32->f64 conversion
- *  runs at the f64 rate; only the per-thread Bo value is converted per step).
+ *  runs at the f64 rate, and only the per-thread Bo value is converted per
+ *  step).
  *
- *  On-grid scoring (PASS2): at each grid point every thread writes its two
- *  partials per column to s_part; after SMAX grid points (or at the chunk
- *  end) the block reduces them cooperatively -- GRP threads per (slot, column,
- *  value) each summing a strided run, then a GRP-wide shuffle -- which costs
- *  ~4x fewer f64 instructions than a per-point warp-shuffle reduction.
+ *  On-grid scoring (PASS2): at each grid point, every thread writes its two
+ *  partials per column to s_part. After SMAX grid points (or at the chunk
+ *  end), the block reduces them cooperatively. GRP threads per (slot, column,
+ *  value) each sum a strided run, and then a GRP-wide shuffle combines them.
+ *  That costs ~4x fewer f64 instructions than a per-point warp-shuffle
+ *  reduction.
  */
 template <int CPT, int JB, bool PASS1>
 __global__ void __launch_bounds__(256)
@@ -271,7 +276,7 @@ sweep_kernel(const float *__restrict__ Bo_rm, int ldBo,
     const int tid = threadIdx.x;
 
     // Columns of this block. PASS1 needs a chunk only if its carry-out feeds a
-    // later chunk the column still sweeps; PASS2 needs it if any cut in it is
+    // later chunk the column still sweeps. PASS2 needs it if any cut in it is
     // at or before the column's last nonzero parent row.
     int  jcol[JB], ilast[JB];
     bool act[JB];
@@ -354,8 +359,8 @@ sweep_kernel(const float *__restrict__ Bo_rm, int ldBo,
         bidx[jj] = -1;
     }
 
-    // Reduce + score the current batch of grid slots (PASS2; block-uniform).
-    // Three barriers: partials complete; sums complete; scoring complete
+    // Reduce + score the current batch of grid slots (PASS2, block-uniform).
+    // Three barriers: partials complete, sums complete, and scoring complete
     // before s_acc/s_part are reused.
     int slot = 0, batch_first = 0;
     auto flush = [&]() {
@@ -910,11 +915,11 @@ void hinge_sweep(Context *ctx, size_t m, size_t p,
     const int BD   = sh.BD;
     const int Lpad = BD * sh.CPT;
     /*
-     *  Shared memory is sized per pass against a residency budget (~34 KB per
-     *  block, i.e. 3 blocks per SM on a 100 KB carve-out): measured, pass 2
+     *  Shared memory is sized per pass against a residency budget: ~34 KB per
+     *  block, that is, 3 blocks per SM on a 100 KB carve-out. Measured: pass 2
      *  loses ~2x when its block grows past that (one resident block), and
      *  pass 1 loses ~30% when the row tile shrinks below 16 rows. So pass 1
-     *  takes a 16-row tile (32 KB at 512 lanes), and pass 2 takes a one-slot
+     *  takes a 16-row tile (32 KB at 512 lanes). Pass 2 takes a one-slot
      *  reduction batch, a partials buffer only as wide as the threads holding
      *  Bo/Bx lanes, and whatever tile then fits the budget.
      */
