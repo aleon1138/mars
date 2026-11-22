@@ -60,7 +60,7 @@ def test_fit_cuda_hinges_match_cpu():
 
 def test_fit_cuda_linear_only_matches_cpu():
     """The batched linear_only path (pre-existing) reorders near-tied terms on
-    correlated features (see CLAUDE.md, 2026-06-16), so only the fit quality
+    correlated features (see docs/notes.md, 2026-06-16), so only the fit quality
     is compared: same term count, same R² trajectory to ~1e-4."""
     ok, why = _cuda_usable()
     if not ok:

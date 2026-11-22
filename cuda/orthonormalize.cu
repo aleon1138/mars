@@ -5,7 +5,7 @@
  *
  *  Precision contract (load-bearing): the near-zero entries of T = Boᵀ·Bx
  *  cancel, so T must accumulate in f64. A single f32 GEMM over K=n gives
- *  1e-2…4.6e-1 relative error (see CLAUDE.md). So the default path splits K
+ *  1e-2…4.6e-1 relative error (see docs/notes.md, 2026-06-15). So the default path splits K
  *  into chunks of MARS_CUDA_KCHUNK rows, runs each chunk as an f32
  *  cublasSgemm, and sums the chunk results into the f64 T. Only the
  *  within-chunk f32 error (~sqrt(kchunk)·eps_f32) remains. MARS_CUDA_KCHUNK=0
