@@ -26,7 +26,7 @@ practice on large datasets.
 The timings below were measured in July 2025 on an AMD EPYC 9654 (96 cores,
 192 logical CPUs), relative to a 2-thread run. Scaling is close to ideal through
 about 16 threads, still improving to 32, and flat beyond 64. The chart predates
-the 2026 kernel work (see `CLAUDE.md`), so absolute times have dropped since
+the 2026 kernel work (see `docs/notes.md`), so absolute times have dropped since
 then. We keep it to show the shape of the scaling curve.
 
 ![Performance timings of MARS](timings.png)

@@ -47,7 +47,7 @@
  *  Bo row-major for this. Rows are staged a tile at a time in shared memory,
  *  so the gather latency is paid with many loads in flight, not once per
  *  sequential step. Everything accumulates in f64 (f/g in f32 are a rejected
- *  failure mode, see CLAUDE.md). On a weak-f64 GPU, that FMA rate is the
+ *  failure mode, see docs/notes.md, 2026-06-09). On a weak-f64 GPU, that FMA rate is the
  *  floor of this kernel.
  *
  *  Support tracking: i_last[j] is the last sorted position whose parent entry

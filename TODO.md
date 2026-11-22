@@ -3,16 +3,16 @@
 Open ideas for future performance and quality work. None of them is planned
 for a specific release. This file holds only open work: completed work is in
 the git history, and the measurements, lessons and rejected approaches from
-that work are in the dated notes in CLAUDE.md. Items are in order of expected
+that work are in the dated notes in docs/notes.md. Items are in order of expected
 value per unit of risk, as of the 2026-11-04 review. Unless noted otherwise,
 timings are single-threaded on the EPYC 9845 server (`tests/bench_sweep`,
-n=5e5, pinned to one core). Read the benchmarking note in CLAUDE.md before you
+n=5e5, pinned to one core). Read the benchmarking note in docs/notes.md before you
 trust any A/B.
 
 ## 0. Where we left off (2026-11-04)
 
 The 2026-11-04 round reworked `linear_only` end to end (commits
-00e4870..4bbb549, and the CLAUDE.md notes of that date). Its changes were the
+00e4870..4bbb549, and the docs/notes.md notes of that date). Its changes were the
 residual target, the f64 restart of the GPU DGKS retry, closed-form scoring,
 the register-tiled Phase 1, the CPU and GPU T caches, the threaded `append()`
 and dead-on-append. Whole linear-only fits went from:
@@ -57,7 +57,7 @@ numbers come from an emulation with OpenBLAS sgemm, not from the device.
 κ = ‖Bx‖ / ‖residual‖.
 
 **Numerics.** Item #1 (the residual target) and item #2 (the GPU DGKS retry
-restarting from the f64 `B·x`) landed on 2026-11-04 (see the CLAUDE.md note).
+restarting from the f64 `B·x`) landed on 2026-11-04 (see docs/notes.md).
 
 2. **Exactly in-span candidates on the GPU: thin margin.** They still score
    0. But in the numpy model their residual reached 0.4·tol at m=400, n=6e3.
@@ -100,8 +100,8 @@ restarting from the f64 `B·x`) landed on 2026-11-04 (see the CLAUDE.md note).
 
 ## 2. CUDA follow-ups
 
-The GPU hinge sweep landed on 2026-11-03 (see the CLAUDE.md note of that
-date). It takes 76 ms per X column at n=5e5, m=100 (28x one CPU core) and 386
+The GPU hinge sweep landed on 2026-11-03 (see the docs/notes.md note of
+that date). It takes 76 ms per X column at n=5e5, m=100 (28x one CPU core) and 386
 ms at m=250. Pass 1 (the carries) runs at ~1.9x the f64 FMA floor. The grid
 scoring adds ~12 ms at m=100 and ~31 ms at m=250. The f64-only levers are
 spent. Open items, in order:
@@ -174,7 +174,7 @@ spent. Open items, in order:
 
 ## 3. Register-tile Phase 2a (CPU hinge eval, re-measure on a quiet box)
 
-Phase 1 (`T = Boᵀ·Bx`) has been register-tiled since 2026-11-04 (CLAUDE.md),
+Phase 1 (`T = Boᵀ·Bx`) has been register-tiled since 2026-11-04 (docs/notes.md),
 which gave ~2× on `eval(linear)`. Phase 2a (`project_out`: `Bx -= Bo·T` plus
 the norms) is still the row-at-a-time `dot_bo4` loop. Only the hinge eval and
 the fallback of the closed form use it. The loop is load-bound at ~1.25 loads
@@ -212,7 +212,7 @@ against them before investing here:
   selecting cuts that are numerically in span (den/‖h+‖² ~ 1e-11). Their
   spurious gain reached 1e-2, above the legitimate cuts. Order-≥3 parents have
   the smallest support, so they were hit most. The sweep now gates these cuts
-  (CLAUDE.md, 2026-10-22). Re-run the failing cases first, because part of
+  (docs/notes.md, 2026-10-22). Re-run the failing cases first, because part of
   the symptom may be gone.
 - A plain hinge fit (n=2e5, p=40, 41 terms, then `prune`) kept four hinges of
   the same input on one parent, at adjacent tail knots (1.83, 1.92, 2.01,
