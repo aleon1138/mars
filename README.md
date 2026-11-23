@@ -29,7 +29,7 @@ about 16 threads, still improving to 32, and flat beyond 64. The chart predates
 the 2026 kernel work (see `docs/notes.md`), so absolute times have dropped since
 then. We keep it to show the shape of the scaling curve.
 
-![Performance timings of MARS](timings.png)
+![Performance timings of MARS](docs/timings.png)
 
 `expand` is parallel as well: it fills the basis matrix in row blocks across
 cores and returns it in Fortran order by default or C order with `order="C"`.
